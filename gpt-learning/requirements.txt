@@ -1,0 +1,65 @@
+# =============================================================================
+# Tiny GPT-2 + RLHF 学习项目 统一依赖
+# 路径：项目根目录  e:/ai-learning/05-llm-fundamentals/gpt-learning/requirements.txt
+#
+# 两个子项目完全独立（PyTorch / TensorFlow），各自只需要安装对应那一节即可：
+#
+#   # 只跑 PyTorch 子项目（推荐，主学）
+#   pip install -r requirements.txt --extra-index-url  # 本文件已分组，见下文
+#   pip install torch numpy nltk
+#
+#   # 只跑 TensorFlow 子项目
+#   pip install tensorflow numpy nltk
+#
+#   # 两个都要跑（需要两套环境，避免 torch+tf 同进程冲突）
+#   conda create -n gpt2pt python=3.10 && conda activate gpt2pt && pip install torch numpy nltk matplotlib
+#   conda create -n gpt2tf python=3.10 && conda activate gpt2tf && pip install tensorflow numpy nltk matplotlib
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# [A] PyTorch 子项目 依赖（gpt-learning-pytorch/）
+# -----------------------------------------------------------------------------
+# 主深度学习框架（CPU 版即可；项目 tiny scale 用不到 GPU）
+torch>=2.0,<3.0
+# 数值计算（GPT-2 logits、attention 概率都用 numpy/array 接口）
+numpy>=1.22,<2.0
+# 评估函数 eval_self_bleu 需要 NLTK tokenizer
+nltk>=3.8
+
+
+# -----------------------------------------------------------------------------
+# [B] TensorFlow 子项目 依赖（gpt-learning-tensorflow/）
+# -----------------------------------------------------------------------------
+# 主深度学习框架
+tensorflow>=2.13,<3.0
+# 数值计算
+numpy>=1.22,<2.0
+# 评估函数 eval_self_bleu 需要 NLTK tokenizer
+nltk>=3.8
+
+
+# -----------------------------------------------------------------------------
+# [C] 两个子项目共享的可选依赖（仅画图脚本 docs/figure-scripts/ 用）
+# -----------------------------------------------------------------------------
+# 画 PPL 曲线、diversity、sft_vs_ppo、4 panel 拼接图
+matplotlib>=3.5
+
+
+# -----------------------------------------------------------------------------
+# [D] 评估所需的 NLTK 数据（Self-BLEU 的 punkt tokenizer）
+# -----------------------------------------------------------------------------
+# 安装完 nltk 后必须执行（PyTorch / TF 都要）：
+#   python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+# (上面那行只是说明，不会自动跑；放这里为了避免新手漏掉)
+
+
+# =============================================================================
+# 版本说明 & 已知坑
+# =============================================================================
+# 1) torch 限制 <3.0：2.x 之后 nn.MultiheadAttention 的 API 有变化，model/gpt2.py 自己写 attention 不受影响
+# 2) tensorflow 限制 <3.0：3.x 移除了 tf.train.Checkpoint 等老 API，train_*.py 用的全是 2.x 写法
+# 3) numpy 限制 <2.0：TF 2.13 在 numpy>=2.0 时会有 ABI 警告；本项目不要求 numpy 2.x 新特性
+# 4) 不强制锁小版本是为了让 pip 能选到最适合当前 Python 解释器的 wheel
+# 5) Python 版本：推荐 3.10；本机实测 D:\python311 的 torch DLL 损坏，请用 D:\python310
+# =============================================================================
