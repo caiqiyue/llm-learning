@@ -27,17 +27,17 @@ llm-learning/
 ├── CLAUDE.md                    ← Claude Code 的入口版规则
 ├── harness.md                   ← harness 通用方法论手册
 ├── init.sh                      ← 一键轻量验证（< 1 分钟）
-├── feature_list.json            ← 任务状态机：现在该做什么
+├── feature_list.json            ← 任务状态机：当前阶段 + 现在该做什么
 ├── claude-progress.md           ← session 进度日志
 ├── session-handoff.md           ← 跨 session 交接卡
 ├── clean-state-checklist.md     ← 收班清单
 │
-├── gpt-learning/                        ← 【主线】GPT-2 + RLHF 全流程
+├── gpt-learning/                        ← 【P1 线】GPT-2 + RLHF 全流程
 │   ├── 0~14 章系列笔记 + 数学公式详解 + 代码阅读顺序
 │   ├── requirements.txt
 │   ├── checkpoints/                     ← 训练产物（不入库）
 │   ├── docs/                            ← 本地资料（不入库）
-│   └── gpt-learning-pytorch/            ← 唯一主线实现（PyTorch）
+│   └── gpt-learning-pytorch/            ← 实现（PyTorch）
 │       ├── config.py                    ← 所有超参集中在这里
 │       ├── data/                        ← 合成数据构造（纯 Python，不依赖 torch）
 │       ├── model/gpt2.py                ← GPT-2 架构 + KV Cache
@@ -49,14 +49,48 @@ llm-learning/
 │       ├── generate.py / inference.py   ← 采样 / KV Cache 推理
 │       └── utils.py
 │
-└── qwen3-learning/                      ← 【副线】Qwen3 现代架构笔记（7 篇）
+└── qwen3-learning/                      ← 【P2 线】Qwen3 现代架构
+    ├── Qwen3_*.md × 7                   ← 笔记（已有）
+    └── qwen3-pytorch/                   ← 实现（待建，见 feat-011）
 ```
 
 > `checkpoints/` 和 `docs/` 被 `.gitignore` 排除：权重文件和本地草稿留在本机，不进仓库。
 
 ---
 
-## 三、笔记索引
+## 三、项目阶段
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| **P1** | GPT-2 + RLHF 全流程：17 篇笔记 + 可运行代码 | 代码与笔记就位，**训练链路待 torch 环境修复后复验**（`feat-001`） |
+| **P2（当前）** | Qwen3 从零实现：RoPE / RMSNorm / QK-Norm / SwiGLU / GQA | 7 篇笔记就绪，代码待建（`feat-011` 起） |
+| **P3** | Qwen3 训练与评估、MoE 稀疏前馈 | 规划中 |
+
+当前阶段以 [`feature_list.json`](feature_list.json) 的 `phase` 字段为准。
+
+### P2 计划中的 Qwen3 代码结构
+
+```
+qwen3-learning/qwen3-pytorch/
+├── config.py          # 独立超参：n_head_kv / head_dim / rope_theta / rms_eps …
+├── model/
+│   ├── norm.py        # RMSNorm
+│   ├── rope.py        # RoPE（含旋转等变性自测）
+│   ├── attention.py   # QK-Norm + GQA 注意力
+│   ├── mlp.py         # SwiGLU
+│   └── qwen3.py       # 完整前向（接口对齐 GPT2.forward）
+├── data/              # 数据与 tokenizer（方案见 feat-019）
+├── inference.py       # KV Cache prefill/decode + 采样
+├── compare_gpt2.py    # 与 GPT-2 的退化对照（feat-017）
+└── train_pretrain.py  # P3
+```
+
+**核心思路**：不靠"读懂论文"，而是**把 Qwen3 的每个组件做成一个可关掉的开关**（`use_gqa` / `use_rope` / `use_qk_norm` / MLP 选型），
+关掉之后退化出的模型应当与 GPT-2 对齐 —— 这样"Qwen3 到底改了什么、为什么改"就变成一次可重跑的实验，而不是一段文字（见 `feat-017`）。
+
+---
+
+## 四、笔记索引
 
 ### 主线：`gpt-learning/` —— 跟着代码走
 
@@ -92,9 +126,12 @@ llm-learning/
 | [Qwen3 GQA 与 KV Cache](qwen3-learning/Qwen3_GQA与KV_Cache_完整学习笔记.md) | 对比主线笔记 3、12 的 MHA + KV Cache |
 | [Qwen3 训练推理完整学习笔记](qwen3-learning/Qwen3_训练推理完整学习笔记.md) | 端到端训练与推理流程 |
 
+> **P2 阶段进行中**：这 7 篇笔记对应的实现正在手写中（`qwen3-learning/qwen3-pytorch/`，见 `feat-011` 起）。
+> 每完成一个组件，会在本表加一列指向源码位置，并把笔记里的断言换成可重跑的对照实验结果。
+
 ---
 
-## 四、快速开始
+## 五、快速开始
 
 ### 环境准备
 
@@ -113,9 +150,10 @@ python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
 bash init.sh
 ```
 
-约 1 分钟，分四层检查：环境 → 纯 Python 数据层 → torch 模型前向 → 仓库卫生。
+约 1 分钟，分五层检查：L0 环境 → L1 纯 Python 数据层 → L2 GPT-2 模型前向 → L3 仓库卫生 → L4 Qwen3 结构
+（目录未创建时自动 SKIP，不会阻塞 GPT-2 线的工作）。
 
-### 完整训练流程（CPU 约 10 分钟）
+### 完整训练流程（CPU 约 10 分钟，P1 线；待 `feat-001` 修复后可跑）
 
 ```bash
 cd gpt-learning/gpt-learning-pytorch
@@ -148,7 +186,7 @@ response quality、SFT vs PPO、toy benchmark、KV speedup。单项评估见
 
 ---
 
-## 五、代码风格约定
+## 六、代码风格约定
 
 | 约定 | 说明 |
 |------|------|
@@ -160,18 +198,18 @@ response quality、SFT vs PPO、toy benchmark、KV speedup。单项评估见
 
 ---
 
-## 六、Harness 机制（给 AI agent 的工作装备）
+## 七、Harness 机制（给 AI agent 的工作装备）
 
 本仓库对 AI 协作做了完整约束，规则都写在文件里而不是靠聊天记录：
 
 | 文件 | 作用 |
 |------|------|
-| [`AGENTS.md`](AGENTS.md) | 操作手册：项目定位、硬约束、三层验证路径、Definition of Done |
-| [`init.sh`](init.sh) | 标准启动 + 轻量验证，一个命令知道环境是否健康 |
-| [`feature_list.json`](feature_list.json) | 任务状态机，WIP=1，每条 feature 都带可执行验证步骤 |
+| [`AGENTS.md`](AGENTS.md) | 操作手册：项目定位与阶段、硬约束、五层验证路径、Definition of Done |
+| [`init.sh`](init.sh) | 标准启动 + 轻量验证，一个命令知道环境是否健康（L0–L4） |
+| [`feature_list.json`](feature_list.json) | 任务状态机：含 `phase` 阶段标记，WIP=1，每条 feature 带可执行验证步骤 |
 | [`claude-progress.md`](claude-progress.md) | session 日记 + 当前已验证状态 |
-| [`session-handoff.md`](session-handoff.md) | context 用满时的交接卡 |
-| [`clean-state-checklist.md`](clean-state-checklist.md) | 收班 6 项自查 |
+| [`session-handoff.md`](session-handoff.md) | 跨 session 交接卡（当前记录：P2 阶段 Qwen3 开发接手须知） |
+| [`clean-state-checklist.md`](clean-state-checklist.md) | 收班清单（6 项通用 + 3 项本项目特有） |
 | [`harness.md`](harness.md) | 通用方法论手册：5 子系统、任务拆解、反模式全集 |
 
 给 agent 的最短指令：
@@ -182,7 +220,7 @@ cat AGENTS.md && cat feature_list.json && bash init.sh
 
 ---
 
-## 七、本地不提交的内容
+## 八、本地不提交的内容
 
 `.gitignore` 已排除以下内容，它们保留在本机磁盘上：
 

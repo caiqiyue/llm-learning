@@ -19,15 +19,15 @@
 
 | 文件 | 状态 | 内容 |
 | ---- | ---- | ---- |
-| [`AGENTS.md`](AGENTS.md) | ✅ 已落地 | **本项目定制操作手册**:framing、10 条硬约束、三层验证路径、DoD、路由表 |
+| [`AGENTS.md`](AGENTS.md) | ✅ 已落地 | **本项目定制操作手册**:framing(P1/P2 双线)、13 条硬约束、五层验证路径、DoD、路由表 |
 | [`CLAUDE.md`](CLAUDE.md) | ✅ 已落地 | Claude Code 入口版,规则本体在 AGENTS.md |
-| [`init.sh`](init.sh) | ✅ 已落地 | 轻量 smoke(L0 环境 / L1 纯 Python 数据层 / L2 torch 前向 / L3 仓库卫生),< 1 分钟 |
-| [`feature_list.json`](feature_list.json) | ✅ 已落地 | 10 条 feature 的状态机,WIP=1,每条带可执行 verification |
-| [`claude-progress.md`](claude-progress.md) | ✅ 已落地 | session 日记 + 当前已验证状态 |
-| [`session-handoff.md`](session-handoff.md) | ✅ 已落地 | 交接卡(已填 feat-001 环境阻塞情况) |
+| [`init.sh`](init.sh) | ✅ 已落地 | 轻量 smoke 五层(L0 环境 / L1 纯 Python 数据层 / L2 GPT-2 前向 / L3 仓库卫生 / L4 Qwen3 结构),< 1 分钟 |
+| [`feature_list.json`](feature_list.json) | ✅ 已落地 | 21 条 feature 的状态机 + `phase` 阶段标记,WIP=1,每条带可执行 verification |
+| [`claude-progress.md`](claude-progress.md) | ✅ 已落地 | session 日记 + 当前已验证状态(Session 002 已对齐到 P2) |
+| [`session-handoff.md`](session-handoff.md) | ✅ 已落地 | 交接卡,当前是 **P2 阶段 Qwen3 开发接手须知** |
 | [`clean-state-checklist.md`](clean-state-checklist.md) | ✅ 已落地 | 收班清单,6 项通用 + 3 项本项目特有 |
-| [`README.md`](README.md) | ✅ 已落地 | 给人看的项目说明与笔记索引 |
-| `docs/` 7 个政策文档 | ❌ 未建 | 本项目 feature 数 10 个、1 人维护,L1/L2 档位够用,**按需再加** |
+| [`README.md`](README.md) | ✅ 已落地 | 给人看的项目说明、阶段表与笔记索引 |
+| `docs/` 7 个政策文档 | ❌ 未建 | 本项目 1 人维护,L1/L2 档位够用,**按需再加** |
 
 **agent 每次开工的最短路径**:
 
@@ -35,16 +35,21 @@
 cat AGENTS.md && cat feature_list.json && bash init.sh
 ```
 
-**本项目与通用手册的 3 处偏差**(手册是通用 SOP,这里按学习仓库的实际改了):
+先看 `feature_list.json` 的 `phase` 字段,确认当前是 **P1(GPT-2 + RLHF)** 还是 **P2(Qwen3 从零实现)**。
+
+**本项目与通用手册的 4 处偏差**(手册是通用 SOP,这里按学习仓库的实际改了):
 
 1. **验证不做全量训练**。通用手册的 `init.sh` 跑 lint+test+build 全套;本项目是 CPU 上 10 分钟的
-   RLHF 训练链,做不起每次开机就跑。因此拆成 L0-L3 四层,`init.sh` 只跑 L0/L1/L2/L3 的轻量部分,
-   全量训练(L3)改为**动到训练/评估代码时才手动跑**,见 `AGENTS.md` §5。
-2. **允许 SKIP,不允许静默通过**。本机 torch 目前加载不了,`init.sh` 的 L2 层输出 `[SKIP]` 而非 `[FAIL]`,
+   RLHF 训练链,做不起每次开机就跑。因此拆成 L0-L4 五层,`init.sh` 只跑轻量部分,
+   GPT-2 全量训练(L3)改为**动到训练/评估代码时才手动跑**,见 `AGENTS.md` §5。
+2. **允许 SKIP,不允许静默通过**。本机 torch 目前加载不了,`init.sh` 的 L2/L4 层输出 `[SKIP]` 而非 `[FAIL]`,
    不阻塞纯 Python 数据层的工作;但任何非 torch 检查失败一律 FAIL 并以非 0 退出码中断。
 3. **DoD 多了一条笔记门槛**。通用手册的 DoD 是"实现 + 验证 + evidence + 可重启";
    本项目多一条:**笔记改动的 feature 必须抽样核对 ≥3 处与 `config.py` / 源码一致**——
    因为这是个学习仓库,笔记与代码不一致就是硬伤,见 `AGENTS.md` §6。
+4. **多了一条"组件开关"约束(P2 阶段)**。Qwen3 的每个架构组件都实现成可关掉的开关
+   (`use_gqa` / `use_rope` / `use_qk_norm` / MLP 选型),退化后应与 GPT-2 对齐。
+   这把"Qwen3 到底改了什么"从文字断言变成可重跑的实验(`feat-017`),见 `AGENTS.md` §3。
 
 手册正文(第一~七部分 + 附录 A~E)作为**方法论参考**保留,不随本仓库状态改动。
 

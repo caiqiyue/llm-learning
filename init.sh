@@ -163,6 +163,60 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+head_ "L4  Qwen3 线（P2 阶段：目录未创建时 SKIP）"
+# -----------------------------------------------------------------------------
+QWEN_DIR="$REPO_ROOT/qwen3-learning/qwen3-pytorch"
+
+if [ ! -d "$QWEN_DIR" ]; then
+  skip "Qwen3 代码目录" "qwen3-learning/qwen3-pytorch/ 尚未创建（feature_list.json feat-011）"
+else
+  ok "qwen3-learning/qwen3-pytorch/ 存在"
+
+  for f in config.py README.md model data; do
+    if [ -e "$QWEN_DIR/$f" ]; then
+      ok "Qwen3 骨架存在: $f"
+    else
+      fail "Qwen3 骨架缺失: $f" "见 feature_list.json feat-011"
+    fi
+  done
+
+  if [ -f "$QWEN_DIR/model/qwen3.py" ] && python -c "import torch" >/dev/null 2>&1; then
+    (cd "$QWEN_DIR" && python - <<'PY' >/tmp/llm_init_l4.log 2>&1
+import torch
+import config
+from model.qwen3 import Qwen3
+from data.tokenizer import CharTokenizer
+
+tk = CharTokenizer("data/vocab.txt")
+model = Qwen3(
+    vocab_size=tk.vocab_size,
+    n_layer=config.n_layer,
+    n_head=config.n_head,
+    n_head_kv=config.n_head_kv,
+    n_embd=config.n_embd,
+    head_dim=config.head_dim,
+    intermediate_dim=config.intermediate_dim,
+    block_size=config.block_size,
+    rope_theta=config.rope_theta,
+    dropout=0.0,
+)
+idx = torch.randint(0, tk.vocab_size, (2, 8))
+logits, loss, cache, _ = model(idx)
+assert logits.shape == (2, 8, tk.vocab_size), f"logits 形状错: {tuple(logits.shape)}"
+print(f"logits {tuple(logits.shape)} params {sum(p.numel() for p in model.parameters())}")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 前向 smoke（logits 形状 + 参数量）$(tail -1 /tmp/llm_init_l4.log)"
+    else
+      fail "Qwen3 前向 smoke" "$(tail -3 /tmp/llm_init_l4.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 前向 smoke" "model/qwen3.py 尚未创建，或 torch 不可用（见 feat-001）"
+  fi
+fi
+
+# -----------------------------------------------------------------------------
 head_ "汇总"
 # -----------------------------------------------------------------------------
 echo "  PASS=$PASS  SKIP=$SKIP  FAIL=$FAIL"
@@ -177,7 +231,7 @@ fi
 
 echo ""
 echo "  ✅ baseline 健康。下一步："
-echo "    1. 读 feature_list.json，挑一个 not_started / in_progress 的 feature"
-echo "    2. 一次只做一个（WIP=1）"
-echo "    3. 动到训练/评估代码时，再跑全量验证（AGENTS.md §5 的 L3）"
+echo "    1. 读 feature_list.json 的 phase 字段确认当前阶段"
+echo "    2. 挑 priority 最小的非 passing feature，一次只做一个（WIP=1）"
+echo "    3. L2/L4 被 SKIP 时先修环境（feat-001）；动训练代码再跑全量（L3）"
 exit 0

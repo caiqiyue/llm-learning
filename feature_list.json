@@ -1,7 +1,13 @@
 {
   "project": "llm-learning",
-  "codename": "TinyGPT2-RLHF",
+  "codename": "TinyGPT2-RLHF → TinyQwen3",
   "last_updated": "2026-10-18",
+  "phase": {
+    "current": "P2 — Qwen3 从零实现",
+    "previous": "P1 — GPT-2 + RLHF 全流程（笔记与代码已就位，训练链路因 feat-001 未复验）",
+    "next": "P3 — Qwen3 训练与评估、MoE",
+    "scope_of_qwen3": "从零手写 tiny Qwen3（RoPE + RMSNorm + QK-Norm + SwiGLU + GQA [+ 后期 MoE]），延续 GPT-2 线的「笔记 ↔ 代码」对照做法。不引入 transformers/peft 等重依赖。"
+  },
   "rules": {
     "single_active_feature": true,
     "passing_requires_evidence": true,
@@ -11,12 +17,14 @@
     "not_started": "尚未开始。",
     "in_progress": "当前唯一活跃 feature。",
     "blocked": "被外部条件卡住，notes 里写明解法。",
-    "passing": "验证通过 + evidence 已记录。"
+    "passing": "验证通过 + evidence 已记录。",
+    "deferred": "主动推迟到后续阶段，notes 里写明推迟理由。"
   },
   "verification_levels": {
-    "L0_L1_L2": "bash init.sh —— 轻量 smoke，每个 session 必跑。",
-    "L3": "cd gpt-learning/gpt-learning-pytorch && 全量 4 阶段训练 + evaluate.py --stage all（CPU 约 10 分钟）。",
-    "NOTE": "改训练/评估代码必须跑 L3；只改笔记跑 L0/L1 + 抽样核对 ≥3 处与代码一致。"
+    "L0_L1_L2_L3": "bash init.sh —— 轻量 smoke，每个 session 必跑。",
+    "L3_train": "cd gpt-learning/gpt-learning-pytorch && 全量 4 阶段训练 + evaluate.py --stage all（CPU 约 10 分钟）。",
+    "L4_qwen3": "Qwen3 结构与推理 smoke（init.sh 的 L4 层），随 qwen3-learning/qwen3-pytorch/ 落地逐步加重。",
+    "NOTE": "改训练/评估代码必须跑对应 L3；只改笔记跑 L0/L1 + 抽样核对 ≥3 处与代码一致。"
   },
   "features": [
     {
@@ -24,142 +32,308 @@
       "priority": 1,
       "area": "env",
       "title": "让本机 torch 可正常导入",
-      "user_visible_behavior": "在本机执行 python -c \"import torch\" 不再报 WinError 127，init.sh 的 L2 层由 SKIP 变 PASS。",
+      "user_visible_behavior": "在本机执行 python -c \"import torch\" 不再报 WinError 127，init.sh 的 L2/L4 层由 SKIP 变 PASS。",
       "status": "blocked",
       "verification": [
         "执行 python -c \"import torch; print(torch.__version__)\" 并贴出输出",
         "执行 bash init.sh，确认 L2 层显示 [PASS] 模型前向 smoke",
-        "确认 gpt-learning-pytorch 下四个 train_*.py 均可 --help 或直接启动不立即崩溃"
+        "确认 gpt-learning-pytorch 下四个 train_*.py 均可启动不立即崩溃"
       ],
       "evidence": [
         "2026-10-18 init.sh: [SKIP] torch 模型前向 — OSError [WinError 127] 加载 torch_python.dll 失败"
       ],
-      "notes": "已诊断：torch 安装不完整或缺 VC++ 运行库。候选解法：重装匹配 Python 3.11 的 torch CPU wheel；或安装 Microsoft Visual C++ Redistributable。未确认前不要动训练代码结论。"
+      "notes": "已诊断：torch 安装不完整或缺 VC++ 运行库。候选解法：重装匹配 Python 3.11 的 torch CPU wheel；或安装 Microsoft Visual C++ Redistributable。【阶段硬前置】Qwen3 开发全程依赖 torch，不解决则 L2/L4 一直 SKIP，任何模型代码都无法验证。"
     },
     {
-      "id": "feat-002",
+      "id": "feat-011",
       "priority": 2,
-      "area": "pretrain",
-      "title": "预训练链路端到端跑通",
-      "user_visible_behavior": "学习者跑 python train_pretrain.py 能在 CPU 上 3 分钟内得到 checkpoints/pretrain.pt，并看到 loss 下降与困惑度打印。",
+      "area": "qwen3-scaffold",
+      "title": "Qwen3 代码骨架与独立超参配置",
+      "user_visible_behavior": "仓库里出现 qwen3-learning/qwen3-pytorch/ 目录，含独立的 config.py、model/、data/、README.md，与 GPT-2 线代码完全隔离。",
       "status": "not_started",
       "verification": [
-        "cd gpt-learning/gpt-learning-pytorch && python data/build_vocab.py",
-        "python train_pretrain.py，贴出 loss 曲线首末值",
-        "python evaluate.py --stage pretrain --checkpoint checkpoints/pretrain.pt，贴出 perplexity",
-        "bash init.sh 全绿"
+        "新建 qwen3-learning/qwen3-pytorch/{config.py,model/,data/,README.md}",
+        "config.py 中 Qwen3 结构超参（n_layer/n_head_kv/n_embd/head_dim/rope_theta/rms_eps）齐全且带中文注释",
+        "bash init.sh 的 L4 层由 SKIP 转为检查新目录"
       ],
       "evidence": [],
-      "notes": "依赖 feat-001；config.py max_iters=200 是 smoke 配置，超参依据见 GPT2训练数学公式与超参详解.md"
+      "notes": "关键决策：Qwen3 用 head_dim 与 n_embd 解耦（不强制 n_embd % n_head == 0），config 必须支持这一点；不得复制粘贴 GPT-2 的 config.py"
     },
     {
-      "id": "feat-003",
+      "id": "feat-012",
       "priority": 3,
-      "area": "sft",
-      "title": "SFT 监督微调链路跑通",
-      "user_visible_behavior": "跑 python train_sft.py 得到 checkpoints/sft.pt，模型按 prompt 补全出符合格式的回答。",
+      "area": "qwen3-norm",
+      "title": "实现 RMSNorm 与 Pre-LN Block 结构",
+      "user_visible_behavior": "学习者能在 model/norm.py 读到 RMSNorm 的完整公式注释，并理解 Qwen3 为什么用 RMSNorm 替代 LayerNorm、gain 为什么不存在。",
       "status": "not_started",
       "verification": [
-        "python train_sft.py，贴出 loss 首末值",
-        "python evaluate.py --stage sft --checkpoint checkpoints/sft.pt，贴出 Distinct-N 与 Self-BLEU",
-        "python generate.py 采样 3 条，确认输出格式与 sft_data 构造格式一致"
+        "实现 RMSNorm（无 bias、无 mean 中心化、带可学习 gain）",
+        "Block 为 Pre-LN 结构：x + Attn(LN1(x))、x + MLP(LN2(x))",
+        "写单元级 smoke：随机输入经 RMSNorm 后均值为 0、方差约 1",
+        "在 Qwen3_RMSNorm 笔记中标注对应源码位置"
       ],
       "evidence": [],
-      "notes": "对应笔记 7.sft-train.md；prompt 部分需被 ignore_index=-100 mask"
+      "notes": "对应笔记 Qwen3_RMSNorm_学习笔记.md；对照主线 GPT-2 的 nn.LayerNorm，说明 epsilon 位置与数值范围差异"
     },
     {
-      "id": "feat-004",
+      "id": "feat-013",
       "priority": 4,
-      "area": "reward",
-      "title": "奖励模型训练并验证 pairwise 准确率",
-      "user_visible_behavior": "跑 python train_reward.py 后，奖励模型对 chosen 的打分稳定高于 rejected，pairwise accuracy 明显高于随机。",
+      "area": "qwen3-rope",
+      "title": "实现 RoPE 位置编码",
+      "user_visible_behavior": "model/rope.py 能生成 (block_size, head_dim) 的旋转位置编码表，支持外推长度参数，且能演示相同相对距离的两对位置旋转后内积相等。",
       "status": "not_started",
       "verification": [
-        "python train_reward.py，贴出 reward loss 首末值",
-        "python evaluate.py --stage reward --checkpoint checkpoints/reward.pt，贴出 pairwise accuracy",
-        "抽样打印 5 组 chosen/rejected 的打分，确认排序方向正确"
+        "实现 inv_freq / cos / sin 缓存，theta 可配（Qwen3 默认 1e6）",
+        "smoke：dim=8 时验证内积只依赖相对位置（旋转等变性）",
+        "支持 position_ids 参数，为 KV Cache 的增量位置预留接口",
+        "笔记 Qwen3_RoPE_学习笔记.md ↔ 源码位置互相标注"
       ],
       "evidence": [],
-      "notes": "对应笔记 8.训练奖励模型.md；偏好数据构造策略见 data/preference_data.py 的 5 类 rejected 生成器"
+      "notes": "对照笔记 2.位置编码.md 的 Sinusoidal：说明「加到 embedding」vs「旋转 QK」的机制差异，以及 theta 对长上下文的影响"
     },
     {
-      "id": "feat-005",
+      "id": "feat-014",
       "priority": 5,
-      "area": "ppo",
-      "title": "PPO 强化学习跑通并观察到奖励上升",
-      "user_visible_behavior": "跑 python train_ppo.py 后，策略模型平均奖励随迭代上升且 KL 惩罚未失控，生成质量优于纯 SFT。",
+      "area": "qwen3-attn",
+      "title": "实现 QK-Norm 注意力与 GQA",
+      "user_visible_behavior": "model/attention.py 同时支持 GQA（n_head_kv < n_head）与 QK-Norm，KV Cache 长度按 kv 头数分配。",
       "status": "not_started",
       "verification": [
-        "python train_ppo.py，贴出 reward 与 kl 两条曲线的数据点",
-        "python evaluate.py --stage compare --sft checkpoints/sft.pt --ppo checkpoints/ppo.pt --rm checkpoints/reward.pt",
-        "确认 ppo_kl_coef / ppo_cliprange 生效（异常时回看 config.py 与笔记 14.gpt-ppo.md）"
+        "Q、K 在进入 RoPE 前各过一次 RMSNorm（确认归一化发生在 RoPE 之前还是之后，并以注释写明 Qwen3 的选择）",
+        "KV 通过 repeat_interleave 扩到 n_head，或实现分组注意力",
+        "smoke：n_head=8 / n_head_kv=2 时前向输出形状为 (B, T, n_embd)",
+        "smoke：不同 batch 元素的 KV Cache 不互相污染"
       ],
       "evidence": [],
-      "notes": "4 个模型角色（policy / ref_model / reward_model / value_head）对应关系见 14.gpt-ppo.md 第一节"
+      "notes": "对应笔记 Qwen3_QK-Norm_学习笔记.md 与 Qwen3_GQA与KV_Cache_完整学习笔记.md；这里要显式验证 GQA 相比 MHA 的 KV 缓存缩小为 1/4"
     },
     {
-      "id": "feat-006",
+      "id": "feat-015",
       "priority": 6,
-      "area": "eval",
-      "title": "9 项评估脚本一次性全跑通",
-      "user_visible_behavior": "python evaluate.py --stage all --all_checkpoints checkpoints/ 一次输出全部 9 项指标，不中途报错。",
+      "area": "qwen3-mlp",
+      "title": "实现 SwiGLU 前馈网络",
+      "user_visible_behavior": "model/mlp.py 实现 gate_proj / up_proj / down_proj 三矩阵 SwiGLU，中间维按 8/3 规则对齐到 128 的倍数。",
       "status": "not_started",
       "verification": [
-        "确认 checkpoints/ 下 4 个权重齐全",
-        "python evaluate.py --stage all --all_checkpoints checkpoints/，贴出完整输出",
-        "逐项对照 13.gpt2评估.md 的指标表，确认每个数字都有判断方向说明"
+        "smoke：down_proj 输出形状等于残差流形状 (B, T, n_embd)",
+        "smoke：验证 SwiGLU(x) = down(silu(gate(x)) * up(x))，与逐元素手写结果一致",
+        "注释说明为何 hidden_dim 取整到 128 的倍数，以及与 GPT-2 的 4×n_embd + GELU 的参数量差异"
       ],
       "evidence": [],
-      "notes": "9 项：PPL / pairwise accuracy / Distinct-N / Self-BLEU / token entropy / response quality / SFT vs PPO / toy benchmark / KV speedup"
+      "notes": "对应笔记 Qwen3_SwiGLU_MLP_学习笔记.md；顺带算清两套 FFN 在同 n_embd 下的参数量对比（写进笔记）"
     },
     {
-      "id": "feat-007",
+      "id": "feat-016",
       "priority": 7,
-      "area": "inference",
-      "title": "KV Cache 推理正确性与加速比验证",
-      "user_visible_behavior": "带 KV Cache 与不带 KV Cache 生成同一 prompt 得到语义一致的文本，speedup 指标显著大于 1。",
+      "area": "qwen3-model",
+      "title": "Qwen3 完整前向与权重绑定",
+      "user_visible_behavior": "model/qwen3.py 串起 embedding + N × Block + final RMSNorm + lm_head，前向返回 (logits, loss, kv_cache, value)。",
       "status": "not_started",
       "verification": [
-        "用 inference.py 同一 prompt 分别跑有/无 KV Cache，对比输出一致性",
-        "python evaluate.py --stage speedup --checkpoint checkpoints/ppo.pt，贴出加速比",
-        "核对 12.采样方式.md 中 prefill/decode 的描述与 inference.py 实现一致"
+        "smoke：logits 形状为 (B, T, vocab_size)，loss 在 targets 给出时有限",
+        "确认权重绑定策略（Qwen3 是否 tie embedding 与 lm_head）在代码与注释中明确",
+        "参数量统计打印，并与笔记中的规模描述对得上",
+        "bash init.sh 全绿（L2/L4 均 PASS）"
       ],
       "evidence": [],
-      "notes": "对应笔记 3.prefill.md 与 12.采样方式.md"
+      "notes": "接口刻意与 GPT-2 的 GPT2.forward 保持一致（同样 4 元组返回），便于写等价性对照测试 feat-017"
+    },
+    {
+      "id": "feat-017",
+      "priority": 8,
+      "area": "qwen3-eval",
+      "title": "与 GPT-2 做结构等价性对照测试",
+      "user_visible_behavior": "有一份对照脚本证明：把 GQA 退化成 MHA、RoPE 退化成 0、SwiGLU 换成 GELU 后，Qwen3 与 GPT-2 在同样输入下输出可对齐。",
+      "status": "not_started",
+      "verification": [
+        "构造退化开关：use_gqa=False / use_rope=False / use_qk_norm=False / mlp=GELU",
+        "同权重加载 GPT-2 与退化 Qwen3，逐层对齐参数名",
+        "同输入下 max_abs_diff < 1e-4（fp32）",
+        "把结论写进 Qwen3 笔记，作为「Qwen3 每个组件到底改了什么」的实证"
+      ],
+      "evidence": [],
+      "notes": "这是 Qwen3 线最有价值的产出：把 7 篇笔记的每个改动点都变成一次可跑的消融，而不是口头断言"
+    },
+    {
+      "id": "feat-018",
+      "priority": 9,
+      "area": "qwen3-infer",
+      "title": "Qwen3 KV Cache 推理与采样",
+      "user_visible_behavior": "inference.py 支持 prefill/decode 两阶段，采样支持 temperature / top-k / top-p，生成结果与无缓存模式语义一致。",
+      "status": "not_started",
+      "verification": [
+        "同一 prompt 有/无 KV Cache 生成，对比输出一致性",
+        "GQA 下打印 KV Cache 实际占用（batch × n_head_kv × T × head_dim × 2 × dtype）",
+        "与 GPT-2 的 speedup 指标在同一 prompt 长度下横向对比",
+        "对照笔记 12.采样方式.md 说明 top-k/top-p 实现差异"
+      ],
+      "evidence": [],
+      "notes": "复用 GPT-2 线的 generate.py 组织方式（prefill → decode 循环），不要另起一套"
     },
     {
       "id": "feat-008",
-      "priority": 8,
+      "priority": 10,
       "area": "docs",
       "title": "笔记与代码交叉引用表",
-      "user_visible_behavior": "学习者从任一概念（GQA、QK-Norm、MoE、SwiGLU）都能在笔记里跳到 GPT-2 主线里对应的朴素实现与源码位置。",
+      "user_visible_behavior": "学习者从任一概念（GQA、QK-Norm、MoE、SwiGLU、RMSNorm、RoPE）都能在笔记里跳到 GPT-2 主线与 Qwen3 实现的具体源码位置。",
       "status": "not_started",
       "verification": [
-        "为 GQA/KV Cache 补上 Qwen3_GQA与KV_Cache 笔记 ↔ model/gpt2.py 的对照段落",
-        "为 SwiGLU/RMSNorm/QK-Norm/RoPE 各自补上 GPT-2 侧的对应实现位置",
-        "README.md 的笔记索引表同步更新，链接可点开"
+        "每篇 Qwen3 笔记开头加「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置」两行",
+        "README.md 的笔记索引表补上 Qwen3 代码列",
+        "逐条链接可点开且目标文件真实存在"
       ],
       "evidence": [],
-      "notes": "qwen3-learning/ 7 篇笔记目前与 gpt-learning/ 主线是并列关系，缺交叉引用"
+      "notes": "本项从 P1 顺延到 P2：Qwen3 代码落地后再做，交叉引用才有实际目标"
+    },
+    {
+      "id": "feat-002",
+      "priority": 11,
+      "area": "pretrain",
+      "title": "预训练链路端到端跑通",
+      "user_visible_behavior": "跑 python train_pretrain.py 能在 CPU 上得到 checkpoints/pretrain.pt，并看到 loss 下降与困惑度打印。",
+      "status": "deferred",
+      "verification": [
+        "python data/build_vocab.py",
+        "python train_pretrain.py，贴出 loss 曲线首末值",
+        "python evaluate.py --stage pretrain --checkpoint checkpoints/pretrain.pt，贴出 perplexity"
+      ],
+      "evidence": [],
+      "notes": "推迟到 P3：当前阶段（Qwen3）优先，代码逻辑本身不需改动，只缺 torch 环境复验"
+    },
+    {
+      "id": "feat-003",
+      "priority": 12,
+      "area": "sft",
+      "title": "SFT 监督微调链路跑通",
+      "user_visible_behavior": "跑 python train_sft.py 得到 checkpoints/sft.pt，模型按 prompt 补全出符合格式的回答。",
+      "status": "deferred",
+      "verification": [
+        "python train_sft.py，贴出 loss 首末值",
+        "python evaluate.py --stage sft --checkpoint checkpoints/sft.pt，贴出 Distinct-N 与 Self-BLEU"
+      ],
+      "evidence": [],
+      "notes": "推迟到 P3。对应笔记 7.sft-train.md"
+    },
+    {
+      "id": "feat-004",
+      "priority": 13,
+      "area": "reward",
+      "title": "奖励模型训练并验证 pairwise 准确率",
+      "user_visible_behavior": "奖励模型对 chosen 的打分稳定高于 rejected，pairwise accuracy 明显高于随机。",
+      "status": "deferred",
+      "verification": [
+        "python train_reward.py，贴出 reward loss 首末值",
+        "python evaluate.py --stage reward --checkpoint checkpoints/reward.pt，贴出 pairwise accuracy"
+      ],
+      "evidence": [],
+      "notes": "推迟到 P3。对应笔记 8.训练奖励模型.md"
+    },
+    {
+      "id": "feat-005",
+      "priority": 14,
+      "area": "ppo",
+      "title": "PPO 强化学习跑通并观察到奖励上升",
+      "user_visible_behavior": "策略模型平均奖励随迭代上升且 KL 惩罚未失控，生成质量优于纯 SFT。",
+      "status": "deferred",
+      "verification": [
+        "python train_ppo.py，贴出 reward 与 kl 曲线数据点",
+        "python evaluate.py --stage compare --sft checkpoints/sft.pt --ppo checkpoints/ppo.pt --rm checkpoints/reward.pt"
+      ],
+      "evidence": [],
+      "notes": "推迟到 P3。对应笔记 14.gpt-ppo.md"
+    },
+    {
+      "id": "feat-006",
+      "priority": 15,
+      "area": "eval",
+      "title": "9 项评估脚本一次性全跑通",
+      "user_visible_behavior": "python evaluate.py --stage all 一次输出全部 9 项指标，不中途报错。",
+      "status": "deferred",
+      "verification": [
+        "python evaluate.py --stage all --all_checkpoints checkpoints/，贴出完整输出",
+        "逐项对照 13.gpt2评估.md 的指标表"
+      ],
+      "evidence": [],
+      "notes": "推迟到 P3"
+    },
+    {
+      "id": "feat-007",
+      "priority": 16,
+      "area": "inference",
+      "title": "KV Cache 推理正确性与加速比验证",
+      "user_visible_behavior": "带/不带 KV Cache 生成同一 prompt 语义一致，speedup 显著大于 1。",
+      "status": "deferred",
+      "verification": [
+        "有/无 KV Cache 输出对比",
+        "python evaluate.py --stage speedup --checkpoint checkpoints/ppo.pt，贴出加速比"
+      ],
+      "evidence": [],
+      "notes": "推迟到 P3；Qwen3 线会先做同类验证（feat-018），届时可横向对照"
+    },
+    {
+      "id": "feat-019",
+      "priority": 17,
+      "area": "qwen3-data",
+      "title": "Qwen3 线的数据与 tokenizer 方案",
+      "user_visible_behavior": "Qwen3 线明确 tokenization 策略（复用 GPT-2 字符级 vs 换 BPE），并有可复现的数据构造与词表构建脚本。",
+      "status": "not_started",
+      "verification": [
+        "在 Qwen3 README 中写明选择理由",
+        "data/ 下脚本可独立运行生成 vocab 与样本",
+        "若复用 GPT-2 词表，说明共享边界与各自 checkpoint 的对应关系"
+      ],
+      "evidence": [],
+      "notes": "Qwen3 真模型用 BPE，但 tiny 版本是否值得引入 BPE 依赖要实测；若引入 BPE 需在 README 说明并更新依赖上限"
+    },
+    {
+      "id": "feat-020",
+      "priority": 18,
+      "area": "qwen3-train",
+      "title": "Qwen3 预训练 smoke 跑通",
+      "user_visible_behavior": "跑 python train_pretrain.py（Qwen3 目录）能在 CPU 上得到 loss 下降的曲线与可评估的权重。",
+      "status": "not_started",
+      "verification": [
+        "python train_pretrain.py，贴出 loss 首末值",
+        "困惑度可打印且随迭代下降",
+        "bash init.sh 的 L4 层纳入该脚本的最小 smoke"
+      ],
+      "evidence": [],
+      "notes": "P3 内容。"
+    },
+    {
+      "id": "feat-021",
+      "priority": 19,
+      "area": "qwen3-moe",
+      "title": "Qwen3 MoE 稀疏前馈（可选）",
+      "user_visible_behavior": "在 dense Qwen3 之上可开关启用 MoE（top-k 路由 + 负载均衡损失），能打印每个专家的负载分布。",
+      "status": "not_started",
+      "verification": [
+        "Router 实现 top-k 选择 + 负载均衡辅助损失",
+        "smoke：dense 模式下参数量与 feat-016 一致（开关不改变默认行为）",
+        "打印专家负载分布，确认无专家饿死",
+        "对照 Qwen3_MoE_学习笔记.md 标注实现位置"
+      ],
+      "evidence": [],
+      "notes": "P3 可选项；若时间紧可只做笔记对照不写代码"
     },
     {
       "id": "feat-009",
-      "priority": 9,
+      "priority": 20,
       "area": "audit",
       "title": "笔记数字与 config.py 全量核对",
-      "user_visible_behavior": "笔记里出现的每个超参数、层数、维度都与 config.py 当前值一致，学习者照笔记调参不会踩空。",
+      "user_visible_behavior": "笔记里出现的每个超参数、层数、维度都与对应 config.py 当前值一致。",
       "status": "not_started",
       "verification": [
-        "列出笔记中出现的全部超参数数字",
-        "逐条与 gpt-learning-pytorch/config.py 核对并记录差异",
+        "列出 GPT-2 与 Qwen3 两条线笔记中出现的全部超参数数字",
+        "逐条与各自 config.py 核对并记录差异",
         "对每处差异：改笔记或改代码，二选一并写明理由"
       ],
       "evidence": [],
-      "notes": "AGENTS.md 硬约束：改 config.py 必须说明影响哪几章笔记"
+      "notes": "跨两条线；Qwen3 线落地后做一次全量审计"
     },
     {
       "id": "feat-010",
-      "priority": 10,
+      "priority": 21,
       "area": "harness",
       "title": "harness 文件集落地并首次通过",
       "user_visible_behavior": "任何人 clone 本仓库后，执行 bash init.sh 即可知道当前环境是否健康、当前该做哪个 feature。",
@@ -170,9 +344,10 @@
         "git status 干净，checkpoints/ 与 docs/ 未被跟踪"
       ],
       "evidence": [
-        "2026-10-18 bash init.sh: PASS=11 SKIP=1 FAIL=0（L2 torch 因 feat-001 SKIP）"
+        "2026-10-18 bash init.sh: PASS=11 SKIP=1 FAIL=0（L2 torch 因 feat-001 SKIP）",
+        "2026-10-18 Session 002: PASS=11 SKIP=2 FAIL=0（新增 L4 Qwen3 结构层，因目录未创建而 SKIP）"
       ],
-      "notes": "本次交付。harness.md 保留为通用方法论手册，AGENTS.md 为本项目定制操作手册"
+      "notes": "P1 交付已完成；Session 002 已对齐到 P2（Qwen3 阶段）"
     }
   ]
 }
