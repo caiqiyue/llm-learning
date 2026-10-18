@@ -1,0 +1,178 @@
+{
+  "project": "llm-learning",
+  "codename": "TinyGPT2-RLHF",
+  "last_updated": "2026-10-18",
+  "rules": {
+    "single_active_feature": true,
+    "passing_requires_evidence": true,
+    "do_not_skip_verification": true
+  },
+  "status_legend": {
+    "not_started": "尚未开始。",
+    "in_progress": "当前唯一活跃 feature。",
+    "blocked": "被外部条件卡住，notes 里写明解法。",
+    "passing": "验证通过 + evidence 已记录。"
+  },
+  "verification_levels": {
+    "L0_L1_L2": "bash init.sh —— 轻量 smoke，每个 session 必跑。",
+    "L3": "cd gpt-learning/gpt-learning-pytorch && 全量 4 阶段训练 + evaluate.py --stage all（CPU 约 10 分钟）。",
+    "NOTE": "改训练/评估代码必须跑 L3；只改笔记跑 L0/L1 + 抽样核对 ≥3 处与代码一致。"
+  },
+  "features": [
+    {
+      "id": "feat-001",
+      "priority": 1,
+      "area": "env",
+      "title": "让本机 torch 可正常导入",
+      "user_visible_behavior": "在本机执行 python -c \"import torch\" 不再报 WinError 127，init.sh 的 L2 层由 SKIP 变 PASS。",
+      "status": "blocked",
+      "verification": [
+        "执行 python -c \"import torch; print(torch.__version__)\" 并贴出输出",
+        "执行 bash init.sh，确认 L2 层显示 [PASS] 模型前向 smoke",
+        "确认 gpt-learning-pytorch 下四个 train_*.py 均可 --help 或直接启动不立即崩溃"
+      ],
+      "evidence": [
+        "2026-10-18 init.sh: [SKIP] torch 模型前向 — OSError [WinError 127] 加载 torch_python.dll 失败"
+      ],
+      "notes": "已诊断：torch 安装不完整或缺 VC++ 运行库。候选解法：重装匹配 Python 3.11 的 torch CPU wheel；或安装 Microsoft Visual C++ Redistributable。未确认前不要动训练代码结论。"
+    },
+    {
+      "id": "feat-002",
+      "priority": 2,
+      "area": "pretrain",
+      "title": "预训练链路端到端跑通",
+      "user_visible_behavior": "学习者跑 python train_pretrain.py 能在 CPU 上 3 分钟内得到 checkpoints/pretrain.pt，并看到 loss 下降与困惑度打印。",
+      "status": "not_started",
+      "verification": [
+        "cd gpt-learning/gpt-learning-pytorch && python data/build_vocab.py",
+        "python train_pretrain.py，贴出 loss 曲线首末值",
+        "python evaluate.py --stage pretrain --checkpoint checkpoints/pretrain.pt，贴出 perplexity",
+        "bash init.sh 全绿"
+      ],
+      "evidence": [],
+      "notes": "依赖 feat-001；config.py max_iters=200 是 smoke 配置，超参依据见 GPT2训练数学公式与超参详解.md"
+    },
+    {
+      "id": "feat-003",
+      "priority": 3,
+      "area": "sft",
+      "title": "SFT 监督微调链路跑通",
+      "user_visible_behavior": "跑 python train_sft.py 得到 checkpoints/sft.pt，模型按 prompt 补全出符合格式的回答。",
+      "status": "not_started",
+      "verification": [
+        "python train_sft.py，贴出 loss 首末值",
+        "python evaluate.py --stage sft --checkpoint checkpoints/sft.pt，贴出 Distinct-N 与 Self-BLEU",
+        "python generate.py 采样 3 条，确认输出格式与 sft_data 构造格式一致"
+      ],
+      "evidence": [],
+      "notes": "对应笔记 7.sft-train.md；prompt 部分需被 ignore_index=-100 mask"
+    },
+    {
+      "id": "feat-004",
+      "priority": 4,
+      "area": "reward",
+      "title": "奖励模型训练并验证 pairwise 准确率",
+      "user_visible_behavior": "跑 python train_reward.py 后，奖励模型对 chosen 的打分稳定高于 rejected，pairwise accuracy 明显高于随机。",
+      "status": "not_started",
+      "verification": [
+        "python train_reward.py，贴出 reward loss 首末值",
+        "python evaluate.py --stage reward --checkpoint checkpoints/reward.pt，贴出 pairwise accuracy",
+        "抽样打印 5 组 chosen/rejected 的打分，确认排序方向正确"
+      ],
+      "evidence": [],
+      "notes": "对应笔记 8.训练奖励模型.md；偏好数据构造策略见 data/preference_data.py 的 5 类 rejected 生成器"
+    },
+    {
+      "id": "feat-005",
+      "priority": 5,
+      "area": "ppo",
+      "title": "PPO 强化学习跑通并观察到奖励上升",
+      "user_visible_behavior": "跑 python train_ppo.py 后，策略模型平均奖励随迭代上升且 KL 惩罚未失控，生成质量优于纯 SFT。",
+      "status": "not_started",
+      "verification": [
+        "python train_ppo.py，贴出 reward 与 kl 两条曲线的数据点",
+        "python evaluate.py --stage compare --sft checkpoints/sft.pt --ppo checkpoints/ppo.pt --rm checkpoints/reward.pt",
+        "确认 ppo_kl_coef / ppo_cliprange 生效（异常时回看 config.py 与笔记 14.gpt-ppo.md）"
+      ],
+      "evidence": [],
+      "notes": "4 个模型角色（policy / ref_model / reward_model / value_head）对应关系见 14.gpt-ppo.md 第一节"
+    },
+    {
+      "id": "feat-006",
+      "priority": 6,
+      "area": "eval",
+      "title": "9 项评估脚本一次性全跑通",
+      "user_visible_behavior": "python evaluate.py --stage all --all_checkpoints checkpoints/ 一次输出全部 9 项指标，不中途报错。",
+      "status": "not_started",
+      "verification": [
+        "确认 checkpoints/ 下 4 个权重齐全",
+        "python evaluate.py --stage all --all_checkpoints checkpoints/，贴出完整输出",
+        "逐项对照 13.gpt2评估.md 的指标表，确认每个数字都有判断方向说明"
+      ],
+      "evidence": [],
+      "notes": "9 项：PPL / pairwise accuracy / Distinct-N / Self-BLEU / token entropy / response quality / SFT vs PPO / toy benchmark / KV speedup"
+    },
+    {
+      "id": "feat-007",
+      "priority": 7,
+      "area": "inference",
+      "title": "KV Cache 推理正确性与加速比验证",
+      "user_visible_behavior": "带 KV Cache 与不带 KV Cache 生成同一 prompt 得到语义一致的文本，speedup 指标显著大于 1。",
+      "status": "not_started",
+      "verification": [
+        "用 inference.py 同一 prompt 分别跑有/无 KV Cache，对比输出一致性",
+        "python evaluate.py --stage speedup --checkpoint checkpoints/ppo.pt，贴出加速比",
+        "核对 12.采样方式.md 中 prefill/decode 的描述与 inference.py 实现一致"
+      ],
+      "evidence": [],
+      "notes": "对应笔记 3.prefill.md 与 12.采样方式.md"
+    },
+    {
+      "id": "feat-008",
+      "priority": 8,
+      "area": "docs",
+      "title": "笔记与代码交叉引用表",
+      "user_visible_behavior": "学习者从任一概念（GQA、QK-Norm、MoE、SwiGLU）都能在笔记里跳到 GPT-2 主线里对应的朴素实现与源码位置。",
+      "status": "not_started",
+      "verification": [
+        "为 GQA/KV Cache 补上 Qwen3_GQA与KV_Cache 笔记 ↔ model/gpt2.py 的对照段落",
+        "为 SwiGLU/RMSNorm/QK-Norm/RoPE 各自补上 GPT-2 侧的对应实现位置",
+        "README.md 的笔记索引表同步更新，链接可点开"
+      ],
+      "evidence": [],
+      "notes": "qwen3-learning/ 7 篇笔记目前与 gpt-learning/ 主线是并列关系，缺交叉引用"
+    },
+    {
+      "id": "feat-009",
+      "priority": 9,
+      "area": "audit",
+      "title": "笔记数字与 config.py 全量核对",
+      "user_visible_behavior": "笔记里出现的每个超参数、层数、维度都与 config.py 当前值一致，学习者照笔记调参不会踩空。",
+      "status": "not_started",
+      "verification": [
+        "列出笔记中出现的全部超参数数字",
+        "逐条与 gpt-learning-pytorch/config.py 核对并记录差异",
+        "对每处差异：改笔记或改代码，二选一并写明理由"
+      ],
+      "evidence": [],
+      "notes": "AGENTS.md 硬约束：改 config.py 必须说明影响哪几章笔记"
+    },
+    {
+      "id": "feat-010",
+      "priority": 10,
+      "area": "harness",
+      "title": "harness 文件集落地并首次通过",
+      "user_visible_behavior": "任何人 clone 本仓库后，执行 bash init.sh 即可知道当前环境是否健康、当前该做哪个 feature。",
+      "status": "passing",
+      "verification": [
+        "bash init.sh 退出码为 0（L2 允许 SKIP）",
+        "README.md / AGENTS.md / feature_list.json / claude-progress.md 均已入库",
+        "git status 干净，checkpoints/ 与 docs/ 未被跟踪"
+      ],
+      "evidence": [
+        "2026-10-18 bash init.sh: PASS=11 SKIP=1 FAIL=0（L2 torch 因 feat-001 SKIP）"
+      ],
+      "notes": "本次交付。harness.md 保留为通用方法论手册，AGENTS.md 为本项目定制操作手册"
+    }
+  ]
+}
