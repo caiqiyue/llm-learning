@@ -1867,15 +1867,23 @@ with torch.no_grad():
 # --- 5) 【关键对比】SwiGLU 与 GPT-2 的 4x-GELU 在同 n_embd 下的参数量 ---
 n_swiglu = sum(p.numel() for m in [mlp.gate_proj, mlp.up_proj, mlp.down_proj] for p in m.parameters())
 n_gelu = 2 * C.n_embd * (4 * C.n_embd)      # GPT-2: c_fc + c_proj，各 128×512
+ratio = n_swiglu / n_gelu
+# 【实测修正 2026-10-22】初稿断言 n_swiglu < n_gelu 是错的，实际比值 = 9/8 = 1.125：
+#   SwiGLU = 3 个矩阵 × 128 × 384 = 147,456
+#   GPT-2  = 2 个矩阵 × 128 × 512 = 131,072
+#   3×384 / (2×512) = 1.125
+# 而若 intermediate 精确取 8/3·n_embd，两边都是 8·n_embd²，**参数量完全相等** ——
+# 这正是 8/3 规则的设计意图（多一个矩阵，用更窄的中间维抵消）。
+# 1.125 这个超出量**全部来自向上对齐到 128 的倍数**（341.33 → 384 = 3×128）。
+assert abs(ratio - 9 / 8) < 1e-9, f"比值应为 9/8=1.125，实得 {ratio:.6f}"
+n_swiglu_exact = 3 * C.n_embd * (C.n_embd * 8 / 3)
+assert abs(n_swiglu_exact - n_gelu) < 1e-6, "精确 8/3 时两者参数量应相等"
 print(f"[参数对比] n_embd={C.n_embd}: SwiGLU(中间维={C.intermediate_size}) {n_swiglu:,} vs "
-      f"GPT-2 GELU(中间维={4*C.n_embd}) {n_gelu:,} → 比值 {n_swiglu/n_gelu:.2f}")
-# SwiGLU 用两个矩阵做升维但每个更窄，总参数应接近 GELU 而非翻倍
-assert n_swiglu < n_gelu, "本配置下 SwiGLU 参数量应不超过 GPT-2 的 4x-GELU"
+      f"GPT-2 GELU(中间维={4*C.n_embd}) {n_gelu:,} → 比值 {ratio:.3f}")
 
-# --- 6) 中间维对齐规则校验 ---
-import math
-raw = C.n_embd * 8 / 3
-aligned = math.ceil(raw / 128) * 128
+# --- 6) 中间维对齐规则校验（用实现里的 align_intermediate_size，不在测试里重写公式）---
+from model.common.mlp import align_intermediate_size
+aligned = align_intermediate_size(C.n_embd)
 assert C.intermediate_size == aligned, f"intermediate_size 应为 {aligned}，实得 {C.intermediate_size}"
 assert C.intermediate_size % 128 == 0, "intermediate_size 必须是 128 的倍数"
 
@@ -1920,11 +1928,36 @@ SwiGLU 前馈网络。
     对齐到 128 的倍数 = 容量不打折 + 张量核心友好。本项目 128×8/3 → 384。
 """
 
+import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def align_intermediate_size(n_embd: int, multiple: int = 128) -> int:
+    """
+    按 8/3 规则计算中间层维度，并对齐到 `multiple` 的倍数（向上取整）。
+
+    【为什么是 8/3】
+      SwiGLU 用**两个**矩阵做升维（gate + up），GPT-2 只用一个（c_fc）。
+      若中间维不变，参数量直接翻倍。把宽度砍到 8/3 ≈ 2.67 倍，
+      两个 2.67 宽的矩阵合起来才与一个 4 宽的矩阵参数量相当：
+          3 × (8/3) = 8 = 2 × 4  →  两边都是 8·n_embd²，**完全相等**。
+
+    【为什么要对齐到 multiple 的倍数】
+      向下取整到整数会削弱容量；向上取整到任意数字又可能让矩阵维度
+      不能被硬件的 128 宽度整除。对齐到 128 的倍数 = 容量不打折 + 张量核心友好。
+
+    参数：
+        n_embd:   残差流宽度
+        multiple: 对齐到的倍数
+    返回：
+        中间层维度（int）
+    """
+    raw = n_embd * 8 / 3
+    return int(math.ceil(raw / multiple) * multiple)
 
 
 class SwiGLUMLP(nn.Module):
@@ -1992,14 +2025,34 @@ class SwiGLUMLP(nn.Module):
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `cd qwen3-learning/qwen3-pytorch && python tests/test_swiglu.py`
-Expected 输出两行：先 `[参数对比] n_embd=128: SwiGLU(中间维=384) 294,912 vs GPT-2 GELU(中间维=512) 131,072 → 比值 2.25`，再 `test_swiglu OK`
+Expected 输出三行：
+```
+[参数对比] n_embd=128: SwiGLU(中间维=384) 147,456 vs GPT-2 GELU(中间维=512) 131,072 -> 比值 1.125
+  └─ 精确 8/3 时两者参数量相等 (8*n_embd^2)；本配置多出的 12.5% 全部来自向上对齐到 128 的倍数 (341.33 -> 384 = 3*128)
+test_swiglu OK  n_embd=128 intermediate=384
+```
 
-- [ ] **Step 5: 修正设计文档里的参数量结论**
+- [ ] **Step 5: 修正设计文档与笔记里的参数量结论**（2026-10-22 已执行）
 
-上面的输出会显示 `n_swiglu > n_gelu`（384 宽的三矩阵比 512 宽的两矩阵参数更多），此时第 5 条断言 `assert n_swiglu < n_gelu` 会失败。**处理办法**（二选一，按实际数字决定）：
+初稿的三个数字**全是错的**，已按实测修正：
 
-- 若比值 > 1：把断言改成 `assert n_swiglu / n_gelu < 3.0`，并在 `test_swiglu.py` 的打印行后加一行中文说明「本 tiny 配置下 384 宽使 SwiGLU 参数量为 4×-GELU 的 2.25 倍；真实 Qwen3-0.6B 用 hidden=1024 / intermediate=3072，比值为 0.75 —— 说明 8/3 规则的价值只在**大 n_embd** 时才体现，tiny 规模下要按比例下调 intermediate_size」
-- 同时在 `qwen3-pytorch设计.md` §4 的 `intermediate_size` 行加注：「tiny 规模下 384 会让参数量高于 GPT-2 的 4×-GELU，详见 `tests/test_swiglu.py` 的参数对比输出；这是 tiny 规模的取舍，不影响架构学习」
+| 初稿说法 | 实测 | 结论 |
+|---------|------|------|
+| SwiGLU(384) = 294,912 参数 | **147,456** | 初稿把 3 个矩阵算成了 6 个 |
+| 比 GPT-2 GELU(512) 多 2.25 倍 | **1.125 倍 (= 9/8)** | `3×384 / (2×512)` |
+| 真实 Qwen3-0.6B 比值 0.75 | **1.125 倍** | `3×1024×3072 / (2×1024×4096)`，同因 I = 3H |
+
+真正的规律（已写进 `Qwen3_SwiGLU_MLP_学习笔记.md` §2.1）：
+- 参数量 = 矩阵个数 × H × I
+- I 精确取 `8/3·H` 时，SwiGLU（3 矩阵）与 GPT-2 4×-GELU（2 矩阵）**参数量完全相等**（都是 8H²）
+  —— 8/3 规则的设计意图就是「持平」
+- 向上对齐到 128 的倍数后 I 变大 → 比值 = 1.125，超出量**全部来自对齐**
+- Qwen3-0.6B 实际用 `intermediate = 3×hidden = 3072`（**不是** 8/3 规则，8/3 来自 LLaMA），
+  算出来同样是 1.125
+
+已同步修改：
+- `qwen3-pytorch设计.md` §4 的 `intermediate_size` 行加注「8/3 来自 LLaMA，Qwen3 用 3×」
+- `Qwen3_SwiGLU_MLP_学习笔记.md` 新增 §2.1「参数量对照：三个矩阵怎么做到不爆」
 
 Run 验证:
 ```bash

@@ -98,7 +98,7 @@ tiny 尺寸，CPU 可训。以下是 `config.py` 的**初始值**，实施时以
 | `n_head` | 4 | Q head 数 |
 | `n_head_kv` | 2 | GQA：KV head 数，为 Q head 的 1/2 |
 | `head_dim` | 48 | **与 n_embd 解耦**：4 × 48 = 192 ≠ 128 |
-| `intermediate_size` | 384 | `128 × 8/3 = 341.3` → 对齐到 128 的倍数 |
+| `intermediate_size` | 384 | `128 × 8/3 = 341.3` → 对齐到 128 的倍数；也正好 = 3 × `n_embd`，与 Qwen3-0.6B 的 3×hidden 取法一致。**8/3 规则来自 LLaMA，Qwen3 实际用 3×** |
 | `rope_theta` | 1e6 | Qwen3 默认；真实值以官方 `config.json` 为准 |
 | `rms_eps` | 1e-6 | |
 | `block_size` | 128 | |

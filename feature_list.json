@@ -158,7 +158,7 @@
       "area": "qwen3-mlp",
       "title": "实现 SwiGLU 前馈网络",
       "user_visible_behavior": "model/common/mlp.py 实现 gate_proj / up_proj / down_proj 三矩阵 SwiGLU，中间维按 8/3 规则对齐到 128 的倍数。",
-      "status": "not_started",
+      "status": "passing",
       "verification": [
         "smoke：down_proj 输出形状等于残差流形状 (B, T, n_embd)",
         "smoke：验证 SwiGLU(x) = down(silu(gate(x)) * up(x))，与逐元素手写结果一致",
@@ -166,8 +166,14 @@
         "注释说明中间维取整规则，以及与 GPT-2 的 4×n_embd + GELU 的参数量差异",
         "tests/test_swiglu.py 通过并计入 tests/run_all.py 汇总"
       ],
-      "evidence": [],
-      "notes": "对应笔记 Qwen3_SwiGLU_MLP_学习笔记.md。【布局勘误】设计.md §3 的目录树把 SwiGLU 放在 qwen3_dense.py，但其 §3「设计要点」要求两个模型类只差 FFN 一处；开发计划.md Task 8 明确放 model/common/mlp.py（SwiGLUMLP）——按 common/ 共享实现，MoE 的专家才能复用同一份 SwiGLU。参数量对比（tiny 规模下 SwiGLU(384) 是 GPT-2 GELU(512) 的 2.25 倍，真实 Qwen3-0.6B 是 0.75 倍）要在笔记里说清「8/3 规则在 tiny 规模不体现」。对应 开发计划.md Task 8。"
+      "evidence": [
+        "2026-10-22 实现 model/common/mlp.py::SwiGLUMLP：gate_proj / up_proj / down_proj 三个 无 bias 的 Linear，forward = down_proj(silu(gate_proj(x)) * up_proj(x))，另附 align_intermediate_size(n_embd, multiple=128) 实现 8/3 规则 + 向上对齐。",
+        "2026-10-22 `python tests/test_swiglu.py` → `[参数对比] n_embd=128: SwiGLU(中间维=384) 147,456 vs GPT-2 GELU(中间维=512) 131,072 -> 比值 1.125` + `test_swiglu OK  n_embd=128 intermediate=384`（exit 0）；`python tests/run_all.py` → PASS=5 FAIL=0 TOTAL=5 / all green。",
+        "2026-10-22 测试覆盖 7 项：①输出形状回到 (B,T,n_embd) ②三个投影形状与无 bias ③与逐元素手写 silu(gate)*up→down 逐元素一致（atol 1e-5）④把 gate 置零后输出必变（门控有效）⑤参数量对比与 8/3 规则的精确等式 ⑥intermediate_size == align_intermediate_size(n_embd) 且是 128 倍数 ⑦位置无关性（逐位置独立）。",
+        "2026-10-22 **修正开发计划初稿里三处全错的数字**（已实测 + 已同步修正计划/设计文档/笔记）：①「SwiGLU(384) = 294,912 参数」→ 实测 **147,456**（初稿把 3 个矩阵当 6 个算了）；②「比 GPT-2 4×-GELU 多 2.25 倍」→ 实测 **1.125 倍 (= 9/8)**（3×384 / (2×512)）；③「真实 Qwen3-0.6B 比值 0.75」→ 实测同样是 **1.125 倍**（3×1024×3072 / (2×1024×4096)）。",
+        "2026-10-22 **算清了真正的规律**（写进 Qwen3_SwiGLU_MLP_学习笔记.md §2.1）：参数量 = 矩阵个数 × H × I。· I 精确取 8/3·H 时，SwiGLU(3 矩阵) 与 GPT-2 4×-GELU(2 矩阵) **参数量完全相等**（都是 8·H²）—— 8/3 规则的设计意图就是「持平」；· 本仓库 H=128，8/3·H=341.33 向上对齐到 384（=3×128），比值因此是 3×384/(2×512)=9/8=1.125，**多出的 12.5% 全部来自向上对齐**，与「三矩阵」本身无关；· **Qwen3-0.6B 实际用 intermediate = 3×hidden = 3072，不是 8/3 规则**（8/3 规则来自 LLaMA），算出来同样是 1.125。已在 设计.md §4 的 intermediate_size 行加注、在笔记 §2.1 补全对照表。"
+      ],
+      "notes": "对应笔记 Qwen3_SwiGLU_MLP_学习笔记.md。【布局勘误】设计.md §3 的目录树把 SwiGLU 放在 qwen3_dense.py，但其 §3「设计要点」要求两个模型类只差 FFN 一处；开发计划.md Task 8 明确放 model/common/mlp.py（SwiGLUMLP）——按 common/ 共享实现，MoE 的专家才能复用同一份 SwiGLU。【参数量结论已按实测修正】初稿的「2.25 倍」「0.75 倍」两个数字都算错了，实际是 1.125 倍（9/8），且超出量全部来自中间维向上对齐到 128 的倍数；精确 8/3 时 SwiGLU 与 4×-GELU 参数量相等。对应 开发计划.md Task 8。"
     },
     {
       "id": "feat-016",
