@@ -130,7 +130,7 @@
       "area": "qwen3-attn",
       "title": "实现 QK-Norm 注意力与 GQA",
       "user_visible_behavior": "model/common/attention.py 同时支持 GQA（n_head_kv < n_head）与 QK-Norm，KV Cache 长度按 kv 头数分配。",
-      "status": "in_progress",
+      "status": "passing",
       "verification": [
         "Q、K 在进入 RoPE 前各过一次 RMSNorm（QK-Norm 必须在 RoPE 之前，代码注释写明理由）",
         "KV 通过 repeat_interleave 扩到 n_head（不可用 repeat——那会退化成 MQA）",
@@ -139,8 +139,18 @@
         "smoke：KV Cache 占用为同尺寸 MHA 的 1/4；不同 batch 元素的 KV Cache 不互相污染",
         "smoke：因果性 —— 改动后 3 个 token 不影响前 5 个位置的输出"
       ],
-      "evidence": [],
-      "notes": "对应笔记 Qwen3_QK-Norm_学习笔记.md 与 Qwen3_GQA与KV_Cache_完整学习笔记.md。这里要显式验证 GQA 相比 MHA 的 KV 缓存缩小为 1/4。KVCache 独立成 model/common/kv_cache.py，按 n_head_kv 分配，两态：prefill 写整段、decode 每步写 1 个。对应 开发计划.md Task 6（KVCache）+ Task 7（Attention）。"
+      "evidence": [
+        "2026-10-22 实现 model/common/attention.py::CausalSelfAttention：q_proj(H·D) / k_proj(Hkv·D) / v_proj(Hkv·D) / o_proj(H·D→n_embd) 四个独立投影（因 head_dim 与 n_embd 解耦，Q/K/V 输出维度不等，无法合并成一个 c_attn）；q_norm / k_norm 为作用在 head_dim 上的 RMSNorm；rope 为 RoPE(head_dim, block_size, theta)。",
+        "2026-10-22 抽出的 _project_and_rotate(x, position_ids) 明确固化执行顺序：投影 → 拆 head → QK-Norm → RoPE；该 helper 的存在是为了让顺序**可被数值验证**而非只靠注释。",
+        "2026-10-22 `python tests/test_attention.py` → `test_attention OK n_head=4 n_head_kv=2 group=2 head_dim=8 顺序差(非均匀gain)=7.3810 顺序差(均匀gain)=3.58e-07`（exit 0）；`python tests/run_all.py` → PASS=4 FAIL=0 TOTAL=4 / all green。",
+        "2026-10-22 测试覆盖 9 项：①输出形状 (B,T,n_embd) 与四个投影维度 ②因果性（改后 2 个 token 不影响前 4 个位置）③**QK-Norm 在 RoPE 之前**（见下条）④GQA 分组语义 ⑤KV Cache prefill+decode == 全量 forward ⑥eval 确定性 ⑦QK-Norm 作用维是 head_dim ⑧RoPE 相对位置性质 ⑨head_dim 与 n_embd 解耦配置可用。",
+        "2026-10-22 **QK-Norm 顺序的数值证明（用非均匀 gain）**：把 q_norm.gain 设为 arange(1, D+1) 后，实现的 q 与手工 `rope(norm(q_raw))` 逐元素相同（max|diff| < 1e-5），而与手工 `norm(rope(q_raw))` 相差 **7.38**（>1.0 阈值），即顺序被真正区分而非「看起来接上了」。",
+        "2026-10-22 **一个实测发现（已写进 attention.py 文件头注释）**：RMSNorm 与 RoPE 在 gain **均匀**（初始化值=1）时数值上几乎可交换 —— 实测两种顺序 max|diff| 仅 3.58e-07（纯浮点噪声）；只有 gain **非均匀**（可学习参数被训成非均匀）时才显著不同（7.38 ~ 14.9）。原因：rotate_half 把特征维前后两半交叉配对（dim i ↔ dim i+half），均匀缩放与旋转可交换，非均匀缩放不可交换。**推论**：开发计划初稿里那条「把 gain 乘 3.0 → 输出变化」的测试**证明不了顺序**（均匀缩放仍可交换），必须换成非均匀 gain 才有区分力；已就此修正开发计划正文与本条测试。",
+        "2026-10-22 **修正开发计划初稿的测试错误（3 处）**：①初稿第 3 条用「gain 乘 3.0」验证顺序 —— 改用非均匀 gain arange(1,D+1) 并加「均匀 vs 非均匀」对照；②初稿第 6 条断言「不同绝对位置 → 输出不同」是**错的** —— RoPE 是相对位置编码，整体平移位置后注意力输出本就应不变（实测 max|diff| < 1e-5），已改为「平移不变性」+「改变相对距离才变输出」两条正确断言；③初稿 causal mask 取 mask[:T_q,:T_kv] —— 在「有 cache 且 T_q>1」时会错杀历史 key，实现已改为 mask[T_kv-T_q : T_kv, :T_kv]（无 cache 时与初稿等价）。",
+        "2026-10-22 GQA 语义用「手工复算 + 反面对照」验证：手工按 repeat_interleave 复算的整条注意力链路（缩放点积→因果 mask→softmax→加权求和→o_proj）与实现逐元素一致（max|diff| < 1e-5），而按 repeat（错误语义，退化成 MQA）复算的结果与实现明显不同 —— 证明用的是 repeat_interleave。",
+        "2026-10-22 KV Cache 端到端验证：prefill 3 步 + 逐 token decode 到第 6 个位置，每步输出都与「一次性全量 forward」对应位置一致（atol 1e-5），cache 长度递进正确。"
+      ],
+      "notes": "对应笔记 Qwen3_QK-Norm_学习笔记.md 与 Qwen3_GQA与KV_Cache_完整学习笔记.md。KVCache 独立成 model/common/kv_cache.py，按 n_head_kv 分配，两态：prefill 写整段、decode 每步写 1 个。【重要结论，已进代码注释】QK-Norm 必须在 RoPE 之前 —— 但这条约束在 gain 均匀时**不产生任何数值差异**，只有 gain 学成非均匀后才显现；所以「QK-Norm 在 RoPE 之前」的价值主要是①对齐官方实现 ②gain 学成非均匀后不会把旋转和缩放搅在一起。笔记里必须写清这一点，否则会给出「顺序可随便换」的错误印象。对应 开发计划.md Task 6（KVCache）+ Task 7（Attention）。"
     },
     {
       "id": "feat-015",

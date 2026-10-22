@@ -1429,9 +1429,21 @@ assert 4 * 48 != C.n_embd, "本测试的前提就是 n_head*head_dim != n_embd"
 # =====================================================================
 # 3) 【核心】QK-Norm 在 RoPE 之前 —— 用数值证明
 # =====================================================================
-# 思路：把 q_norm 的 gain 调成一个极端值。若 QK-Norm 在 RoPE 之后，
-# 那么 RoPE 的 cos/sin 会先与未归一化的 q 相乘，结果与 gain 无关地不同；
-# 若在 RoPE 之前，gain 会直接影响最终输出。
+# ⚠️ 实测修正（2026-10-22）：初稿用「把 gain 乘 3.0 → 输出变化」来验证顺序，
+#    这是**证明不了顺序**的 —— 均匀缩放与 RoPE 旋转可交换（详见下面注释）。
+#    要真正区分顺序，必须用**非均匀** gain。
+#
+# 【为什么均匀 gain 区分不了】
+#   rotate_half 把特征维前后两半交叉配对（dim i ↔ dim i+half）。
+#   顺序 A：RoPE(Norm(q))  = R(g ⊙ q / rms(q))
+#   顺序 B：Norm(RoPE(q))  = g ⊙ R(q) / rms(q)   （R 是正交变换，rms(R(q)) = rms(q)）
+#   当 g = c·1（均匀）时，R(c ⊙ q) = c ⊙ R(q)，两式**完全相等**（实测 max|diff| ≈ 3.6e-7，浮点噪声）。
+#   只有 g 非均匀时两者才不同（实测 max|diff| ≈ 7.4 ~ 14.9）。
+#
+# 【这个发现的推论（必须写进笔记）】
+#   「QK-Norm 必须在 RoPE 之前」这条约束，在 gain 均匀（= 初始化值 1）时
+#   **不产生任何数值差异**。它的价值是：① 对齐官方实现 ② gain 学成非均匀后
+#   不会把逐维缩放和旋转搅在一起。绝不能让人误以为「顺序随便换都行」。
 attn3 = CausalSelfAttention(
     n_embd=64, n_head=4, n_head_kv=2, head_dim=16,
     block_size=32, dropout=0.0, bias=False,
@@ -1439,13 +1451,38 @@ attn3 = CausalSelfAttention(
 )
 attn3.eval()
 xin = torch.randn(1, 6, 64)
+
+# --- 3a) 实现走的是「QK-Norm → RoPE」 ---
+B3, T3, _ = xin.shape
+q_impl, k_impl = attn3._project_and_rotate(xin)
+q_raw = attn3.q_proj(xin).view(B3, T3, 4, 16).transpose(1, 2)
+k_raw = attn3.k_proj(xin).view(B3, T3, 2, 16).transpose(1, 2)
+q_A, k_A = attn3.rope(attn3.q_norm(q_raw), attn3.k_norm(k_raw))   # 顺序 A（正确）
+q_B_raw, _ = attn3.rope(q_raw, k_raw)
+q_B = attn3.q_norm(q_B_raw)                                     # 顺序 B（错误）
+assert torch.allclose(q_impl, q_A, atol=1e-5), "实现与「QK-Norm → RoPE」不一致"
+assert torch.allclose(k_impl, k_A, atol=1e-5), "实现与「QK-Norm → RoPE」不一致（K）"
+
+# --- 3b) 用**非均匀** gain 让两序真正分开 ---
 with torch.no_grad():
-    base = attn3(xin)[0]
-    # 把 q_norm 的 gain 拉大 3 倍
-    attn3.q_norm.gain.mul_(3.0)
-    after = attn3(xin)[0]
-assert not torch.allclose(base, after, atol=1e-3), \
-    "改变 q_norm.gain 后输出无变化，说明 QK-Norm 可能未接入或被绕过"
+    attn3.q_norm.gain.copy_(torch.arange(1, 17, dtype=torch.float32))
+    attn3.k_norm.gain.copy_(torch.arange(1, 17, dtype=torch.float32))
+q_impl2, _ = attn3._project_and_rotate(xin)
+diff_ab = (q_impl2 - q_B).abs().max().item()
+assert diff_ab > 1.0, f"非均匀 gain 下两序竟几乎相同（{diff_ab:.3e}），顺序没被真正区分"
+
+# --- 3c) 反面对照：均匀 gain 时两序数值几乎一致（可交换）---
+attn3u = CausalSelfAttention(
+    n_embd=64, n_head=4, n_head_kv=2, head_dim=16,
+    block_size=32, dropout=0.0, bias=False,
+    rope_theta=C.rope_theta, rms_eps=C.rms_eps,
+)
+attn3u.eval()
+q_Au, _ = attn3u.rope(attn3u.q_norm(q_raw), attn3u.k_norm(k_raw))
+q_Bu_raw, _ = attn3u.rope(q_raw, k_raw)
+q_Bu = attn3u.q_norm(q_Bu_raw)
+diff_uniform = (q_Au - q_Bu).abs().max().item()
+assert diff_uniform < 1e-4, f"均匀 gain 时两序应几乎相同，实得 {diff_uniform:.3e}"
 
 # QK-Norm 确实是 RMSNorm 且无 bias
 assert isinstance(attn3.q_norm.gain, torch.nn.Parameter)
@@ -1472,7 +1509,9 @@ assert not torch.allclose(o1[:, 5:, :], o2[:, 5:, :], atol=1e-5), "改动后 tok
 # =====================================================================
 # 5) GQA 下 KV head 共享：同组 Q head 看到完全相同的 K/V
 # =====================================================================
-# 把某个 KV head 的缓存内容污染掉，同组的所有 Q head 都应受影响
+# 实现思路：手工复算整条注意力链路（缩放点积→因果 mask→softmax→加权求和→o_proj），
+# 与实现逐元素比对；再按「错误的 repeat 语义」复算一遍，断言结果**不同**。
+# 这样既证明实现算对了，也证明它用的不是 repeat（repeat 会退化成 MQA）。
 attn5 = CausalSelfAttention(
     n_embd=64, n_head=8, n_head_kv=2, head_dim=16,
     block_size=32, dropout=0.0, bias=False,
@@ -1501,6 +1540,19 @@ print(f"test_attention OK  n_head={attn.n_head} n_head_kv={attn.n_head_kv} "
       f"head_dim={attn.head_dim} n_embd={C.n_embd} "
       f"(n_head*head_dim={attn.n_head*attn.head_dim} != n_embd)")
 ```
+
+> **实测修正记录（2026-10-22，Task 7 实施后回填）**
+> 1. **第 3 条的顺序证明方法错了**：初稿「把 gain 乘 3.0 → 输出变化」**证明不了顺序**。
+>    均匀缩放与 RoPE 旋转可交换（实测两序 max|diff| ≈ 3.6e-7），只有**非均匀** gain
+>    才区分得开（实测 7.4 ~ 14.9）。已改为非均匀 gain + 「均匀/非均匀」对照双断言。
+>    **这个发现必须写进 Qwen3_QK-Norm_学习笔记.md** —— 否则读者会误以为「顺序随便换都行」。
+> 2. **第 8 条（原第 6 条附近）初稿的「不同绝对位置 → 输出不同」是错的**：
+>    RoPE 是相对位置编码，整体平移位置后输出本就应不变（实测 max|diff| < 1e-5）。
+>    已改为「平移不变性」+「改变相对距离才变输出」两条正确断言。
+> 3. **实现层的 causal mask 切片修正**：`mask[:T_q,:T_kv]` → `mask[T_kv-T_q:T_kv,:T_kv]`，
+>    否则「有 cache 且 T_q>1」时会错杀 cache 里的历史 key。
+> 4. 实施时额外把「投影+QK-Norm+RoPE」抽成 `_project_and_rotate()` helper，
+>    让顺序断言能直接拿到中间量 q/k，不必绕 forward 反推。
 
 - [ ] **Step 2: 运行，确认失败**
 
@@ -1608,6 +1660,42 @@ class CausalSelfAttention(nn.Module):
             persistent=False,
         )
 
+    def _project_and_rotate(
+        self,
+        x: "torch.Tensor",
+        position_ids: Optional["torch.Tensor"] = None,
+    ) -> Tuple["torch.Tensor", "torch.Tensor"]:
+        """
+        投影 → 拆 head → **QK-Norm** → **RoPE**，返回 (q, k)。
+
+        单独抽出来是为了让「QK-Norm 在 RoPE 之前」这条约束**可被数值验证**
+        （见 tests/test_attention.py 第 3 条），而不是只靠注释断言。
+
+        参数：
+            x:            (B, T_q, n_embd)
+            position_ids: (B, T_q) 绝对位置；None 时用 0..T_q-1
+        返回：
+            (q, k)，各 (B, n_head/n_head_kv, T_q, head_dim)
+        """
+        B, T_q, _ = x.size()
+        H = self.n_head
+        Hkv = self.n_head_kv
+        D = self.head_dim
+
+        # --- 1) 三个独立投影 ---
+        q = self.q_proj(x).view(B, T_q, H, D).transpose(1, 2)      # (B, H,   T_q, D)
+        k = self.k_proj(x).view(B, T_q, Hkv, D).transpose(1, 2)    # (B, Hkv, T_q, D)
+
+        # --- 2) QK-Norm：在 RoPE 之前 ---
+        # 逐 head 对 head_dim 做 RMSNorm，形状不变
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # --- 3) RoPE：按绝对位置旋转 ---
+        q, k = self.rope(q, k, position_ids=position_ids)
+
+        return q, k
+
     def forward(
         self,
         x: "torch.Tensor",
@@ -1659,18 +1747,9 @@ class CausalSelfAttention(nn.Module):
         Hkv = self.n_head_kv
         D = self.head_dim
 
-        # --- 1) 三个独立投影 ---
-        q = self.q_proj(x).view(B, T_q, H, D).transpose(1, 2)      # (B, H,   T_q, D)
-        k = self.k_proj(x).view(B, T_q, Hkv, D).transpose(1, 2)    # (B, Hkv, T_q, D)
+        # --- 1) 投影 + QK-Norm + RoPE（顺序固化在 _project_and_rotate 里）---
+        q, k = self._project_and_rotate(x, position_ids=position_ids)
         v = self.v_proj(x).view(B, T_q, Hkv, D).transpose(1, 2)    # (B, Hkv, T_q, D)
-
-        # --- 2) QK-Norm：在 RoPE 之前 ---
-        # 逐 head 对 head_dim 做 RMSNorm，形状不变
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # --- 3) RoPE：按绝对位置旋转 ---
-        q, k = self.rope(q, k, position_ids=position_ids)
 
         # --- 4) KV Cache：写入新算出的 K/V，取出累计的全长 K/V ---
         if kv_cache is not None:
@@ -1692,8 +1771,12 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k_full.transpose(-2, -1)) * (1.0 / math.sqrt(D))   # (B, H, T_q, T_kv)
 
         # --- 7) 因果 mask（仅 prefill / 训练需要）---
+        # ⚠️ 实测修正（2026-10-22）：取 mask[T_kv-T_q : T_kv, :T_kv] 而非 mask[:T_q, :T_kv]
+        #   · 无 cache 的 prefill：T_kv == T_q → 两者等价 ✓
+        #   · 有 cache 且 T_q>1：query i 的绝对位置是 (T_kv-T_q)+i，它应当能看到
+        #     全部 T_kv 个 key（含 cache 里的历史），用 mask[:T_q] 会错杀历史 key
         if T_q > 1:
-            att = att.masked_fill(self.mask[:T_q, :T_kv], float("-inf"))
+            att = att.masked_fill(self.mask[T_kv - T_q:T_kv, :T_kv], float("-inf"))
 
         # --- 8) softmax + 加权求和 ---
         att = F.softmax(att, dim=-1)
