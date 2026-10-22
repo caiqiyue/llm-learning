@@ -2141,7 +2141,7 @@ print(f"[参数量] total={total:,} embedding={n_emb_params:,} "
 
 # --- 8) 因果性：模型级也不泄漏未来 ---
 x2 = idx.clone()
-x2[:, T // 2:, :] = torch.randint(0, VOCAB, (B, T - T // 2))
+x2[:, T // 2:] = torch.randint(0, VOCAB, (B, T - T // 2))   # idx 是 (B,T) 二维，不能多写一维
 with torch.no_grad():
     l1 = model(idx)[0]
     l2 = model(x2)[0]
@@ -2459,9 +2459,14 @@ Expected: 两行输出，`[参数量] total=...` 后跟 `test_dense OK`
 
 - [ ] **Step 5: 把 `init.sh` 的 L4 前向段纳入验证**
 
+`init.sh` 的 L4 前向段原本要求 `data/vocab.json` 存在才跑，导致 feat-016 完成后
+L4 仍然是 SKIP。已改为：**只要 `model/qwen3_dense.py` 存在就跑**——
+有真词表就用真的（feat-022 之后），没有则用假词表 512 占位，
+守住「import / 形状 / loss 有限」这条底线，不阻塞验证。
+
 Run:
 ```bash
-python -c "
+cd qwen3-learning/qwen3-pytorch && python -c "
 import torch
 from config import DENSE_CONFIG
 from model.qwen3_dense import Qwen3Dense
@@ -2472,12 +2477,14 @@ assert logits.shape == (2, 8, 512) and extras == {}
 print('L4 前向 smoke 就绪:', m.num_params())
 "
 ```
-Expected: `L4 前向 smoke 就绪: <数字>`
+Expected: `L4 前向 smoke 就绪: 951808`
+
+实测：`bash init.sh` → **PASS=22 SKIP=0 FAIL=0**（此前是 PASS=21 SKIP=1）。
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add qwen3-learning/qwen3-pytorch feature_list.json
+git add qwen3-learning/qwen3-pytorch feature_list.json init.sh
 git commit -m "feat-016: 实现 Qwen3Dense 完整前向（恒定 4 元组返回 + 权重绑定 + 无 pos_emb）"
 ```
 

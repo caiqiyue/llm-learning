@@ -181,7 +181,7 @@
       "area": "qwen3-model",
       "title": "Qwen3 完整前向与权重绑定",
       "user_visible_behavior": "model/qwen3_dense.py 串起 embedding + N × Block + final RMSNorm + lm_head，前向恒定返回 4 元组 (logits, loss, kv_cache, extras)。",
-      "status": "not_started",
+      "status": "passing",
       "verification": [
         "smoke：logits 形状为 (B, T, vocab_size)，loss 在 targets 给出时有限（≈ ln(V)）",
         "确认权重绑定策略（tie_embeddings）在代码与注释中明确，lm_head.weight is wte.weight",
@@ -190,8 +190,16 @@
         "无加法式 pos_emb；超 block_size 时报错",
         "bash init.sh 全绿（L2/L4 均 PASS）"
       ],
-      "evidence": [],
-      "notes": "接口刻意与 GPT-2 的 GPT2.forward 保持一致（4 元组返回），便于写等价性对照测试 feat-017。结构：wte → N × Pre-LN Block → final RMSNorm → lm_head(tied)；Block = x + Attn(RMSNorm(x)) → x + SwiGLU(RMSNorm(x))。对应 开发计划.md Task 9。"
+      "evidence": [
+        "2026-10-22 实现 model/qwen3_dense.py::Block（Pre-LN Transformer block）+ ::Qwen3Dense（wte → N×Block → ln_f → lm_head）：无 sinusoidal pos_emb（位置由 attention 内部 RoPE 承担）、ln_1/ln_2/ln_f 三处 RMSNorm、SwiGLU FFN、lm_head 与 wte 权重绑定（lm_head.weight = wte.weight，同一张量，优化器只更新一份）。",
+        "2026-10-22 forward **恒定返回 4 元组** (logits, loss, kv_cache, extras)：dense 的 extras 恒为 {}，MoE 版往后往 extras 里塞 aux_loss / 专家负载 —— 训练脚本统一写 extras.get('aux_loss') 即可，不需要 if 分支猜返回结构。",
+        "2026-10-22 `python tests/test_dense.py` → `[参数量] total=951,808 embedding=65,536 (6.9%) 非embedding=886,272` + `test_dense OK  params=951,808 layers=4 n_head=4 n_head_kv=2 head_dim=48`（exit 0）；`python tests/run_all.py` → PASS=6 FAIL=0 TOTAL=6 / all green。",
+        "2026-10-22 测试覆盖 12 项：①logits 形状 (B,T,V) + 4 元组结构 + extras=={} ②给 targets 时 loss 有限且接近 ln(512)=6.24 ③权重绑定（is 同一对象 + parameters() 去重）④无 pos_emb 参数 ⑤层数与各子层类型 ⑥ln_1/ln_2 维度 = n_embd ⑦num_params 与实际自洽 ⑧模型级因果性 ⑨超 block_size 抛 ValueError ⑩eval 确定性 ⑪**模型级 KV Cache**（prefill 5 步 + 逐 token decode 到 16 步，每步与全量 forward 对应位置一致）⑫**梯度能从 lm_head 回流到 wte**（验证权重绑定真的接上了）。",
+        "2026-10-22 **修正开发计划初稿的测试 bug（1 处）**：初稿第 8 条写 `x2[:, T // 2:, :] = ...`，但 idx 是 (B,T) **二维**张量，多写一维会抛 IndexError: too many indices for tensor of dimension 2 —— 已改为 `x2[:, T // 2:] = ...` 并就地修正开发计划正文。",
+        "2026-10-22 **init.sh 的 L4 前向段改造**：原本要求 data/vocab.json 存在才跑，导致 feat-016 完成后 L4 仍 SKIP。已改为只要 model/qwen3_dense.py 存在就跑：有真词表用真的（feat-022 之后），没有则用假词表 512 占位，守住「import / 形状 / loss 有限」这条底线。实测 `bash init.sh` → **PASS=22 SKIP=0 FAIL=0**（此前 PASS=21 SKIP=1）。",
+        "2026-10-22 参数量实测 951,808（embedding 占 6.9%）：n_embd=128 / head_dim=48（4×48=192≠128，解耦在真模型里生效）时 embedding 占比只有 6.9%，与 GPT-2 线「小词表下 embedding 占比很高」的直觉相反 —— 原因是本模型 head_dim 解耦后每层参数量被放大（attn 投影 192 维而非 128 维）。"
+      ],
+      "notes": "对应笔记 Qwen3_训练推理完整学习笔记.md。恒定 4 元组返回是本线的设计决策：dense 与 MoE 共用同一套训练脚本接口（extras.get('aux_loss')）。无 pos_emb 是 Qwen3 与 GPT-2 最直观的结构差异之一（RoPE 把位置编码进 Q/K 内部）。对应 开发计划.md Task 9。"
     },
     {
       "id": "feat-022",

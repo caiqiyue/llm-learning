@@ -244,26 +244,36 @@ else
     fi
   fi
 
-  # --- 端到端前向（feat-016 之后才可用）---
-  if [ -f "$QWEN_DIR/model/qwen3_dense.py" ] && [ -f "$QWEN_DIR/data/vocab.json" ] && [ "$HAS_TORCH" -eq 1 ]; then
+  # --- 端到端前向（feat-016 之后可用；vocab.json 就绪前用假词表占位）---
+  if [ -f "$QWEN_DIR/model/qwen3_dense.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
     (cd "$QWEN_DIR" && "$PY" - <<'PY' >/tmp/llm_init_l4_fwd.log 2>&1
+import os
 import torch
 from config import DENSE_CONFIG
-from data.tokenizer import BPETokenizer
 from model.qwen3_dense import Qwen3Dense
 
-tk = BPETokenizer("data/vocab.json", "data/merges.txt")
-model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=DENSE_CONFIG, dropout=0.0)
+# 有真词表就用真的（feat-022 之后），没有则用假词表占位，
+# 目的只是守住「import / 形状 / loss 有限」这条底线，不阻塞验证。
+if os.path.exists("data/vocab.json"):
+    from data.tokenizer import BPETokenizer
+    tk = BPETokenizer("data/vocab.json", "data/merges.txt")
+    vocab_size = tk.vocab_size
+    src = "vocab.json"
+else:
+    vocab_size = 512
+    src = "fake-vocab(512)"
 
-idx = torch.randint(0, tk.vocab_size, (2, 8))
+model = Qwen3Dense(vocab_size=vocab_size, cfg=DENSE_CONFIG, dropout=0.0)
+
+idx = torch.randint(0, vocab_size, (2, 8))
 logits, loss, cache, extras = model(idx)
-assert logits.shape == (2, 8, tk.vocab_size), f"logits 形状错: {tuple(logits.shape)}"
+assert logits.shape == (2, 8, vocab_size), f"logits 形状错: {tuple(logits.shape)}"
 assert extras == {}, f"dense 的 extras 应为空 dict，实得 {extras}"
 
-targets = torch.randint(0, tk.vocab_size, (2, 8))
+targets = torch.randint(0, vocab_size, (2, 8))
 logits, loss, _, _ = model(idx, targets=targets)
 assert loss is not None and torch.isfinite(loss), f"loss 异常: {loss}"
-print(f"logits {tuple(logits.shape)} loss {loss.item():.4f} params {model.num_params():,}")
+print(f"[{src}] logits {tuple(logits.shape)} loss {loss.item():.4f} params {model.num_params():,}")
 PY
     )
     if [ $? -eq 0 ]; then
@@ -272,7 +282,7 @@ PY
       fail "Qwen3 前向 smoke" "$(tail -3 /tmp/llm_init_l4_fwd.log | tr '\n' ' ')"
     fi
   else
-    skip "Qwen3 前向 smoke" "model/qwen3_dense.py 或 data/vocab.json 尚未就绪（feat-011/feat-022），或 torch 不可用"
+    skip "Qwen3 前向 smoke" "model/qwen3_dense.py 尚未就绪（feat-016），或 torch 不可用"
   fi
 fi
 
