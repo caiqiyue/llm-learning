@@ -11,12 +11,12 @@
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（WIP=0；下一条是 `feat-011` Qwen3 代码骨架）
-- 当前最高优先级未完成 feature：`feat-011` Qwen3 代码骨架与独立 `config.py`
+- 当前活跃 feature：**无**（WIP=0；下一条是 `feat-019` 预训练语料与偏好数据构造）
+- 当前最高优先级未完成 feature：`feat-019` Qwen3 预训练语料与 DPO 偏好数据构造
 - ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
 - 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-22 在修复后的环境里重跑产出**，指标可信（见 `feature_list.json` feat-002~007 的 evidence）
 - 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` 7 篇（缺 BPE / LoRA / DPO 三篇，见 feat-008）
-- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **尚未创建**（计划已就位：`qwen3-learning/qwen3-pytorch设计.md` + `qwen3-learning/qwen3-pytorch开发计划.md`）
+- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层已全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE），`bash init.sh` L4 前向 smoke 已用真实词表（778）跑通；**训练侧（预训练 / LoRA / DPO）与评估侧尚未开工**
 
 ---
 
@@ -188,3 +188,85 @@ $ bash E:/tmp/run_l3.sh        # P1 全量
 `gpt-learning/gpt-learning-pytorch/data/build_vocab.py`、
 `gpt-learning/gpt-learning-pytorch/train_pretrain.py`、`train_sft.py`、`train_reward.py`、`train_ppo_standard_adapted.py`、
 `qwen3-learning/qwen3-pytorch设计.md`（新增）、`qwen3-learning/qwen3-pytorch开发计划.md`（新增）
+
+---
+
+### Session 004 — Qwen3 线组件层从零实现（feat-011 → feat-022）
+
+- **日期**：2026-10-22
+- **目标**：按 `qwen3-pytorch开发计划.md` 把 Qwen3 线的**组件层**全部手写出来，每个组件都要有可运行的对照/消融证据（仓库硬约束：不能只靠文字断言）
+
+**做了什么**（每条一个独立 commit，WIP=1，测试先失败后通过）
+
+1. **feat-011 骨架**：`qwen3-learning/qwen3-pytorch/` 落地，`config.py` 用 `Qwen3Config` dataclass 统一 dense / MoE 两套超参（不复制 GPT-2 线的 config）。
+2. **feat-012 RMSNorm**：无 bias、无均值中心化、可学习 gain；smoke 断言「平方均值归一化到 1」而不是「均值≈0」。
+3. **feat-013 RoPE**：`theta=1e6` + `position_ids` 增量位置接口 + 旋转等变性 smoke。
+4. **feat-014a KVCache**：按 `n_head_kv` 分配，GQA 下占用 = MHA 的 1/4。
+5. **feat-014b 注意力**：QK-Norm + GQA + RoPE 三合一，**QK-Norm 在 RoPE 之前**。
+6. **feat-015 SwiGLU**：三矩阵门控（无 bias），`8/3` 中间维对齐规则 + 参数量对照 smoke。
+7. **feat-016 Qwen3Dense**：完整前向，**恒定 4 元组返回** `(logits, loss, kv_cache, extras)` + 权重绑定 + 无 pos_emb。
+8. **feat-021 Qwen3MoE**：Router top-k + 真稀疏专家（forward hook 证明只算 N·K 行）+ 负载均衡 aux_loss。
+9. **feat-022 byte-level BPE**：`data/bpe.py` + `data/tokenizer.py` + `data/build_vocab.py`，零新依赖。
+
+**四条可迁移的实测结论**（已写进笔记，不是拍脑袋）
+
+- **QK-Norm 在 RoPE 前 vs 后，用均匀 gain 测不出来**：两者数值几乎相同（max|diff| ≈ 3.6e-07），因为 `rotate_half` 把第 i 维和第 i+half 维配对，逐维 gain 与旋转不对易。**只有非均匀 gain 才暴露差异（7.38 ~ 14.9）**。⇒ 任何用 `gain.mul_(3.0)` 这类均匀增益的测试都**证明不了顺序**。
+- **SwiGLU 与 GPT-2 4×-GELU 的参数量差 = `矩阵数 × H × I`**。I 严格取 8/3·H 时两者**完全相等**（都是 8H²，这正是 8/3 规则的目的）；本仓库把 341.33 向上取整到 384（=3×128），比值 = 9/8 = **1.125×**，超出部分全部来自取整。另注：Qwen3-0.6B 实际用的是 **3×hidden**，8/3 是 LLaMA 的规则。
+- **aux_loss 的量纲有 Switch 版和 Mixtral 版两套**：Switch 论文版 `L=N·Σf_i p_i` 均匀时 = 1；HF Mixtral 版对 tokens×k 槽位求均值、系数是专家数 E，均匀时 = **1/K**（本仓库 K=2 → 0.5）。混用会得出「均匀时 aux_loss=1」的错误结论。已写进 `Qwen3_MoE_学习笔记.md` §19.1。
+- **RoPE 是相对位置编码**：把所有绝对位置整体平移，注意力输出**不变**（max|diff| < 1e-5）；只有改变**相对距离**才会改变输出。初稿测试「不同绝对位置应产生不同输出」本身是错的，已改成「整体平移不变 + 插入 token 改变相对距离则输出改变」两条。
+
+**feat-022 修正的 5 个真 bug**（开发计划 Task 11 的初稿设计里全都有）
+
+1. **id 撞车** —— 字节 token 占 id 1..256，合并 token 却从 256 开始 → **字节 0xFF 被静默吞掉**。改为 `BASE_VOCAB_SIZE=257 / MERGE_OFFSET=257`，并加回归断言。
+2. **`merges.txt` 解析不了** —— 空格/换行本身就是字节 token，`line.split(" ")` 必错。改用 GPT-2 的 byte→unicode 双射（`Ġ`=空格、`Ċ`=换行），格式与 HF tokenizers 兼容。
+3. **测试断言类型写错** —— `vocab["<|endoftext|>"] == 0`（vocab 是 `{id: bytes}`）→ 改为 `vocab[0] == b"<|endoftext|>"`。
+4. **训练侧与编码侧 id 差 1** —— `train_bpe` 用原始字节值、`encode`/词表用字节值+1 → 合并规则全错（39B → 37 tokens）。修正后同句 → 6 tokens。
+5. **训练太慢 + 压缩断言的适用范围** —— 改为预分词后按块去重计数（训练单元 = 编码单元，语料以句子列表返回），十几分钟 → 秒级；压缩断言只能用**语料内**句子。
+
+**验证**
+
+```
+$ python data/build_vocab.py
+[build_vocab] 语料 20000 句 / 785065 字节
+[build_vocab] 词表 778（合并 521 次，目标 1000）
+[build_vocab] 压缩比：19641 字节 -> 2767 tokens (7.10 字节/token)
+
+$ python tests/test_bpe.py
+[压缩] 语料内句子 39B -> 15 tokens (2.60 字节/token)
+[真实词表] vocab=778 merges=521 'The student trained ' 39B -> 6 tokens
+test_bpe OK  vocab=293 merges=36 'The student trained ' 39B -> 15 tokens
+
+$ python tests/run_all.py
+  [PASS] test_attention.py … [PASS] test_bpe.py … [PASS] test_dense.py … [PASS] test_kv_cache.py
+  [PASS] test_moe.py … [PASS] test_rmsnorm.py … [PASS] test_rope.py … [PASS] test_swiglu.py
+[run_all] PASS=8  FAIL=0  TOTAL=8
+
+$ bash init.sh
+L4 [PASS] Qwen3 前向 smoke（logits 形状 + loss 有限 + 参数量）[vocab.json] logits (2, 8, 778) loss 6.6282 params 985,856
+汇总: PASS=22  SKIP=0  FAIL=0
+```
+
+**未解决 / 风险**
+
+- **BPE 词表只有 778 < 目标 1000**：合成语料的可合并对用尽（521 次合并后没有频次 ≥ 2 的对），属于语料多样性问题，不是实现 bug（`config.py` 已注明「实际大小由训练语料决定」）。
+- **BPE 语料与预训练语料是两个生成器**：`build_vocab.py` 与（待写的）`data/pretrain_data.py` 各自合成语料，词表对预训练语料的覆盖率会打折。Task 12 需把语料生成器收敛成**唯一真值**（建议放到 `data/pretrain_data.py`，`build_vocab.py` 改为 import 它）并重新生成词表。
+- **MoE 的「参数多 N 倍、计算只多 k 倍」在本仓库不成立**：专家更窄（128 vs 384），全模型只多 1.21×。已在笔记 §25.1 写清前提条件。
+- 笔记仍有缺口：`Qwen3_BPE_学习笔记.md` / `Qwen3_LoRA与DPO_学习笔记.md` 未写（按计划在 feat-008 / Task 19 补）。
+
+**下一步**
+
+1. 开 `feat-019`：写 `data/pretrain_data.py` + `data/preference_data.py`（语料生成器唯一真源，DPO 偏好对至少 3 种「变差」策略）
+2. `feat-020` 预训练 smoke（`--model dense|moe`，超参全从 config 读）
+3. `feat-023` 手写 LoRA → `feat-024` 手写 DPO（π_ref 靠关 LoRA 分支得到）→ `feat-025` 评估
+4. `feat-018` KV Cache 推理与采样 → `feat-017` 与 GPT-2 的退化对照 → `feat-008` 笔记↔源码交叉引用
+5. `feat-009` 笔记数字全量核对 → 收班
+
+**本次改动涉及的文件**
+
+`qwen3-learning/qwen3-pytorch/`：`config.py`、`model/common/{rmsnorm,rope,kv_cache,attention,mlp}.py`、
+`model/{qwen3_dense,qwen3_moe}.py`、`data/{bpe,tokenizer,build_vocab}.py`、
+`tests/{test_rmsnorm,test_rope,test_kv_cache,test_attention,test_swiglu,test_dense,test_moe,test_bpe}.py`、
+`tests/run_all.py`、`data/{vocab.json,merges.txt}`（生成产物）、
+`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–11 就地纠错）、`qwen3-learning/qwen3-pytorch设计.md`（§4 中间维说明）、
+`qwen3-learning/Qwen3_{SwiGLU_MLP,MoE}_学习笔记.md`（新增 §2.1 / §19.1 / §25.1）、
+`feature_list.json`、`claude-progress.md`

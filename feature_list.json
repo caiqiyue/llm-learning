@@ -207,7 +207,7 @@
       "area": "qwen3-tokenizer",
       "title": "从零手写 byte-level BPE tokenizer",
       "user_visible_behavior": "Qwen3 线有自己训练的 byte-level BPE 词表（vocab.json + merges.txt），编码任意中英文代码片段后能逐字节还原。",
-      "status": "not_started",
+      "status": "passing",
       "verification": [
         "data/bpe.py 实现 train_bpe / encode / decode / save_bpe / load_bpe，基础 token 为 256 个原始字节",
         "smoke：任意文本（含未出现过的字符与中文）编码后解码逐字节还原",
@@ -216,8 +216,15 @@
         "data/tokenizer.py 的 BPETokenizer 接口对齐 GPT-2 线 CharTokenizer（encode/decode/vocab_size/stoi/itos）",
         "python data/build_vocab.py 生成 vocab.json 与 merges.txt；不引入任何新依赖"
       ],
-      "evidence": [],
-      "notes": "GPT-2 线是字符级（vocab 45），Qwen3 线是 byte-level BPE，两套词表互不共享，各自 checkpoint 各配各的词表。<|endoftext|> 的 id 固定为 0，合并产生的 token 从 256 递增。依赖上限不变——不引入 sentencepiece / tokenizers。对应 开发计划.md Task 11。"
+      "evidence": [
+        "2026-10-22 实现 data/bpe.py（train_bpe / build_vocab / encode / decode / save_bpe / load_bpe / pretokenize / bytes_to_unicode）+ data/tokenizer.py（BPETokenizer，接口对齐 GPT-2 线 CharTokenizer：encode/decode/vocab_size/stoi/itos）+ data/build_vocab.py（合成语料并落盘 vocab.json / merges.txt），零新依赖。",
+        "2026-10-22 `python data/build_vocab.py` → `[build_vocab] 语料 20000 句 / 785065 字节` / `[build_vocab] 词表 778（合并 521 次，目标 1000）` / `[build_vocab] 压缩比：19641 字节 -> 2767 tokens (7.10 字节/token)` / `[bpe] saved vocab(778) -> data\\vocab.json` / `[bpe] saved merges(521) -> data\\merges.txt`。",
+        "2026-10-22 `python tests/test_bpe.py` → `[压缩] 语料内句子 39B -> 15 tokens (2.60 字节/token)` / `[真实词表] vocab=778 merges=521 'The student trained ' 39B -> 6 tokens` / `test_bpe OK  vocab=293 merges=36`（exit 0）；`python tests/run_all.py` → PASS=8 FAIL=0 TOTAL=8 / all green；`bash init.sh` → PASS=22 SKIP=0 FAIL=0（L4 前向 smoke 已改用真实词表 778）。",
+        "2026-10-22 测试覆盖 8 组：①词表结构（id0=<|endoftext|>、id1..256=字节、id257+=合并，且所有 token 字节串互不相同）②编解码往返（语料 + 未出现过的 €/emoji/\\t\\n\\r/中文 逐字节还原）③压缩（语料内句子变短，语料外文本不变长）④训练确定性（两次训练 merge 表与词表完全一致）⑤语料耗尽提前停止 ⑥落盘/加载往返 + merges.txt 每行恰好两个不含空白的 token ⑦BPETokenizer 往返 + stoi/itos 自洽 + 空格显示为 'Ġ' ⑧真实落盘词表自检（256 个字节 token 一个不少 + 往返 + 压缩）。",
+        "2026-10-22 **修正初稿的 5 个真 bug**（详见 开发计划.md Task 11 Step 9 「实测修正记录」）：①id 撞车 —— 合并 token 起始 id 原本定成 256，与「字节 0xFF 占 id 256」撞车，0xFF 被静默吞掉（实测 `字节 0xFF 还在吗: False`）；改为 BASE_VOCAB_SIZE=257 / MERGE_OFFSET=257，并在测试里加回归断言 `vocab[256] == bytes([0xFF])`。②merges.txt 原本写原始字节，而空格/换行本身就是字节 token，`line.split(\" \")` 根本解析不了；改为 GPT-2 的 byte→unicode 双射（Ġ=空格、Ċ=换行），格式与 HF tokenizers 兼容。③测试断言 `vocab[\"<|endoftext|>\"] == 0` 类型写错（vocab 是 {id: bytes}，用字符串 key 会 KeyError）；改为 `vocab[0] == b\"<|endoftext|>\"`。④train_bpe 用原始字节值、encode/build_vocab 用字节值+1，两侧差 1 导致合并规则全错（实测 39 字节 → 37 tokens，压缩比 1.05）；修正后同句 → 6 tokens。⑤训练按整段字节跑要十几分钟；改为先预分词并按块去重计数（训练单元 = 编码单元，语料以句子列表返回），秒级完成，真实压缩比 7.10 字节/token。",
+        "2026-10-22 附带修复 tests/run_all.py：原用系统默认编码（Windows 上 GBK）解码子进程输出，遇 UTF-8 输出抛 UnicodeDecodeError；且子进程用 GBK 打印 'Ġ'、'²' 之类字符时自己就会崩。改为子进程强制 PYTHONIOENCODING=utf-8、父进程按 UTF-8 解码、打印前做「当前编码编不了就替换」的处理。"
+      ],
+      "notes": "GPT-2 线是字符级（vocab 45），Qwen3 线是 byte-level BPE，两套词表互不共享，各自 checkpoint 各配各的词表。<|endoftext|> 的 id 固定为 0，**合并产生的 token 从 257 递增（不是 256 —— 初稿在这里撞了车，把字节 0xFF 吞掉了）**。依赖上限不变——不引入 sentencepiece / tokenizers。训练前先按 `\\s*\\S+|\\s+` 预分词并按块去重计数，所以语料必须以「句子列表」返回，保证训练单元 = 编码单元；压缩断言只能用语料内句子。笔记 Qwen3_BPE_学习笔记.md 在 feat-008（Task 19）补写。对应 开发计划.md Task 11。"
     },
     {
       "id": "feat-019",
