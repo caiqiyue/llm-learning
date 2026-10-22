@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# init.sh — llm-learning 标准启动 + 轻量验证路径（L0 + L1 + L2 + L3）
+# init.sh — llm-learning 标准启动 + 轻量验证路径（L0 + L1 + L2 + L3 + L4）
 #
 # 设计原则（见 AGENTS.md §5）：
 #   - 本文件只做"轻量 smoke"，不跑全量训练（全量训练 CPU 约 10 分钟，按需手动跑）
@@ -32,7 +32,7 @@ FAILED_ITEMS=()
 
 if [ "$QUIET" -eq 0 ]; then
   echo "=============================================="
-  echo " llm-learning :: 轻量验证 (L0-L3)"
+  echo " llm-learning :: 轻量验证 (L0-L4)"
   echo " repo: $REPO_ROOT"
   echo "=============================================="
 fi
@@ -212,7 +212,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-head_ "L4  Qwen3 线（P2 阶段：目录未创建时 SKIP）"
+head_ "L4  Qwen3 线（目录未创建时 SKIP；随 feature 完成度逐步加重）"
 # -----------------------------------------------------------------------------
 QWEN_DIR="$REPO_ROOT/qwen3-learning/qwen3-pytorch"
 
@@ -221,7 +221,8 @@ if [ ! -d "$QWEN_DIR" ]; then
 else
   ok "qwen3-learning/qwen3-pytorch/ 存在"
 
-  for f in config.py README.md model data; do
+  # --- 骨架检查（feat-011）：目录结构齐全 ---
+  for f in config.py README.md model data train tests; do
     if [ -e "$QWEN_DIR/$f" ]; then
       ok "Qwen3 骨架存在: $f"
     else
@@ -229,39 +230,49 @@ else
     fi
   done
 
-  if [ -f "$QWEN_DIR/model/qwen3.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
-    (cd "$QWEN_DIR" && "$PY" - <<'PY' >/tmp/llm_init_l4.log 2>&1
-import torch
-import config
-from model.qwen3 import Qwen3
-from data.tokenizer import CharTokenizer
+  # --- 组件 smoke：跑 tests/run_all.py（feat-012 起逐步变重）---
+  if [ -f "$QWEN_DIR/tests/run_all.py" ]; then
+    if [ "$HAS_TORCH" -ne 1 ]; then
+      skip "Qwen3 组件 smoke" "torch 不可用（见 feat-001）"
+    else
+      (cd "$QWEN_DIR" && "$PY" tests/run_all.py) >/tmp/llm_init_l4.log 2>&1
+      if [ $? -eq 0 ]; then
+        ok "Qwen3 组件 smoke（tests/run_all.py）$(tail -1 /tmp/llm_init_l4.log)"
+      else
+        fail "Qwen3 组件 smoke" "$(tail -5 /tmp/llm_init_l4.log | tr '\n' ' ')"
+      fi
+    fi
+  fi
 
-tk = CharTokenizer("data/vocab.txt")
-model = Qwen3(
-    vocab_size=tk.vocab_size,
-    n_layer=config.n_layer,
-    n_head=config.n_head,
-    n_head_kv=config.n_head_kv,
-    n_embd=config.n_embd,
-    head_dim=config.head_dim,
-    intermediate_dim=config.intermediate_dim,
-    block_size=config.block_size,
-    rope_theta=config.rope_theta,
-    dropout=0.0,
-)
+  # --- 端到端前向（feat-016 之后才可用）---
+  if [ -f "$QWEN_DIR/model/qwen3_dense.py" ] && [ -f "$QWEN_DIR/data/vocab.json" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && "$PY" - <<'PY' >/tmp/llm_init_l4_fwd.log 2>&1
+import torch
+from config import DENSE_CONFIG
+from data.tokenizer import BPETokenizer
+from model.qwen3_dense import Qwen3Dense
+
+tk = BPETokenizer("data/vocab.json", "data/merges.txt")
+model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=DENSE_CONFIG, dropout=0.0)
+
 idx = torch.randint(0, tk.vocab_size, (2, 8))
-logits, loss, cache, _ = model(idx)
+logits, loss, cache, extras = model(idx)
 assert logits.shape == (2, 8, tk.vocab_size), f"logits 形状错: {tuple(logits.shape)}"
-print(f"logits {tuple(logits.shape)} params {sum(p.numel() for p in model.parameters())}")
+assert extras == {}, f"dense 的 extras 应为空 dict，实得 {extras}"
+
+targets = torch.randint(0, tk.vocab_size, (2, 8))
+logits, loss, _, _ = model(idx, targets=targets)
+assert loss is not None and torch.isfinite(loss), f"loss 异常: {loss}"
+print(f"logits {tuple(logits.shape)} loss {loss.item():.4f} params {model.num_params():,}")
 PY
     )
     if [ $? -eq 0 ]; then
-      ok "Qwen3 前向 smoke（logits 形状 + 参数量）$(tail -1 /tmp/llm_init_l4.log)"
+      ok "Qwen3 前向 smoke（logits 形状 + loss 有限 + 参数量）$(tail -1 /tmp/llm_init_l4_fwd.log)"
     else
-      fail "Qwen3 前向 smoke" "$(tail -3 /tmp/llm_init_l4.log | tr '\n' ' ')"
+      fail "Qwen3 前向 smoke" "$(tail -3 /tmp/llm_init_l4_fwd.log | tr '\n' ' ')"
     fi
   else
-    skip "Qwen3 前向 smoke" "model/qwen3.py 尚未创建，或 torch 不可用（见 feat-001）"
+    skip "Qwen3 前向 smoke" "model/qwen3_dense.py 或 data/vocab.json 尚未就绪（feat-011/feat-022），或 torch 不可用"
   fi
 fi
 
