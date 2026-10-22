@@ -2635,8 +2635,43 @@ assert ffn.experts[0].gate_proj.out_features == MOE_CONFIG.moe_intermediate_size
 assert ffn.router.out_features == MOE_CONFIG.n_experts, "router 输出维度应为专家数"
 assert ffn.router.bias is None, "router 不应有 bias"
 
+# =====================================================================
+# 9) 【核心】稀疏是真的：专家实际处理的行数 = N·K，而不是 N·E
+# =====================================================================
+# 用 forward hook 统计每个专家一次调用处理了多少行。
+# 若实现是「算了再丢」（全算 E 个专家再取 top-k），这里会是 N·E。
+rows = []
+handles = []
+for e in ffn.experts:
+    def _hook(mod, inp, out, _rows=rows):
+        _rows.append(inp[0].shape[0])
+    handles.append(e.register_forward_hook(_hook))
+with torch.no_grad():
+    ffn._forward_ffn(h)
+for hd in handles:
+    hd.remove()
+
+total_rows = sum(rows)
+N = B * T
+K = MOE_CONFIG.experts_per_tok
+E = MOE_CONFIG.n_experts
+assert len(rows) == E, f"每个专家应各被调用一次，实得 {len(rows)} 次"
+assert total_rows == N * K, \
+    f"专家实际处理总行数应为 N*K={N*K}，实得 {total_rows}（若为 {N*E} 说明没省计算）"
+assert total_rows < N * E, "总行数应严格小于「全算」的 N*E"
+print(f"[稀疏性] 专家处理总行数={total_rows} (=N*K={N}*{K})，全算需 {N*E}，"
+      f"省下 {(1 - total_rows / (N * E)):.0%}")
+
+# =====================================================================
+# 10) MoE 与 Dense 的参数量对比
+# =====================================================================
+n_dense = dense_model.num_params()
+n_moe = model.num_params()
+print(f"[参数量] dense={n_dense:,}  moe={n_moe:,}  比值={n_moe/n_dense:.2f}x")
+assert n_moe > n_dense, "MoE 的 FFN 专家更多，总参数量应大于 Dense"
+
 print(f"test_moe OK  n_experts={MOE_CONFIG.n_experts} top_k={MOE_CONFIG.experts_per_tok} "
-      f"moe_intermediate={MOE_CONFIG.moe_intermediate_size} params={model.num_params():,}")
+      f"moe_intermediate={MOE_CONFIG.moe_intermediate_size} params={n_moe:,}")
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -2665,12 +2700,15 @@ Tiny Qwen3 MoE 主模型（Router + 多专家 SwiGLU）。
     router(x) → n_experts 个 logits → softmax → 取 top-k → （可选）权重重新归一化
     → 只把这 k 个专家的 FFN 作用于该 token → 按归一化权重加权求和
 
-【负载均衡辅助损失（Switch Transformer 风格）】
+【负载均衡辅助损失（HuggingFace Mixtral 的写法）】
     aux_loss = n_experts * Σ_i  f_i · P_i
-        f_i = 本 batch 中被路由到专家 i 的 token 比例
+        f_i = 专家 i 的 (token, k槽) 对数 / (token 总数 × k)  ← 对 tokens×k 个槽位求均值，Σf_i = 1
         P_i = router 对专家 i 给出的平均概率
-    当路由均匀时 f_i = P_i = 1/n_experts，aux_loss = 1（最小值）。
+    当路由均匀时 f_i = 1/(K·E)、P_i = 1/E，aux_loss = **1/K**（K=2 时 0.5，**不是 1**）。
     某个专家被过度使用则 f_i ≫ P_i，aux_loss 上升，推动 router 重新分配。
+    （Switch Transformer 论文版是 L_aux = N·Σ f_i p_i 且 f_i 按 token 计数，
+      均匀时取 1。两个式子量纲不同、作用相同；本实现选 Mixtral 版与 HF 训练代码配套。
+      详见 Qwen3_MoE_学习笔记.md §19.1。）
 
 【实现要点：真的省计算，而不是"算了再丢"】
     朴素写法会算全部 n_experts 个 FFN 再按 top-k 取用，等于没省。
@@ -3063,6 +3101,12 @@ print('MoEBlock 类序调整后可实例化，params =', m.num_params())
 ```
 Expected: 打印参数量；`[run_all] PASS=6 FAIL=0 TOTAL=6`
 
+> **实施说明（2026-10-22）**：实现时**直接就是按这个顺序写的**
+> （`SparseMoeBlock` → `MoEBlock` → `Qwen3MoE`），无需再移动。
+> 另：`tests/test_moe.py` 比本计划初稿多两条 —— 第 9 条用 forward hook 证明
+> **稀疏性是真省计算**（专家实际处理行数 = N·K 而非 N·E），第 10 条是 dense/MoE 参数量对照。
+> 这两条已回填进上面的测试代码块。
+
 - [ ] **Step 6: 对比 dense / MoE 参数量并写进笔记**
 
 Run:
@@ -3078,6 +3122,18 @@ print(f'dense={d:,}  moe={m:,}  比值={m/d:.2f}x')
 "
 ```
 Expected: 类似 `dense=313,088  moe=625,312  比值=2.00x`。把实际数字写进 `qwen3-learning/Qwen3_MoE_学习笔记.md` 的实现对照小节。
+
+> **实测修正（2026-10-22）**：初稿的预期数字 `dense=313,088 moe=625,312 比值=2.00x` **是错的**
+> （那组数字对应的是另一套 vocab/配置）。实际（vocab=512, n_embd=128, n_layer=4）：
+> ```
+> [专家负载] ['12.5', '16.0', '16.0', '19.5']  理想=16.0  最大偏差=21.9%
+> [稀疏性] 专家处理总行数=128 (=N*K=64*2)，全算需 256，省下 50%
+> [参数量] dense=951,808  moe=1,150,464  比值=1.21x
+> ```
+> 比值只有 1.21×（而非 2×），因为本配置 MoE 专家更窄：
+> `moe_intermediate_size=128` vs Dense 的 `intermediate_size=384`。
+> **MoE 的「参数多 N 倍、计算只多 k 倍」只在专家宽度与 dense 相同的前提下成立。**
+> 这条已写进 `Qwen3_MoE_学习笔记.md` 新增的 §25.1「本仓库的实测对照」。
 
 - [ ] **Step 7: Commit**
 

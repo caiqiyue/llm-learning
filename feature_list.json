@@ -259,7 +259,7 @@
       "area": "qwen3-moe",
       "title": "Qwen3 MoE 稀疏前馈",
       "user_visible_behavior": "在 dense Qwen3 之上可开关启用 MoE（top-k 路由 + 负载均衡损失），能打印每个专家的负载分布。",
-      "status": "not_started",
+      "status": "passing",
       "verification": [
         "Router 实现 top-k 选择 + 负载均衡辅助损失（aux_loss = n_experts × Σ f_i·P_i，均匀时 = 1.0）",
         "真稀疏路由：只有被选中的 token 进专家计算（代价是 B·T·K 而非 B·T·E）",
@@ -269,8 +269,15 @@
         "总 loss = lm_loss + aux_loss_coef × aux_loss；aux_loss 梯度能回传到每个 router",
         "对照 Qwen3_MoE_学习笔记.md 标注实现位置"
       ],
-      "evidence": [],
-      "notes": "【已从 P3 可选升为 P2 必做】依据 设计.md §10。MoE 与 Dense 的唯一差异是 FFN；attention / norm / rope / KV Cache 全部走 model/common/。对照 开发计划.md Task 10。"
+      "evidence": [
+        "2026-10-22 实现 model/qwen3_moe.py，类顺序按设计文档 §5.8：SparseMoeBlock（Router + n_experts 个 SwiGLU 专家）→ MoEBlock（Pre-LN 容器，第二个子层是 SparseMoeBlock）→ Qwen3MoE（主干与 Qwen3Dense 逐行一致）。forward 同样返回恒定 4 元组，extras 多出 aux_loss / expert_load / expert_load_last。",
+        "2026-10-22 稀疏实现是**真稀疏**：按 topk_indices sort 后同一专家的样本连续，逐专家切片计算（n_e, C)→(n_e, C)，再按 top-k 权重缩放并 index_add_ 散回原位；未被路由到的专家该步直接跳过。",
+        "2026-10-22 `python tests/test_moe.py` → `[专家负载] ['12.5', '16.0', '16.0', '19.5']  理想=16.0  最大偏差=21.9%` / `[稀疏性] 专家处理总行数=128 (=N*K=64*2)，全算需 256，省下 50%` / `[参数量] dense=951,808  moe=1,150,464  比值=1.21x` / `test_moe OK  n_experts=4 top_k=2 moe_intermediate=128 params=1,150,464`（exit 0）；`python tests/run_all.py` → PASS=7 FAIL=0 TOTAL=7 / all green。",
+        "2026-10-22 测试覆盖 10 项：①接口与 dense 完全一致（4 元组 + extras 含 aux_loss/expert_load，且 dense 的 extras.get('aux_loss') 为 None，训练脚本无需 if 分支）②主干与 Dense 一致（attn 的 n_head/n_head_kv/head_dim 相同）③稀疏路由（routed_tokens=B*T，expert_token_pairs=B*T*K）④专家负载无饿死且总和=B*T ⑤norm_topk_prob 开关的权重和⑥aux_loss 的梯度回传到每个 router（4/4 有限）⑦因果性 + eval 确定性 ⑧专家数/中间维/router 维度与无 bias ⑨**稀疏性用 forward hook 证明**：专家实际处理总行数 = N*K = 128（若实现是「全算再丢」会是 N*E = 256），断言总行数 < N*E ⑩MoE 参数量 > Dense。",
+        "2026-10-22 **修正 aux_loss 的量纲说明（开发计划与代码注释都写错了）**：初稿写「均匀时 f_i = P_i = 1/n_experts，aux_loss = 1（最小值）」，但代码采用的是 HuggingFace Mixtral 的量纲 —— f_i 是对 tokens×k 个槽位求的均值（Σf_i = 1），系数是专家数 E 而非额外的 N。均匀时 f_i = 1/(K·E)、P_i = 1/E → **aux_loss = 1/K（K=2 时 0.5，不是 1）**。已修正代码 docstring、开发计划正文，并在 Qwen3_MoE_学习笔记.md 新增 §19.1 对比 Switch Transformer 论文版与 Mixtral 版的量纲差异（附对照表）。",
+        "2026-10-22 **修正开发计划初稿错误的参数量预期**（初稿写 dense=313,088 moe=625,312 比值 2.00×，那组数字对应另一套配置）：实测 dense=951,808 / moe=1,150,464 / **比值 1.21×**。比值远小于 2 的原因是本配置 MoE 专家更窄（moe_intermediate_size=128 vs Dense 的 384）：FFN 部分 147,456/层 vs 197,120/层 ≈ 1.34×，摊到全模型（含 attention/embedding）就是 1.21×。**MoE 的「参数多 N 倍、计算只多 k 倍」只在专家宽度与 dense 相同时才成立。**已写进笔记新增的 §25.1「本仓库的实测对照」。"
+      ],
+      "notes": "对应笔记 Qwen3_MoE_学习笔记.md（已补 §19.1 aux_loss 量纲辨析 + §25.1 实测对照）。主干与 Qwen3Dense 逐行一致，只有 FFN 不同；forward 恒定 4 元组，训练脚本用 extras.get('aux_loss') 统一处理 dense/MoE 两种模型。实现按设计文档 §5.8 的类顺序：SparseMoeBlock → MoEBlock → Qwen3MoE。对应 开发计划.md Task 10。"
     },
     {
       "id": "feat-023",
