@@ -253,14 +253,20 @@ class MoEBlock(nn.Module):
     只是第二个子层（FFN）换成 SparseMoeBlock。
     """
 
-    def __init__(self, cfg: Qwen3Config) -> None:
+    def __init__(
+        self,
+        cfg: Qwen3Config,
+        dropout: Optional[float] = None,
+    ) -> None:
         """
         初始化 MoEBlock。
 
         参数：
-            cfg: Qwen3 配置对象（应为 MOE_CONFIG）
+            cfg:     Qwen3 配置对象（应为 MOE_CONFIG）
+            dropout: dropout 覆盖值；None 时用 cfg.dropout
         """
         super().__init__()
+        d = cfg.dropout if dropout is None else dropout
         self.ln_1 = RMSNorm(cfg.n_embd, eps=cfg.rms_eps)
         self.attn = CausalSelfAttention(
             n_embd=cfg.n_embd,
@@ -268,7 +274,7 @@ class MoEBlock(nn.Module):
             n_head_kv=cfg.n_head_kv,
             head_dim=cfg.head_dim,
             block_size=cfg.block_size,
-            dropout=cfg.dropout,
+            dropout=d,
             bias=cfg.attention_bias,
             rope_theta=cfg.rope_theta,
             rms_eps=cfg.rms_eps,
@@ -280,7 +286,7 @@ class MoEBlock(nn.Module):
             experts_per_tok=cfg.experts_per_tok,
             moe_intermediate_size=cfg.moe_intermediate_size,
             norm_topk_prob=cfg.norm_topk_prob,
-            dropout=cfg.dropout,
+            dropout=d,
             bias=cfg.attention_bias,
         )
         self._last_stats: Optional[dict] = None
@@ -352,7 +358,7 @@ class Qwen3MoE(nn.Module):
         self.drop = nn.Dropout(d)
 
         # --- N 个 MoE Block ---
-        self.blocks = nn.ModuleList([MoEBlock(cfg) for _ in range(cfg.n_layer)])
+        self.blocks = nn.ModuleList([MoEBlock(cfg, dropout=d) for _ in range(cfg.n_layer)])
 
         self.ln_f = RMSNorm(cfg.n_embd, eps=cfg.rms_eps)
         self.lm_head = nn.Linear(cfg.n_embd, vocab_size, bias=False)

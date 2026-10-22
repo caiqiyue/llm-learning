@@ -113,5 +113,23 @@ loss_g.backward()
 assert model.wte.weight.grad is not None, "wte 没有梯度"
 assert model.wte.weight.grad.abs().sum().item() > 0, "wte 梯度全零"
 
+# --- 13) dropout 覆盖真的传到每一处（feat-024 修的 bug 的回归断言）---
+#     历史 bug：Qwen3Dense 只把覆盖值给 embedding 的 Dropout，
+#     Block 里的注意力/MLP 一直用 cfg.dropout ⇒ `dropout=0.0` 关不掉它们。
+#     下面两条断言（结构 + 行为）任缺其一都抓不住那个 bug。
+model_no_drop = Qwen3Dense(vocab_size=VOCAB, cfg=C, dropout=0.0)
+ps = sorted({m.p for m in model_no_drop.modules() if isinstance(m, torch.nn.Dropout)})
+assert ps == [0.0], f"dropout=0.0 时所有 Dropout 的 p 都应是 0.0，实得 {ps}"
+# 行为断言：dropout=0 ⇒ train 模式下两次前向必须逐元素相同
+model_no_drop.train()
+with torch.no_grad():
+    t1 = model_no_drop(idx)[0]
+    t2 = model_no_drop(idx)[0]
+assert torch.equal(t1, t2), "dropout=0.0 时 train 模式的两次前向应完全一致"
+# 反向：不给覆盖值时应当用 cfg.dropout
+model_cfg_drop = Qwen3Dense(vocab_size=VOCAB, cfg=C)
+ps_cfg = sorted({m.p for m in model_cfg_drop.modules() if isinstance(m, torch.nn.Dropout)})
+assert ps_cfg == [C.dropout], f"不给覆盖值时所有 Dropout 的 p 都应是 cfg.dropout={C.dropout}，实得 {ps_cfg}"
+
 print(f"test_dense OK  params={total:,} layers={C.n_layer} "
       f"n_head={C.n_head} n_head_kv={C.n_head_kv} head_dim={C.head_dim}")

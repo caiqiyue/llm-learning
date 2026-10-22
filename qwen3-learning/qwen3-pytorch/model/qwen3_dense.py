@@ -47,16 +47,23 @@ class Block(nn.Module):
     Pre-LN：归一化在子层**之前**，残差路径上不经过任何缩放，梯度能直通，训练更稳。
     """
 
-    def __init__(self, cfg: Qwen3Config, layer_idx: int) -> None:
+    def __init__(
+        self,
+        cfg: Qwen3Config,
+        layer_idx: int,
+        dropout: Optional[float] = None,
+    ) -> None:
         """
         初始化 Block。
 
         参数：
             cfg:       Qwen3 配置对象
             layer_idx: 层索引（MoE 版用于逐层统计，本层仅作标识）
+            dropout:   dropout 覆盖值；None 时用 cfg.dropout
         """
         super().__init__()
         self.layer_idx = layer_idx
+        d = cfg.dropout if dropout is None else dropout
         # --- 注意力子层 ---
         self.ln_1 = RMSNorm(cfg.n_embd, eps=cfg.rms_eps)
         self.attn = CausalSelfAttention(
@@ -65,7 +72,7 @@ class Block(nn.Module):
             n_head_kv=cfg.n_head_kv,
             head_dim=cfg.head_dim,
             block_size=cfg.block_size,
-            dropout=cfg.dropout,
+            dropout=d,
             bias=cfg.attention_bias,
             rope_theta=cfg.rope_theta,
             rms_eps=cfg.rms_eps,
@@ -75,7 +82,7 @@ class Block(nn.Module):
         self.mlp = SwiGLUMLP(
             n_embd=cfg.n_embd,
             intermediate_size=cfg.intermediate_size,
-            dropout=cfg.dropout,
+            dropout=d,
             bias=cfg.attention_bias,
         )
 
@@ -126,7 +133,7 @@ class Qwen3Dense(nn.Module):
     参数：
         vocab_size: 词表大小
         cfg:        Qwen3 配置对象（默认取 config.DENSE_CONFIG）
-        dropout:    覆盖 cfg.dropout（smoke 测试传 0.0）
+        dropout:    覆盖 cfg.dropout（**embedding / 注意力 / MLP 三处都会真的关掉**）
     """
 
     def __init__(
@@ -160,7 +167,7 @@ class Qwen3Dense(nn.Module):
 
         # --- N 个 Pre-LN Block ---
         self.blocks = nn.ModuleList(
-            [Block(cfg, layer_idx=i) for i in range(cfg.n_layer)]
+            [Block(cfg, layer_idx=i, dropout=d) for i in range(cfg.n_layer)]
         )
 
         # --- final RMSNorm ---

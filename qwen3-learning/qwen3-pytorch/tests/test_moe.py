@@ -212,5 +212,14 @@ assert abs(float(aux_hf) - K_ * float(aux)) < 1e-6, \
 print(f"[aux 量纲] 均衡时 aux={float(aux):.4f}（=1）；错配时 aux={float(aux_skewed):.4f}；"
       f"HF 同款公式 = {float(aux_hf):.4f}（= K×{K_}）")
 
+# --- dropout 覆盖真的传到每一处（feat-024 修的 bug 的回归断言，MoE 版）---
+moe_no_drop = Qwen3MoE(vocab_size=VOCAB, cfg=MOE_CONFIG, dropout=0.0)
+ps = sorted({m.p for m in moe_no_drop.modules() if isinstance(m, torch.nn.Dropout)})
+assert ps == [0.0], f"dropout=0.0 时所有 Dropout 的 p 都应是 0.0，实得 {ps}"
+moe_cfg_drop = Qwen3MoE(vocab_size=VOCAB, cfg=MOE_CONFIG)
+ps_cfg = sorted({m.p for m in moe_cfg_drop.modules() if isinstance(m, torch.nn.Dropout)})
+assert ps_cfg == [MOE_CONFIG.dropout], \
+    f"不给覆盖值时所有 Dropout 的 p 都应是 cfg.dropout={MOE_CONFIG.dropout}，实得 {ps_cfg}"
+
 print(f"test_moe OK  n_experts={MOE_CONFIG.n_experts} top_k={MOE_CONFIG.experts_per_tok} "
       f"moe_intermediate={MOE_CONFIG.moe_intermediate_size} params={n_moe:,}")
