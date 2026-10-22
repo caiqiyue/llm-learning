@@ -1,7 +1,7 @@
 {
   "project": "llm-learning",
   "codename": "TinyGPT2-RLHF → TinyQwen3",
-  "last_updated": "2026-10-18",
+  "last_updated": "2026-10-22",
   "phase": {
     "current": "P2 — Qwen3 从零实现",
     "previous": "P1 — GPT-2 + RLHF 全流程（笔记与代码已就位，训练链路因 feat-001 未复验）",
@@ -33,16 +33,19 @@
       "area": "env",
       "title": "让本机 torch 可正常导入",
       "user_visible_behavior": "在本机执行 python -c \"import torch\" 不再报 WinError 127，init.sh 的 L2/L4 层由 SKIP 变 PASS。",
-      "status": "blocked",
+      "status": "passing",
       "verification": [
         "执行 python -c \"import torch; print(torch.__version__)\" 并贴出输出",
         "执行 bash init.sh，确认 L2 层显示 [PASS] 模型前向 smoke",
         "确认 gpt-learning-pytorch 下四个 train_*.py 均可启动不立即崩溃"
       ],
       "evidence": [
-        "2026-10-18 init.sh: [SKIP] torch 模型前向 — OSError [WinError 127] 加载 torch_python.dll 失败"
+        "2026-10-22 根因诊断：并非 torch 安装损坏。PATH 上的 python 是 D:/python311 (Python 3.11.0a2 alpha)，torch 2.1.0+cpu 的 torch_python.dll 在该预发布 ABI 下加载失败 → OSError [WinError 127]。",
+        "2026-10-22 D:/python310/python.exe (Python 3.10.4) 实测可正常导入：torch 2.1.0+cpu / numpy 1.26.4 / nltk 3.9.4。",
+        "2026-10-22 init.sh 增加解释器自动探测（PYTHON_BIN 优先，否则挑第一个能 import torch 的候选），不再硬依赖 PATH 上的 python。",
+        "2026-10-22 bash init.sh：PASS=13 SKIP=1 FAIL=0（退出码 0）。L0 [PASS] python 可用 (Python 3.10.4, 解释器 = /d/python310/python.exe)；L0 [PASS] torch 可导入 (2.1.0+cpu)；L2 [PASS] 模型前向 smoke（logits 形状 + loss 有限 + 参数量）logits (2, 8, 45) loss 3.8208 params 794496。"
       ],
-      "notes": "已诊断：torch 安装不完整或缺 VC++ 运行库。候选解法：重装匹配 Python 3.11 的 torch CPU wheel；或安装 Microsoft Visual C++ Redistributable。【阶段硬前置】Qwen3 开发全程依赖 torch，不解决则 L2/L4 一直 SKIP，任何模型代码都无法验证。"
+      "notes": "【已解决，无需重装 torch】原先记录的候选解法（重装 CPU wheel / 装 VC++ 运行库）是误诊：真实病因是选错解释器（PATH 上的 3.11.0a2 alpha ABI）。修复方式：init.sh 内置解释器探测 + 支持 PYTHON_BIN 环境变量覆盖。遗留（不阻塞）：train_ppo_standard_adapted.py 仍写死绝对路径（本机可用，但换机器会失效），与 train_reward.py 已改的相对路径风格不一致，后续可统一。"
     },
     {
       "id": "feat-011",

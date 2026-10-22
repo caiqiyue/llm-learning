@@ -9,6 +9,12 @@
 #
 # 用法：bash init.sh          （Git Bash / Linux / macOS）
 #       bash init.sh --quiet  （只输出汇总行）
+#
+# 解释器选择（见 feat-001）：
+#   - PYTHON_BIN=... bash init.sh   显式指定解释器
+#   - 否则自动挑第一个 **能 import torch** 的解释器
+#   - 本机 PATH 上的 python 可能是 3.11.0a2（alpha），torch 的 DLL 在该 ABI 下
+#     加载失败（WinError 127），因此不能只看 `command -v python`
 # =============================================================================
 
 set -u
@@ -37,13 +43,56 @@ fail() { FAIL=$((FAIL+1)); FAILED_ITEMS+=("$1"); [ "$QUIET" -eq 0 ] && printf " 
 head_() { [ "$QUIET" -eq 0 ] && printf "\n--- %s ---\n" "$1"; return 0; }
 
 # -----------------------------------------------------------------------------
+# 解释器探测：优先要一个能 import torch 的
+# -----------------------------------------------------------------------------
+# 理由（feat-001 的真实病因）：本机 PATH 上的 python 是 3.11.0a2（预发布 alpha），
+# torch 2.1.0+cpu 的 torch_python.dll 在该 ABI 下加载失败 → OSError [WinError 127]。
+# 这不是「torch 装坏了」，而是「选错了解释器」。所以探测必须以
+# `import torch` 能否成功为准，而不是 `command -v python` 能否找到。
+PY_FALLBACK=""
+detect_python() {
+  local cand
+  # 1) 显式指定（最高优先级）
+  if [ -n "${PYTHON_BIN:-}" ]; then
+    if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+      PY_FALLBACK="$PYTHON_BIN"
+      if "$PYTHON_BIN" -c "import torch" >/dev/null 2>&1; then
+        echo "$PYTHON_BIN"; return 0
+      fi
+    fi
+  fi
+  # 2) 候选列表：第一个能 import torch 的胜出
+  for cand in python python3 python3.12 python3.11 python3.10 python3.9 \
+              /d/python310/python.exe; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    [ -z "$PY_FALLBACK" ] && PY_FALLBACK="$cand"
+    if "$cand" -c "import torch" >/dev/null 2>&1; then
+      echo "$cand"; return 0
+    fi
+  done
+  # 3) 都没有能 import torch 的：退回裸 python（L1 仍可跑，L2 会 SKIP）
+  echo "${PY_FALLBACK:-python}"
+  return 0
+}
+
+PY="$(detect_python)"
+HAS_TORCH=0
+if "$PY" -c "import torch" >/dev/null 2>&1; then HAS_TORCH=1; fi
+
+# -----------------------------------------------------------------------------
 head_ "L0  环境"
 # -----------------------------------------------------------------------------
-if command -v python >/dev/null 2>&1; then
-  PYV="$(python --version 2>&1)"
-  ok "python 可用 ($PYV)"
+if command -v "$PY" >/dev/null 2>&1; then
+  PYV="$("$PY" --version 2>&1)"
+  ok "python 可用 ($PYV, 解释器 = $PY)"
 else
   fail "python 不可用" "PATH 中找不到 python，先装 Python 3.10+"
+fi
+
+if [ "$HAS_TORCH" -eq 1 ]; then
+  ok "torch 可导入 ($("$PY" -c 'import torch; print(torch.__version__)'))"
+else
+  skip "torch 可导入" "候选解释器均无法 import torch，见 feature_list.json feat-001"
 fi
 
 if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
@@ -63,7 +112,7 @@ done
 # -----------------------------------------------------------------------------
 head_ "L1  纯 Python 层（不依赖 torch：tokenizer + 数据构造）"
 # -----------------------------------------------------------------------------
-if [ "$FAIL" -gt 0 ] && ! command -v python >/dev/null 2>&1; then
+if [ "$FAIL" -gt 0 ] && ! command -v "$PY" >/dev/null 2>&1; then
   skip "L1 数据层" "python 不可用，跳过"
 else
   cd "$PY_DIR" || { fail "进入代码目录失败" "$PY_DIR"; }
@@ -74,7 +123,7 @@ else
     fail "data/vocab.txt 缺失" "跑 python data/build_vocab.py"
   fi
 
-  python - <<'PY' >/tmp/llm_init_l1.log 2>&1
+  "$PY" - <<'PY' >/tmp/llm_init_l1.log 2>&1
 import sys
 from data.tokenizer import CharTokenizer
 from data.sft_data import generate_sft_dataset
@@ -107,12 +156,12 @@ fi
 # -----------------------------------------------------------------------------
 head_ "L2  Torch 层（模型前向；torch 不可用时 SKIP 不阻塞）"
 # -----------------------------------------------------------------------------
-if ! python -c "import torch" >/dev/null 2>&1; then
+if [ "$HAS_TORCH" -ne 1 ]; then
   skip "torch 模型前向" "本机 torch 无法导入（已知：torch_python.dll 加载失败），见 feature_list.json feat-001"
 else
   cd "$PY_DIR" || fail "进入代码目录失败" "$PY_DIR"
 
-  python - <<'PY' >/tmp/llm_init_l2.log 2>&1
+  "$PY" - <<'PY' >/tmp/llm_init_l2.log 2>&1
 import torch
 import config
 from data.tokenizer import CharTokenizer
@@ -180,8 +229,8 @@ else
     fi
   done
 
-  if [ -f "$QWEN_DIR/model/qwen3.py" ] && python -c "import torch" >/dev/null 2>&1; then
-    (cd "$QWEN_DIR" && python - <<'PY' >/tmp/llm_init_l4.log 2>&1
+  if [ -f "$QWEN_DIR/model/qwen3.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && "$PY" - <<'PY' >/tmp/llm_init_l4.log 2>&1
 import torch
 import config
 from model.qwen3 import Qwen3

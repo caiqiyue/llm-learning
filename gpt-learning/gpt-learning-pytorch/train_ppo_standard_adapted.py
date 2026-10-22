@@ -139,13 +139,13 @@ def cfg(name: str, default):
 
 
 set_seed(config.seed)
-device = get_device()
+device = get_device()             #运行设备
 print(f"[ppo] device = {device}")
 
 PPO_BATCH_SIZE = cfg("ppo_batch_size", 8) # 强化学习时，一批八个样本
-PPO_MINIBATCH_SIZE = cfg("ppo_minibatch_size", 4)
-PPO_EPOCHS = cfg("ppo_epochs", 4)
-PPO_MAX_ITERS = cfg("ppo_max_iters", 200)
+PPO_MINIBATCH_SIZE = cfg("ppo_minibatch_size", 4) #使用minibatch 来迭代更新
+PPO_EPOCHS = cfg("ppo_epochs", 4) #总共4个 epoch
+PPO_MAX_ITERS = cfg("ppo_max_iters", 200) #4个epoch * batch * minibatch 总共不能超过200轮迭代
 
 POLICY_LR = cfg("ppo_lr_policy", 1e-6)
 VALUE_LR = cfg("ppo_lr_value", POLICY_LR)
@@ -183,7 +183,7 @@ REWARD_WHITEN = cfg("ppo_reward_whiten", False)
 # (1) Tokenizer
 # ===========================================================================
 vocab_path = os.path.join("data", "vocab.txt")
-v = r'E:\ai-learning\05-llm-fundamentals\gpt-learning\gpt-learning-pytorch\data\vocab.txt'
+v = r'E:\ai-learning\05-llm-fundamentals\llm-learning\gpt-learning\gpt-learning-pytorch\data\vocab.txt'
 tokenizer = CharTokenizer(vocab_path=v)
 vocab_size = tokenizer.vocab_size
 print(f"[ppo] vocab_size = {vocab_size}")
@@ -213,7 +213,7 @@ def build_gpt2(dropout: float = 0.0) -> GPT2:
 
 policy_model = build_gpt2(dropout=0.0).to(device) #策略模型，主要被训练的对象
 
-sft_ckpt_path = r"E:\ai-learning\05-llm-fundamentals\gpt-learning\gpt-learning-pytorch\checkpoints\sft.pt"
+sft_ckpt_path = r"E:\ai-learning\05-llm-fundamentals\llm-learning\gpt-learning\gpt-learning-pytorch\checkpoints\sft.pt"
 print(f"[ppo] loading SFT checkpoint from {sft_ckpt_path}")
 sft_ckpt = load_checkpoint(sft_ckpt_path)
 
@@ -250,7 +250,7 @@ reward_model = build_gpt2(dropout=0.0) # 奖励模型，不训练
 reward_model.value_head = nn.Linear(reward_model.n_embd, 1, bias=True)
 reward_model.to(device)
 
-reward_ckpt = load_checkpoint(r"E:\ai-learning\05-llm-fundamentals\gpt-learning\gpt-learning-pytorch\checkpoints\reward.pt")
+reward_ckpt = load_checkpoint(r"E:\ai-learning\05-llm-fundamentals\llm-learning\gpt-learning\gpt-learning-pytorch\checkpoints\reward.pt")
 reward_model.load_state_dict(reward_ckpt["model_state"], strict=False)
 reward_model.eval()
 for p in reward_model.parameters():
@@ -354,7 +354,7 @@ def forward_hidden_states(model: GPT2, input_ids: torch.Tensor) -> torch.Tensor:
     这只得到 sequence-level scalar。
     PPO Critic 需要每一个 action 前状态的 V(s_t)，因此必须保留全部 hidden state。
     """
-    B, T = input_ids.shape
+    B, T = input_ids.shape #8,106
     if T > model.block_size:
         raise ValueError(
             f"sequence length {T} exceeds block_size={model.block_size}"
@@ -371,7 +371,7 @@ def forward_hidden_states(model: GPT2, input_ids: torch.Tensor) -> torch.Tensor:
     else:
         pos = model.pos_emb[position_ids]
 
-    x = model.drop(tok + pos)  # (B, T, C)
+    x = model.drop(tok + pos)  # (B, T, C) 8,106,128
 
     new_kv = None
     for layer_idx, block in enumerate(model.blocks):
@@ -387,7 +387,7 @@ def forward_hidden_states(model: GPT2, input_ids: torch.Tensor) -> torch.Tensor:
             # 防御：如果未来 Block.forward 只返回 x，也能继续运行。
             x = block_out
 
-    x = model.ln_f(x)  # (B, T, C)
+    x = model.ln_f(x)  # (B, T, C)  8,106,128
     return x
 
 
@@ -403,8 +403,8 @@ def token_values(model: GPT2, full_ids: torch.Tensor) -> torch.Tensor:
     因为位置 t 的 hidden state 表示“已经看到 token[0:t] 的状态”，
     它对应位置 t 的 logits 去预测 token[t+1] 这个 action。
     """
-    hidden = forward_hidden_states(model, full_ids)        # (B, T, C)
-    values = model.value_head(hidden).squeeze(-1)          # (B, T)
+    hidden = forward_hidden_states(model, full_ids)        # (B, T, C) 8,106,128 中间特征
+    values = model.value_head(hidden).squeeze(-1)          # (B, T) 8,106
     return values
 
 
@@ -427,17 +427,17 @@ def action_logp_and_entropy(
 
     prompt / padding 位置会被 mask 为 0。
     """
-    logits = unpack_logits(model(full_ids))                # (B, T, V)
-    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)  # (B, T-1, V)
-    probs = log_probs.exp()
+    logits = unpack_logits(model(full_ids))                # (B, T, V)  8,106,45
+    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)  # (B, T-1, V) 8,105,45 不看生成的最后一个token算出的概率
+    probs = log_probs.exp()      #8,105,45
 
-    next_ids = full_ids[:, 1:]                             # (B, T-1)
+    next_ids = full_ids[:, 1:]                             # (B, T-1) 8,105 从prompt 第一个词往后移（就是targets的做法）
     selected_logp = log_probs.gather(
         dim=-1,
-        index=next_ids.unsqueeze(-1),
-    ).squeeze(-1)                                          # (B, T-1)
+        index=next_ids.unsqueeze(-1),       
+    ).squeeze(-1)                                          # (B, T-1)  8,105 每个样本中每个token预测并选择下一个token时的概率
 
-    entropy = -(probs * log_probs).sum(dim=-1)            # (B, T-1)
+    entropy = -(probs * log_probs).sum(dim=-1)            # (B, T-1)   代表token预测下一个token时的不确定性，熵越低  不确定性越低，模型回复多样性越低
 
     action_mask = response_mask[:, 1:].float()            # (B, T-1)
     return selected_logp * action_mask, entropy * action_mask
@@ -458,9 +458,9 @@ def _sample_from_logits(
     if temperature <= 0.0:
         return logits.argmax(dim=-1, keepdim=True)
 
-    logits = logits / temperature
+    logits = logits / temperature #温度调整概率分布
 
-    if top_k is not None and top_k > 0:
+    if top_k is not None and top_k > 0: #前top—k
         k = min(int(top_k), vocab_size)
         kth = logits.topk(k, dim=-1).values[:, -1:]
         logits = torch.where(
@@ -469,7 +469,7 @@ def _sample_from_logits(
             logits,
         )
 
-    if top_p is not None and 0.0 < top_p < 1.0:
+    if top_p is not None and 0.0 < top_p < 1.0: #概率累加超过 top-p
         sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
         sorted_probs = sorted_logits.softmax(dim=-1)
         cumsum = sorted_probs.cumsum(dim=-1)
@@ -512,31 +512,31 @@ def generate_one_with_kv(
         # 保留 prompt 尾部，确保 <sep> 和最近上下文还在。
         prompt_ids = prompt_ids[:, -max_prompt_len:]
 
-    prompt_len = prompt_ids.size(1)
-    allowed_new = min(max_new_tokens, model.block_size - prompt_len)
+    prompt_len = prompt_ids.size(1) #prompt token 32
+    allowed_new = min(max_new_tokens, model.block_size - prompt_len) # 算出response 最多是多少token
     if allowed_new <= 0:
         return prompt_ids.squeeze(0), prompt_len, 0
 
     wrapped = GPT2WithKVCache(model)
-    head_dim = model.n_embd // model.n_head
+    head_dim = model.n_embd // model.n_head  #每个头32维
     cache = KVCache(
-        n_layer=model.n_layer,
-        n_head=model.n_head,
-        head_dim=head_dim,
-        max_seq_len=model.block_size,
+        n_layer=model.n_layer, #4
+        n_head=model.n_head, # 4
+        head_dim=head_dim, #32
+        max_seq_len=model.block_size, #128
         batch_size=1,
     )
 
     # ---------- Prefill prompt ----------
     pos = torch.arange(prompt_len, device=prompt_ids.device, dtype=torch.long)
-    pos = pos.unsqueeze(0)                               # (1, T_prompt)
-    logits, cache = wrapped(prompt_ids, cache, pos)
-    next_logits = logits[:, -1, :]                      # (1, V)
+    pos = pos.unsqueeze(0)                               # (1, T_prompt)  1,32
+    logits, cache = wrapped(prompt_ids, cache, pos) #logits 1,32,45  kv-cache
+    next_logits = logits[:, -1, :]                      # (1, V) 只选择最后一个token的logits 1,45
 
     generated: List[torch.Tensor] = []
 
     # ---------- Decode ----------
-    for step in range(allowed_new):
+    for step in range(allowed_new): #从1,45 也就是45中选用不同的策略去找出一个
         next_token = _sample_from_logits(
             next_logits,
             temperature=TEMPERATURE,
@@ -571,8 +571,8 @@ def generate_one_with_kv(
 
 @torch.no_grad()
 def generate_batch(
-    model: GPT2,
-    prompts: List[torch.Tensor],
+    model: GPT2,  #gpt-2
+    prompts: List[torch.Tensor], #8个样本的token
 ) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[int], List[int]]:
     """
     逐样本 rollout，最后 right-pad 成 batch。
@@ -589,11 +589,11 @@ def generate_batch(
     response_lens = []
     seq_lens = []
 
-    for prompt_ids in prompts:
+    for prompt_ids in prompts: #为每个prompt 生成response
         seq, p_len, r_len = generate_one_with_kv(
             model=model,
-            prompt_ids=prompt_ids,
-            max_new_tokens=MAX_NEW_TOKENS,
+            prompt_ids=prompt_ids,  #token
+            max_new_tokens=MAX_NEW_TOKENS, #最多生成数
         )
         sequences.append(seq)
         prompt_lens.append(p_len)
@@ -603,13 +603,13 @@ def generate_batch(
     B = len(sequences)
     T_max = max(seq_lens)
 
-    full_ids = torch.full(
+    full_ids = torch.full( #把最长的作为标杆， prompt + response 最长106，那么都对齐到106
         (B, T_max),
         fill_value=PAD_ID,
         dtype=torch.long,
         device=device,
     )
-    response_mask = torch.zeros(
+    response_mask = torch.zeros(  #需要掩盖prompt 部分
         (B, T_max),
         dtype=torch.float32,
         device=device,
@@ -646,8 +646,8 @@ def score_reward_model(
     """
     scores = []
     for i, seq_len in enumerate(seq_lens):
-        ids = full_ids[i:i + 1, :seq_len]               # (1, T_i)
-        out = reward_model(ids, targets=None)
+        ids = full_ids[i:i + 1, :seq_len]               # (1, T_i) 1,96 可以理解为去掉padding
+        out = reward_model(ids, targets=None)  #out[3] 是本次response的 reward分数
         if len(out) != 4:
             raise RuntimeError(
                 "reward_model.forward 必须在挂 value_head 后返回 4 元组 "
@@ -696,12 +696,12 @@ def compute_gae(
 
     这样最后一个 response token 后不会 bootstrap 到 padding 的 Value。
     """
-    B, T = rewards.shape
-    advantages = torch.zeros_like(rewards)
-    last_gae = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+    B, T = rewards.shape  #8,105
+    advantages = torch.zeros_like(rewards) #8,105
+    last_gae = torch.zeros(B, device=rewards.device, dtype=rewards.dtype) #8
 
     for t in reversed(range(T)):
-        mask_t = mask[:, t]                             # (B,)
+        mask_t = mask[:, t]                             # (B,) mask 8,105  mask_t 8
 
         if t < T - 1:
             next_mask = mask[:, t + 1]                  # (B,)
@@ -711,7 +711,7 @@ def compute_gae(
             next_value = torch.zeros_like(mask_t)
 
         delta = (
-            rewards[:, t]
+            rewards[:, t]  #8,105
             + gamma * next_value * next_mask
             - values[:, t]
         )                                               # (B,)
@@ -796,7 +796,7 @@ while iter_num < PPO_MAX_ITERS:#最外层循环，ppo总共迭代 100次
             prompt_lens, #记录每个 promtp的 长度
             response_lens, #策略模型回复的 长度
             seq_lens, #prompt+回复的 总长度
-        ) = generate_batch(policy_model, prompts_ids_list)
+        ) = generate_batch(policy_model, prompts_ids_list) #为每个prompt 生成response
 
     B, T_full = full_ids.shape #padding 到 106
     action_mask = response_mask[:, 1:].float()          # (B, T-1)  8,105  prompt 处为0，response 处为1

@@ -87,7 +87,8 @@ print(f"[reward] num_params = {model.num_params():,}")
 #     - 过滤掉 SFT 没有的 `value_head.*` 字段，让其保持新鲜初始化
 #     - SFT 的 lm_head 会被一起加载（lm_head = tok_emb.weight tying），但 RM 不使用它
 # ---------------------------------------------------------------------------
-sft_ckpt_path = r"E:\ai-learning\05-llm-fundamentals\gpt-learning\gpt-learning-pytorch\checkpoints\sft.pt"
+# 路径用相对路径（相对本脚本所在目录），不写死绝对路径 —— 换机器/换目录不会失效
+sft_ckpt_path = os.path.join("checkpoints", "sft.pt")
 print(f"[reward] loading SFT checkpoint from {sft_ckpt_path}")
 ckpt = load_checkpoint(sft_ckpt_path)
 state = {
