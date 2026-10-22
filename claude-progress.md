@@ -11,12 +11,12 @@
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（feat-001 被环境问题卡住；P2 尚未开工）
-- 当前最高优先级未完成 feature：`feat-001` 让本机 torch 可正常导入 → 之后 `feat-011` Qwen3 代码骨架
-- 已知 blocker：torch DLL 加载失败（`WinError 127`），导致 `init.sh` 的 L2/L4 层 SKIP，**任何模型代码都无法验证**
-- 训练产物现状：`gpt-learning/checkpoints/` 下有 `pretrain.pt`、`ppo.pt`（旧 torch 版本产出，当前环境不可复验，指标暂不可信）
-- 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` 7 篇
-- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` 代码齐全待复验；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **尚未创建**
+- 当前活跃 feature：**无**（WIP=0；下一条是 `feat-011` Qwen3 代码骨架）
+- 当前最高优先级未完成 feature：`feat-011` Qwen3 代码骨架与独立 `config.py`
+- ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
+- 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-22 在修复后的环境里重跑产出**，指标可信（见 `feature_list.json` feat-002~007 的 evidence）
+- 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` 7 篇（缺 BPE / LoRA / DPO 三篇，见 feat-008）
+- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **尚未创建**（计划已就位：`qwen3-learning/qwen3-pytorch设计.md` + `qwen3-learning/qwen3-pytorch开发计划.md`）
 
 ---
 
@@ -117,3 +117,74 @@ $ python -c "json.load(feature_list.json)"
 1. 修 `feat-001`（重装 torch CPU wheel 或补 VC++ 运行库），重跑 `bash init.sh` 确认 L2 变 PASS
 2. 开 `feat-011`：建 `qwen3-learning/qwen3-pytorch/` 骨架与独立 `config.py`
 3. 按 `feat-012` → `feat-018` 顺序逐个组件推进，每个组件完成即在笔记里标注源码位置
+
+### Session 003 — 解除环境 blocker + 路线切到 LoRA/DPO + 计划补全
+
+- **日期**：2026-10-22
+- **目标**：① 修 feat-001（不重装）② 按 `设计.md` §10 重排 feature_list 并把路线切到 LoRA+DPO ③ 重写 init.sh L4 ④ 把计划补到「预训练 → LoRA → DPO」
+
+**做了什么**
+
+1. **feat-001 修复（真因不是 torch 损坏）**
+   - 诊断：PATH 上的 `python` = `D:/python311` = **Python 3.11.0a2（alpha 预发布）**，torch 2.1.0+cpu 的 `torch_python.dll` 在该 ABI 下加载失败 → `OSError [WinError 127]`。原先记录的「重装 CPU wheel / 装 VC++ 运行库」是误诊。
+   - 修复：`init.sh` 内置解释器探测（`PYTHON_BIN` 优先，否则挑第一个**能 `import torch`** 的候选），并支持 `PYTHON_BIN=... bash init.sh` 覆盖。命中 `/d/python310/python.exe`（3.10.4 / torch 2.1.0+cpu / numpy 1.26.4 / nltk 3.9.4）。
+   - L2 由 SKIP → PASS。
+2. **解除 P1 线阻塞并复验**
+   - `data/build_vocab.py`：直接执行时 `data/` 占据 `sys.path[0]`，`from data.pretrain_data import ...` 报 `ModuleNotFoundError: No module named 'data'` → 补仓库根到 `sys.path`。
+   - 4 个训练脚本（`train_pretrain.py` / `train_sft.py` / `train_reward.py` / `train_ppo_standard_adapted.py`）里 6 处写死的 `E:\ai-learning\05-llm-fundamentals\gpt-learning\...` 绝对路径（该目录已不存在）→ 全部改为 `os.path.join(...)` 相对路径。
+   - L3 全量重跑：pretrain → sft → reward → ppo → evaluate 全部通过，`evaluate.py --stage all` 退出码 0。
+   - feat-002 ~ feat-007 由 `deferred` 转为 `passing`，evidence 全部落到 `feature_list.json`。
+3. **feature_list.json 重排（21 → 25 条）**
+   - priority 严格 1–25，WIP=0；`phase` 补 `route_change_note`。
+   - 路线切换：**SFT / Reward Model / PPO → LoRA（feat-023）+ DPO（feat-024）**；新增 feat-022（手写 BPE）、feat-025（Qwen3 评估）。
+   - 新增 `verification_levels.QWEN3_TEST`：依赖上限不允许 pytest，采用顶层线性执行 + assert + subprocess 汇总的三态风格。
+4. **init.sh L4 重写**
+   - 旧 L4 写死 `model/qwen3.py` / `CharTokenizer("data/vocab.txt")` / `config.intermediate_dim` —— 与新设计的 `qwen3_dense.py` / `BPETokenizer` / `intermediate_size` 全部不符。
+   - 新 L4 三段递进：骨架检查（`config.py README.md model data train tests`）→ `tests/run_all.py` 组件 smoke → 端到端前向（`Qwen3Dense` + `BPETokenizer`，断言 logits 形状 / extras 为空 / loss 有限）。
+5. **文档纠错**：`python evaluate.py --stage all --all_checkpoints checkpoints/` 中的 `--all_checkpoints` **并非 evaluate.py 支持的参数**（argparse 报 unrecognized arguments）→ CLAUDE.md 与 AGENTS.md 均改回 `python evaluate.py --stage all`。
+6. **计划补全**：`qwen3-pytorch开发计划.md` 补 Phase 3 / 4 / 5（Task 13–21），把用户要求的**预训练 → LoRA → DPO** 三段全部落成可执行 Task（含完整代码块、Run/Expected、Commit 步骤）：
+   - Task 13 feat-020 预训练（`--model dense|moe`，超参全从 config 读）
+   - Task 14 feat-023 手写 LoRA（B 零初始化 + base 冻结 + inject/merge/enable 三件套）
+   - Task 15 feat-024 手写 DPO（**π_ref 复用同一模型对象，靠关 LoRA 分支得到**，不训 Reward Model）
+   - Task 16 feat-025 精简评估（pretrain/lora/dpo/speedup 四段）
+   - Task 17 feat-018 KV Cache 推理与采样；Task 18 feat-017 与 GPT-2 的退化对照（逐组件消融表）；Task 19 feat-008 笔记↔源码交叉引用；Task 20/21 收尾核对与收班。
+
+**验证**
+
+```
+$ bash init.sh
+L0 [PASS] python 可用 (Python 3.10.4, 解释器 = /d/python310/python.exe)
+L0 [PASS] torch 可导入 (2.1.0+cpu)
+L1 [PASS] 数据层 smoke … vocab 45 sft 20 pretrain 20 bench 5
+L2 [PASS] 模型前向 smoke … logits (2, 8, 45) loss 3.8102 params 794496
+L3 [PASS] 无产物类文件被 git 跟踪 / 无 >2MB 大文件
+L4 [SKIP] Qwen3 代码目录 — 尚未创建（feat-011）
+汇总: PASS=13  SKIP=1  FAIL=0（退出码 0）
+
+$ bash E:/tmp/run_l3.sh        # P1 全量
+[pretrain] final val_loss 3.0060 | val_ppl 20.21
+[sft]      eval val_loss 0.0007 | val_ppl 1.00
+[reward]   val_acc 0.7344 | margin 2.7838 | mean_r_chosen 3.2060 | mean_r_rejected 0.4222
+[ppo]      iter=100 | best RM=-3.5685 | ref_KL/token=+0.1767 | wall=160.8s
+[eval]     9 项评估全部通过（exit 0）
+[eval]     speedup value=1.7620 (naive 248.11ms vs kv 140.81ms)
+```
+
+**未解决 / 风险**
+
+- P1 的**质量**指标仍然弱（SFT 后 distinct_1≈0.003、self_bleu=1.0、response_quality=0；PPO 的 compare 阶段 `improvement=0.0000`）。链路是通的、指标是脚本自身阈值下的实跑值，但模型只学会了「背模板」。这是 45 词表 + 小语料的必然结果，**未削弱 evaluate.py 的任何阈值**。已如实记入 feat-003/005 的 evidence。
+- Qwen3 线 0 行代码；`设计.md` 与 `开发计划.md` 之间存在 3 处已知不一致（RMSNorm 判据「均值≈0」不正确、`intermediate_size=384` 的「8/3」推导与 Qwen3-0.6B 实际比例不符、SwiGLU 文件位置），已分别记入 feat-009 与设计文档备注，待 Task 20 统一裁决。
+- `rope_theta=1e6` 目前没有对应笔记支撑。
+
+**下一步**
+
+1. 开 `feat-011`（设 `in_progress`）：建 `qwen3-learning/qwen3-pytorch/` 骨架 + 独立 `config.py`（`Qwen3Config` dataclass，`DENSE_CONFIG` / `MOE_CONFIG`）
+2. 按 `feat-012` → `feat-013` → `feat-014` → `feat-015` → `feat-016` 顺序实现组件，每个组件挂 `tests/` 并跑通 `init.sh` 的 L4
+3. `feat-022` 手写 BPE → `feat-019` 数据 → `feat-020` 预训练 → `feat-021` MoE → `feat-023` LoRA → `feat-024` DPO → `feat-025` 评估 → `feat-017` 对照
+
+**本次改动涉及的文件**
+
+`feature_list.json`、`init.sh`、`claude-progress.md`、`CLAUDE.md`、`AGENTS.md`、
+`gpt-learning/gpt-learning-pytorch/data/build_vocab.py`、
+`gpt-learning/gpt-learning-pytorch/train_pretrain.py`、`train_sft.py`、`train_reward.py`、`train_ppo_standard_adapted.py`、
+`qwen3-learning/qwen3-pytorch设计.md`（新增）、`qwen3-learning/qwen3-pytorch开发计划.md`（新增）

@@ -53,7 +53,7 @@ LLM 学习仓库，两条线：
 | Qwen3 代码目录（P2 目标） | `cd qwen3-learning/qwen3-pytorch` |
 | 重建词表 | `python data/build_vocab.py` |
 | GPT-2 全量训练 | `python train_pretrain.py && python train_sft.py && python train_reward.py && python train_ppo.py` |
-| GPT-2 全量评估 | `python evaluate.py --stage all --all_checkpoints checkpoints/` |
+| GPT-2 全量评估 | `python evaluate.py --stage all` |
 
 ## 延伸阅读
 

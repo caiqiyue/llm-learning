@@ -110,7 +110,7 @@ bash init.sh
 cd gpt-learning/gpt-learning-pytorch
 python data/build_vocab.py
 python train_pretrain.py && python train_sft.py && python train_reward.py && python train_ppo.py
-python evaluate.py --stage all --all_checkpoints checkpoints/
+python evaluate.py --stage all
 ```
 
 | 层 | 检查什么 | 触发时机 |
