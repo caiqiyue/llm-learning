@@ -643,6 +643,13 @@ test_inference OK  greedy一致=逐位相同 logits_max|diff|=5.96e-07 speedup=1
 | **GPT-2**（MHA，n_head=4 / n_head_kv=4） | 207.92 | 118.94 | **1.748** |
 | **Qwen3**（GQA，n_head=4 / n_head_kv=2） | 327.31 | 163.74 | **1.999** |
 
+> ⚠️ **这一组是「实测值」，不是 config 里的超参**，因此**不受
+> `tests/test_config_sync.py` 保护**，而且会随机器负载浮动。
+> 同机复跑一次（`python evaluate.py --stage speedup`）得到的是
+> GPT-2 **1.6992x**（230.54 / 135.68 ms）、Qwen3 **1.841x**（300.27 / 163.10 ms）。
+> **结论不变**（Qwen3 绝对更慢、GQA 让加速比更高），但**小数点后的数字不可当常数引用**。
+> `evaluate.py` 对 speedup 的门槛是**方向性**的（必须 > 1），不是固定阈值。
+
 两条结论：
 
 1. **Qwen3 的绝对速度更慢**（naive 327 ms vs 208 ms，慢了 ~57%）。

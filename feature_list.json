@@ -490,15 +490,27 @@
       "priority": 18,
       "area": "audit",
       "title": "笔记数字与 config.py 全量核对",
-      "user_visible_behavior": "笔记里出现的每个超参数、层数、维度都与对应 config.py 当前值一致。",
-      "status": "not_started",
+      "user_visible_behavior": "两条线笔记里出现的每个超参数字都跟各自 config.py 对得上：改完 config.py 忘了改笔记，`python qwen3-learning/qwen3-pytorch/tests/test_config_sync.py` 直接红，并打印「笔记写的值 / config 实际值」；不属于本仓库配置的取值必须登记理由。",
+      "status": "passing",
       "verification": [
-        "列出 GPT-2 与 Qwen3 两条线笔记中出现的全部超参数数字",
-        "逐条与各自 config.py 核对并记录差异",
-        "对每处差异：改笔记或改代码，二选一并写明理由"
+        "列出 GPT-2 与 Qwen3 两条线笔记中出现的全部超参数数字（采集器 v1 捞 919 处 → v3 收敛到 110 处高信号）",
+        "逐条与各自 config.py 核对并记录差异（直接 import config.py，不靠正则猜值）",
+        "对每处差异：改笔记或改代码，二选一并写明理由（本任务 2 处真错全部改笔记）",
+        "把核对逻辑固化成可运行的守卫 tests/test_config_sync.py（tests/run_all.py 自动发现 ⇒ init.sh L4 自动覆盖）",
+        "守卫上线后自己抓到了本任务的计划文档引用（跨线比较的文档不适用「目录→config」规则）⇒ 改为人工核对并写进注释"
       ],
-      "evidence": [],
-      "notes": "跨两条线；Qwen3 线落地后做一次全量审计。已知待核项：设计.md §4 的 intermediate_size=384 推导理由（8/3 对齐）与 Qwen3-0.6B 实际比例 3.0 不符。"
+      "evidence": [
+        "2026-10-23 **采集：3 版才收敛到可审的粒度** —— v1「键名 + 附近有数字」捞出 919 处候选，人工根本看不动；v2 只认「键名 = 值」仍被**开发计划文档里贴的真实源码**污染；**v3 = v2 + 跳过围栏代码块**才可用（110 处高信号）。关键教训：审计数字的第一道关是**怎么把数字定位出来**，不是逐个核对。",
+        "2026-10-23 **核对方式：直接 import config.py** —— `importlib.util.spec_from_file_location` 按文件路径加载 `gpt-learning/gpt-learning-pytorch/config.py` 与 `qwen3-learning/qwen3-pytorch/config.py`，按目录决定用哪一份（`gpt-learning/` → GPT-2，`qwen3-learning/` → Qwen3）。不用正则去猜 config 的值 —— 猜错一次，整轮审计结论就废了。",
+        "2026-10-23 **★ 真正的错误只有 2 处，都改了笔记（不是改 config）** —— `gpt-learning/0.GPT全流程详解.md` §2「关键超参」写的是 `warmup_iters = 200` / `lr_decay_iters = 2000`，而 GPT-2 的 `config.py` 实际是 **`warmup_iters = 50` / `lr_decay_iters = 200`**。**理由：config 才是真值**，笔记写错就该改笔记。顺带修掉了同一段里**抄错的 `get_lr` 源码**（笔记写 `learning_rate * it / warmup_iters`，仓库实际是 `learning_rate * (it + 1) / max(1, config.warmup_iters)`），并把注释里的 `# 0-200` / `# 200-N` 改成与当前步数一致的写法。",
+        "2026-10-23 **待核项 ①：设计.md §4 `intermediate_size=384` 的「8/3 对齐」推导 —— 不是问题，不改** —— 设计.md 原文已经写明「`128 × 8/3 = 341.3` → 向上对齐到 128 的倍数 ⇒ 384 = 3×n_embd」，并补了「**8/3 规则来自 LLaMA，Qwen3 实际用 3×**」。官方 Qwen3-0.6B 是 hidden 1024 → intermediate 3072（3×），与本仓库取法**一致**。结论写进本条 notes，**不改笔记也不改 config**。",
+        "2026-10-23 **★ 待核项 ②：设计.md §5.1 RMSNorm smoke 判据「均值≈0、方差≈1」—— 是真错，改笔记** —— RMSNorm **不减均值**，输出的均值不是 0，「均值≈0」只是随机输入恰好对称时的巧合。已改成「**平方均值归一化到 1**（RMS ≈ 1）」并指向 `tests/test_rmsnorm.py` 的可跑断言。有意思的是 `开发计划.md` 同一处**早已是正确写法**（「关键是『平方均值』被归一化到 1」），只有 `设计.md` 漏改 —— 这正是「同一个事实写在两处就会漂移」的活例子。",
+        "2026-10-23 **新增守卫 `qwen3-learning/qwen3-pytorch/tests/test_config_sync.py`** —— 扫两条线 27 篇笔记（17 篇 GPT-2 + 9 篇 Qwen3 + `qwen3-pytorch设计.md`），跳过围栏代码块，抽 `` `超参名 = 值` `` 逐条比对。**不属于本仓库配置**的取值必须在本文件 `EXCEPTIONS` 登记簿里**写明理由分类**（ALGO / TEACHING / UPSTREAM / SMOKE / SWITCH / PHASE / SIGNATURE），否则也算红；登记簿里「已不再命中」的条目会被自动统计出来，提醒删掉。实测：`命中超参断言 88 处 / 例外登记 25 条（命中 25，过时 0）/ 跨线或推导量跳过 99 处`。",
+        "2026-10-23 **★ 守卫上线当天就抓到了我自己** —— 新写的 Task 20 章节里引用了「GPT-2 的旧值 `warmup_iters = 200`」，守卫按「目录 → config」的规则拿 **Qwen3** 的 config 去比 ⇒ 报不一致。这暴露了一个真实盲点：**跨线比较的文档不适用「目录决定 config」的规则**。⇒ `开发计划.md` 改为**人工核对**（每次重写该 Task 时做），并把这个盲点写进守卫的注释里 —— **不是「把报错关掉」，是「换一种对的核对方式」**。",
+        "2026-10-23 **顺手复核的「非 config 类数字」（全部一致）** —— GPT-2 可训练参数 **794,496**（`sum(p.numel() for p in GPT2(...).parameters())` 实测一致）；MoE 参数量 **951,808 / 1,150,464 / 1.21x**（`python tests/test_moe.py` 一致）；LoRA 可训练/总参数 **8,704 / 994,560 = 0.88%**（注入 LoRA 后实测一致）；设计.md §12 的 6 行 `max_abs_diff`（`python ablations/compare_with_gpt2.py` **逐位一致**）。",
+        "2026-10-23 **⚠️ 唯一的例外：实测值（speedup）不能当超参审计** —— 笔记 §10.6 写 GPT-2 **1.748x** / Qwen3 **1.999x**，同机复跑 `evaluate.py --stage speedup` 得到的是 GPT-2 **1.6992x**（230.54 / 135.68 ms）、Qwen3 **1.841x**（300.27 / 163.10 ms）。**结论不变**（Qwen3 绝对更慢、GQA 让加速比更高），但**小数点后的数字随机器负载浮动，不能当常数引用** ⇒ 已给该表加免责说明，并注明 `evaluate.py` 对 speedup 的门槛是**方向性**的（必须 > 1），不是固定阈值。"
+      ],
+      "notes": "跨两条线；Qwen3 线落地后做一次全量审计。**结论：真错 2 处（GPT-2 笔记的 warmup_iters / lr_decay_iters），已改笔记；设计.md §5.1 的 RMSNorm 判据已改为「平方均值归一化到 1」；设计.md §4 的 intermediate_size=384 推导经核对无误（384 = 3×n_embd，与 Qwen3-0.6B 的 3× 一致），不改。** 长期防线是 `tests/test_config_sync.py`（init.sh L4 自动覆盖）：改 config.py 忘了改笔记 ⇒ 测试直接红。已知盲点：跨线比较的文档（`开发计划.md`）不适用「目录→config」规则，改为人工核对。"
     },
     {
       "id": "feat-010",

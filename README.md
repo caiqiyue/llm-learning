@@ -135,6 +135,12 @@ qwen3-learning/qwen3-pytorch/
 > 点开就能跳到具体文件；这些链接由 `qwen3-learning/qwen3-pytorch/tests/test_note_refs.py` **自动校验**
 > —— 链接指向的文件不存在时，测试直接红。
 
+> **笔记里的超参数字 ↔ `config.py` 也自动校验**：
+> `qwen3-learning/qwen3-pytorch/tests/test_config_sync.py` 把两条线 27 篇笔记里
+> 形如 `` `超参名 = 值` `` 的写法抽出来，跟各自的 `config.py` 逐条对齐 ——
+> **改完 `config.py` 忘了改笔记，测试直接红**。
+> 不属于本仓库配置的取值（教学举例、官方模型参数、算法定义表……）必须**登记理由**。
+
 ---
 
 ## 五、快速开始
@@ -197,7 +203,7 @@ python train/train_dpo.py                # ③ DPO（π_ref = LoRA 后的 SFT �
 
 python evaluate.py --stage all            # 精简 5 段评估
 python ablations/compare_with_gpt2.py    # 与 GPT-2 的退化对照（6 行消融表）
-python tests/run_all.py                  # 16 个 smoke 汇总
+python tests/run_all.py                  # 17 个 smoke 汇总
 ```
 
 单项说明见 [`qwen3-pytorch/README.md`](qwen3-learning/qwen3-pytorch/README.md)。

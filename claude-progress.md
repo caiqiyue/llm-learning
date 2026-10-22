@@ -11,11 +11,12 @@
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（WIP=0；下一条是 `feat-009` 笔记数字全量核对）
-- 当前最高优先级未完成 feature：`feat-009` 笔记数字与 `config.py` 全量核对（**唯一剩下的未完成 feature**）→ 收班
+- 当前活跃 feature：**无**（WIP=0；**25 个 feature 全部 passing**，feat-009 是最后一个，已于 Session 012 完成）
+- 当前最高优先级未完成 feature：**无** → 下一步是收班（Task 21）
 - ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
 - 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-22 在修复后的环境里重跑产出**，指标可信（见 `feature_list.json` feat-002~007 的 evidence）
 - 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` **9 篇**（BPE 笔记已补齐，feat-008；**每篇开头都有「对应 GPT-2 / 对应 Qwen3 源码 / 对应可跑测试」三行**，由 `tests/test_note_refs.py` 自动校验）
+- **笔记 ↔ config.py 的自动守卫**（feat-009）：`tests/test_config_sync.py` 把 27 篇笔记里的 `` `超参名 = 值` `` 跟各自 `config.py` 逐条对齐（实测 88 处断言 / 25 条例外登记）；**改 `config.py` 忘了改笔记 ⇒ 测试直接红**。已知盲点：`开发计划.md` 跨线比较，不适用自动守卫，改为人工核对
 - 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 训练三段 + 评估侧 + 退化对照全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 预训练 / LoRA / DPO / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py`），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke + LoRA smoke + DPO smoke + 推理 smoke + 评估 smoke + **退化对照 smoke**」八条
 
 ---
@@ -1076,4 +1077,138 @@ $ python data/build_vocab.py
 `qwen3-learning/`：`Qwen3_BPE_学习笔记.md`（**新建**）、9 篇 `Qwen3_*.md`（各 +3 行引用块）、
 `qwen3-pytorch/tests/test_note_refs.py`（**新建**）、`qwen3-pytorch/README.md`、
 `qwen3-pytorch设计.md`（§12）、`qwen3-pytorch开发计划.md`（Task 19 就地换真代码）；
+仓库根 `README.md`、`feature_list.json`
+
+### Session 012 — 笔记数字 ↔ config.py 全量核对（feat-009）
+
+- **日期**：2026-10-23
+- **目标**：把「笔记和代码必须对得上」这条第一优先级，从**人工承诺**变成**自动守卫**
+
+**做了什么**
+
+1. **★ 采集器经历了 3 版才收敛到可审的粒度**（这是本任务最大的坑）
+
+   | 版本 | 做法 | 候选数 | 为什么不行 |
+   |---|---|---|---|
+   | v1 | 「键名 + 附近有数字」 | 919 | 噪声压倒信号，人工根本看不动 |
+   | v2 | 只认 `` `键 = 值` `` | 仍被污染 | **开发计划文档里贴了真实源码** ⇒ 把源码当成了笔记主张 |
+   | **v3** | **v2 + 跳过围栏代码块** | **110** | ✅ 可审 |
+
+   教训：**审计数字的第一道关是「怎么把数字定位出来」，不是逐个核对。**
+
+2. **核对方式：直接 `import` 两个 `config.py`**（`importlib.util.spec_from_file_location` 按文件路径加载），
+   按目录决定用哪一份（`gpt-learning/` → GPT-2，`qwen3-learning/` → Qwen3）。
+   **不用正则去猜 config 的值** —— 猜错一次，整轮审计结论就废了。
+
+3. **★ 真正的错误只有 2 处，都改了笔记（不是改 config）**
+
+   | 位置 | 笔记写的 | config 实际 | 处置 |
+   |---|---|---|---|
+   | `gpt-learning/0.GPT全流程详解.md` §2「关键超参」 | `warmup_iters = 200` | `warmup_iters = 50` | **改笔记** |
+   | 同上 | `lr_decay_iters = 2000` | `lr_decay_iters = 200` | **改笔记** |
+
+   **理由：config 才是真值**，笔记写错就该改笔记。
+   顺带修掉了同一段里**抄错的 `get_lr` 源码**（笔记写 `learning_rate * it / warmup_iters`，
+   仓库实际是 `learning_rate * (it + 1) / max(1, config.warmup_iters)`），
+   并把注释里的 `# 0-200` / `# 200-N` 改成与当前步数一致的写法。
+
+4. **★ 两个「已知待核项」的结论**
+
+   - **设计.md §4 `intermediate_size=384` 的「8/3 对齐」推导 → 不是问题，不改**。
+     设计.md 原文已经写明「`128 × 8/3 = 341.3` → 向上对齐到 128 的倍数 ⇒ 384 = 3×n_embd」，
+     并补了「**8/3 规则来自 LLaMA，Qwen3 实际用 3×**」。
+     官方 Qwen3-0.6B 是 hidden 1024 → intermediate 3072（3×），与本仓库取法**一致**。
+   - **设计.md §5.1 RMSNorm smoke 判据「均值≈0、方差≈1」→ 是真错，改笔记**。
+     RMSNorm **不减均值**，输出的均值不是 0，「均值≈0」只是随机输入恰好对称时的巧合。
+     已改成「**平方均值归一化到 1**（RMS ≈ 1）」并指向 `tests/test_rmsnorm.py` 的可跑断言。
+     有意思的是 `开发计划.md` 同一处**早已是正确写法**，只有 `设计.md` 漏改 ——
+     这正是「同一个事实写在两处就会漂移」的活例子。
+
+5. **★ 新增守卫 `qwen3-learning/qwen3-pytorch/tests/test_config_sync.py`**
+   （`tests/run_all.py` 自动发现 ⇒ `init.sh` L4 自动覆盖）。
+   扫两条线 **27 篇**笔记（17 篇 GPT-2 + 9 篇 Qwen3 + `qwen3-pytorch设计.md`），
+   跳过围栏代码块，抽 `` `超参名 = 值` `` 逐条比对；
+   **不属于本仓库配置**的取值必须在 `EXCEPTIONS` 登记簿里**写明理由分类**，否则也算红；
+   登记簿里「已不再命中」的条目会被自动统计出来，提醒删掉。
+
+   实测：
+
+   ```
+   $ python tests/test_config_sync.py
+   [sync] 核对笔记 27 篇；命中超参断言 88 处；例外登记 25 条（命中 25，过时 0）；跨线/推导量跳过 99 处
+   [sync] 人工核对文档（不进自动守卫）：qwen3-learning/qwen3-pytorch开发计划.md
+   test_config_sync OK
+   ```
+
+   **例外登记簿的 7 个分类**（每条例外必须归类，否则守卫一直红）
+
+   | 类别 | 含义 | 条数 |
+   |---|---|---|
+   | `ALGO` | 算法定义表（`temperature=0` 是贪心、`top_p=None` 是不截断） | 9 |
+   | `SWITCH` | 对照实验的退化开关取值（`use_rope=False`、`mlp_type='gelu'`） | 6 |
+   | `TEACHING` | 教学举例的玩具尺寸（`n_embd=4`、`block_size=8`、`head_dim=2`） | 3 |
+   | `UPSTREAM` | 官方模型参数（GPT-2 124M 的 768、Qwen3-0.6B 的 3072 / n_head=32） | 3 |
+   | `SMOKE` | 单元 smoke 的独立小尺寸（`head_dim=8`、`n_head=8`） | 2 |
+   | `PHASE` | 训练阶段覆盖值（LoRA/DPO 阶段传 `dropout=0.0`） | 1 |
+   | `SIGNATURE` | 函数签名里的默认值（`LoRALinear(dropout=0.0)`） | 1 |
+
+6. **★ 守卫上线当天就抓到了我自己** —— 新写的 Task 20 章节里引用了
+   「GPT-2 的旧值 `warmup_iters = 200`」，守卫按「目录 → config」的规则拿 **Qwen3** 的 config 去比 ⇒ 报不一致。
+   这暴露了一个真实盲点：**跨线比较的文档不适用「目录决定 config」的规则**。
+   ⇒ `开发计划.md` 改为**人工核对**（每次重写该 Task 时做），盲点写进守卫注释 ——
+   **不是「把报错关掉」，是「换一种对的核对方式」**。
+
+7. **顺手复核的「非 config 类数字」（全部一致）**
+
+   | 数字 | 出处 | 复核方式 | 结果 |
+   |---|---|---|---|
+   | 794,496（GPT-2 可训练参数） | `0.GPT全流程详解.md` §1.9 | `sum(p.numel() for p in GPT2(...).parameters())` | ✅ 一致 |
+   | 951,808 / 1,150,464 / 1.21x（MoE 参数量） | `Qwen3_MoE_学习笔记.md` §25.1 | `python tests/test_moe.py` | ✅ 一致 |
+   | 8,704 / 994,560 = 0.88%（LoRA 可训练 / 总参数） | `Qwen3_LoRA与DPO_学习笔记.md` §2 | 注入 LoRA 后 `sum(p.numel())` | ✅ 一致 |
+   | 消融表 6 行 `max_abs_diff` | `设计.md` §12 | `python ablations/compare_with_gpt2.py` | ✅ **逐位一致** |
+
+8. **⚠️ 唯一的例外：实测值（speedup）不能当超参审计** ——
+   笔记 §10.6 写 GPT-2 **1.748x** / Qwen3 **1.999x**，同机复跑 `evaluate.py --stage speedup` 得到的是
+   GPT-2 **1.6992x**（230.54 / 135.68 ms）、Qwen3 **1.841x**（300.27 / 163.10 ms）。
+   **结论不变**（Qwen3 绝对更慢、GQA 让加速比更高），但**小数点后的数字随机器负载浮动，不能当常数引用** ⇒
+   已给该表加免责说明，并注明 `evaluate.py` 对 speedup 的门槛是**方向性**的（必须 > 1），不是固定阈值。
+
+**★ 本任务的四条经验**
+
+1. **审计数字先解决「定位」**（见 v1→v3），别一上来就逐条核对。
+2. **守卫必须允许「显式例外」**，且例外要**带原因分类 + 能被自动统计（哪些过时了）**。
+   没有例外机制的守卫会逼着人把「教学举例」「官方模型参数」也改成 config 值 —— 那是**把笔记改坏**。
+3. **实测值（耗时 / 加速比）不是超参**，只能写「同机复跑」并注明波动范围。
+4. **守卫上线后先让它跑自己**：它抓到我的计划文档引用，暴露了「跨线文档不适用目录→config 规则」这个真盲点。
+
+**验证**
+
+```
+$ python tests/run_all.py
+[run_all] PASS=17  FAIL=0  TOTAL=17
+
+$ bash init.sh
+PASS=28  SKIP=0  FAIL=0
+```
+
+**未解决 / 风险**
+
+- **「跨线比较的文档」没有自动守卫** —— `开发计划.md` 改为人工核对。
+  代价是：以后有人只在计划里改数字而不改 config，仍不会被自动抓到。
+- **裸文件名不在自动校验范围** —— 笔记里不带目录的 `config.py` / `evaluate.py` 机器判不准（可能指主线也可能指本线）。
+- **只覆盖「写成 `键 = 值` 的主张」** —— 写成「128 维」「4 层」的散文数字仍然靠人读。
+  本次靠人工扫了一遍关键派生量（参数量、消融表），但**没有自动化**。
+
+**下一步**
+
+1. 收班（progress → feature_list → handoff → commit → clean-state-checklist）
+2. `feature_list.json` 现在是 **25 passing / 0 in_progress / 0 not_started** —— 全部 feature 已完成
+
+**本次改动涉及的文件**
+
+`qwen3-learning/qwen3-pytorch/tests/test_config_sync.py`（**新建**）、
+`qwen3-learning/qwen3-pytorch/README.md`、`qwen3-learning/qwen3-pytorch设计.md`（§5.1）、
+`qwen3-learning/qwen3-pytorch开发计划.md`（Task 20 就地换真内容）、
+`qwen3-learning/Qwen3_训练推理完整学习笔记.md`（§10.6 加免责说明）、
+`gpt-learning/0.GPT全流程详解.md`（§2 超参 + `get_lr` 源码）、
 仓库根 `README.md`、`feature_list.json`

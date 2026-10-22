@@ -132,7 +132,13 @@ tiny 尺寸，CPU 可训。以下是 `config.py` 的**初始值**，实施时以
 - gain 是 `nn.Parameter`（可学习，形状 `[d]`）
 - `forward(x) -> Tensor`，支持任意前置维度
 
-**smoke**：随机输入归一化后，均值≈0、方差≈1；`rms_eps` 在极小输入下不产生 NaN。
+**smoke**：随机输入归一化后，**平方均值归一化到 1**（即 `out.pow(2).mean(-1) ≈ 1`，RMS ≈ 1）；
+`rms_eps` 在极小输入下不产生 NaN。
+
+> ⚠️ **判据里不能写「均值 ≈ 0」** —— RMSNorm **不减均值**，输出的均值是输入均值的
+> 缩放，不是 0；「均值 ≈ 0」只是随机输入恰好对称时的巧合。
+> 真正的归一化判据是**平方均值 = 1**（等价于 RMS = 1）。
+> 对应的可跑断言见 `qwen3-learning/qwen3-pytorch/tests/test_rmsnorm.py`。
 
 ### 5.2 `model/common/rope.py`
 
