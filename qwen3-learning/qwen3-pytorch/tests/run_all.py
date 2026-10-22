@@ -27,12 +27,18 @@ def main() -> int:
     """逐个跑测试并汇总。返回进程退出码。"""
     results = []
 
+    # 子进程以文件路径方式启动，sys.path[0] 是 tests/ —— 额外用 PYTHONPATH
+    # 把项目根也塞进去（测试文件自身也会做一次 sys.path 引导，双保险）
+    env = dict(os.environ)
+    env["PYTHONPATH"] = PROJECT_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+
     for name in discover():
         proc = subprocess.run(
             [sys.executable, os.path.join(TESTS_DIR, name)],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
+            env=env,
         )
         ok = proc.returncode == 0
         results.append((name, ok, proc))

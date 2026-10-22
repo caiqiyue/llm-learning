@@ -28,6 +28,26 @@
 - 运行方式：`python tests/test_rmsnorm.py`，成功 exit 0，失败抛 AssertionError
 - `tests/run_all.py` 遍历全部测试文件逐个 subprocess 执行，打印汇总（对齐 `init.sh` 的 PASS/SKIP/FAIL 三态）
 
+#### 【实测补充，2026-10-22】每个测试文件必须自带 sys.path 引导
+
+直接执行 `python tests/test_rmsnorm.py` 时，Python 把**脚本所在目录**（`tests/`）放进
+`sys.path[0]`，项目根不在 `sys.path` 里 —— 于是 `from config import DENSE_CONFIG`
+会报 `ModuleNotFoundError: No module named 'config'`。
+`tests/run_all.py` 同样是以文件路径方式启动子进程，`cwd` 设成项目根也**救不了**
+（`cwd` 不进 `sys.path`，只有脚本目录进）。
+
+所以每个 `tests/test_*.py` 开头都要加这三行（**后续所有 Task 的测试文件一律照做**）：
+
+```python
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+```
+
+这样测试文件既能被 `python tests/test_x.py` 单独跑，也能被 `tests/run_all.py`
+批量跑，还能在任何工作目录下跑。
+
 ### 0.3 与 GPT-2 线的三处刻意偏离
 
 | 项 | GPT-2 线 | Qwen3 线 | 理由 |

@@ -81,7 +81,7 @@
       "area": "qwen3-norm",
       "title": "实现 RMSNorm 与 Pre-LN Block 结构",
       "user_visible_behavior": "学习者能在 model/common/rmsnorm.py 读到 RMSNorm 的完整公式注释，并理解 Qwen3 为什么用 RMSNorm 替代 LayerNorm、gain 为什么不存在。",
-      "status": "in_progress",
+      "status": "passing",
       "verification": [
         "实现 RMSNorm（无 bias、不减均值、带可学习 gain，形状 [d]）",
         "smoke：随机输入经 RMSNorm 后 **平方均值**被归一化到 1（注意：RMSNorm 不做中心化，均值一般不为 0）",
@@ -90,8 +90,15 @@
         "在 Qwen3_RMSNorm_学习笔记.md 中标注对应源码位置",
         "tests/test_rmsnorm.py 通过并计入 tests/run_all.py 汇总"
       ],
-      "evidence": [],
-      "notes": "对应笔记 Qwen3_RMSNorm_学习笔记.md；对照 GPT-2 的 nn.LayerNorm，说明 epsilon 位置与数值范围差异。【勘误】设计.md §5.1 写的「归一化后均值≈0、方差≈1」判据不正确——RMSNorm 不减均值，正确判据是平方均值归一化到 1。对应 开发计划.md Task 4。"
+      "evidence": [
+        "2026-10-22 实现 model/common/rmsnorm.py::RMSNorm：RMSNorm(x) = x / sqrt(mean(x²) + eps) * gain；gain 是唯一可学习参数（形状 [dim]），**无 bias**、**不减均值**、eps 加在根号内部（因此 Qwen3 用 1e-6 而非 LayerNorm 的 1e-5）。",
+        "2026-10-22 TDD 证据：先写 tests/test_rmsnorm.py，运行报 `ModuleNotFoundError: No module named 'model.common.rmsnorm'`（确认测试确实在检验实现）；补实现后同一条命令输出 `test_rmsnorm OK  shape=(2, 8, 128) eps=1e-06`，退出码 0。",
+        "2026-10-22 测试覆盖 6 项：①形状不变 ②平方均值归一化到 1（atol 1e-4）③gain=1 时等于纯归一化 结果且 gain 可学习、bias 为 None ④gain 放大 2 倍时输出按比例放大 ⑤1e-12 极小输入不产 NaN ⑥梯度能回传到 gain。",
+        "2026-10-22 `python tests/run_all.py` → `[PASS] test_rmsnorm.py` / `PASS=1 FAIL=0 TOTAL=1` / all green。",
+        "2026-10-22 `bash init.sh --quiet` → PASS=21 SKIP=1 FAIL=0（L4 组件 smoke 走 run_all.py 全绿）。",
+        "2026-10-22 顺带修掉测试基础设施的一个坑：`python tests/test_x.py` 时 sys.path[0] 是 tests/ 目录，项目根不在 sys.path 里，`from config import ...` 会报 No module named 'config'；cwd 设成项目根也救不了（cwd 不进 sys.path）。已在每个测试文件头补 `sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))`，并在 run_all.py 里额外注入 PYTHONPATH。开发计划 §0.2 已补记该约定。"
+      ],
+      "notes": "判据纠正：设计.md §5.1 原写「归一化后均值≈0」是错的 —— RMSNorm 不做中心化，均值≈0 是输入数据本身的性质。正确的不变量是「平方均值被归一化到 1」，已写进测试第 ② 条并同步到开发计划 §0.2 的补充说明。"
     },
     {
       "id": "feat-013",
@@ -99,7 +106,7 @@
       "area": "qwen3-rope",
       "title": "实现 RoPE 位置编码",
       "user_visible_behavior": "model/common/rope.py 能生成 (max_seq_len, head_dim) 的旋转位置编码表，支持外推长度参数，且能演示相同相对距离的两对位置旋转后内积相等。",
-      "status": "not_started",
+      "status": "in_progress",
       "verification": [
         "实现 inv_freq / cos / sin 缓存，theta 可配（Qwen3 默认 1e6）",
         "smoke：head_dim=8 时验证内积只依赖相对位置（旋转等变性），误差 < 1e-5",
