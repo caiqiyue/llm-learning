@@ -56,7 +56,7 @@
       "area": "qwen3-scaffold",
       "title": "Qwen3 代码骨架与独立超参配置",
       "user_visible_behavior": "仓库里出现 qwen3-learning/qwen3-pytorch/ 目录，含独立的 config.py、model/、data/、train/、tests/、README.md，与 GPT-2 线代码完全隔离。",
-      "status": "not_started",
+      "status": "passing",
       "verification": [
         "新建 qwen3-learning/qwen3-pytorch/{config.py,README.md,model/,model/common/,data/,train/,tests/}",
         "config.py 用 Qwen3Config dataclass + DENSE_CONFIG / MOE_CONFIG 两个实例（不用 GPT-2 的模块级裸变量，因为要同时支持 dense 与 MoE）",
@@ -65,8 +65,15 @@
         "tests/run_all.py 存在且能以 PASS/FAIL 汇总方式逐个跑 tests/test_*.py",
         "bash init.sh 的 L4 层由 SKIP 转为检查新目录与 config 字段"
       ],
-      "evidence": [],
-      "notes": "关键决策：Qwen3 用 head_dim 与 n_embd 解耦（不强制 n_embd % n_head == 0），config 必须支持这一点；不得复制粘贴 GPT-2 的 config.py。对应 开发计划.md Task 3。"
+      "evidence": [
+        "2026-10-22 建立 qwen3-learning/qwen3-pytorch/ 骨架：config.py、README.md、model/、model/common/、data/、train/、tests/（各带 __init__.py）。",
+        "2026-10-22 config.py 用 Qwen3Config dataclass 定义唯一真值，DENSE_CONFIG 与 MOE_CONFIG 两套实例共享字段，MoE 额外带 n_experts=4 / experts_per_tok=2 / moe_intermediate_size=128 / norm_topk_prob=True / aux_loss_coef=0.01。",
+        "2026-10-22 验证：`python -c \"from config import DENSE_CONFIG as D, MOE_CONFIG as M; ...\"` → `intermediate_size 384 期望 384` / `config OK`（含 head_dim 与 n_embd 解耦断言：4 * 48 = 192 ≠ 128；n_head % n_head_kv == 0；SwiGLU 中间维按 8/3 再对齐 128 的倍数）。",
+        "2026-10-22 `python tests/run_all.py` → `PASS=0  FAIL=0  TOTAL=0` / `all green`（此时 tests/ 下还没有 test_*.py，汇总器空跑退出 0）。",
+        "2026-10-22 `bash init.sh` → L4 骨架检查 6 项全 PASS（config.py / README.md / model / data / train / tests），组件 smoke 走 tests/run_all.py 全绿；端到端前向仍 SKIP（model/qwen3_dense.py 与 data/vocab.json 尚未就绪，属 feat-016 / feat-022 的范围）。",
+        "2026-10-22 骨架与 GPT-2 线完全隔离：qwen3-pytorch/ 下无任何指向 gpt-learning/gpt-learning-pytorch 的 import（grep 验证），config.py 为独立重写而非复制粘贴。"
+      ],
+      "notes": "Qwen3 线代码与 GPT-2 线严格隔离：不跨目录 import，不复制粘贴 GPT-2 的 config.py 再改（head_dim 与 n_embd 解耦这一点在 GPT-2 线不存在，无法靠改数字得到）。"
     },
     {
       "id": "feat-012",
@@ -74,7 +81,7 @@
       "area": "qwen3-norm",
       "title": "实现 RMSNorm 与 Pre-LN Block 结构",
       "user_visible_behavior": "学习者能在 model/common/rmsnorm.py 读到 RMSNorm 的完整公式注释，并理解 Qwen3 为什么用 RMSNorm 替代 LayerNorm、gain 为什么不存在。",
-      "status": "not_started",
+      "status": "in_progress",
       "verification": [
         "实现 RMSNorm（无 bias、不减均值、带可学习 gain，形状 [d]）",
         "smoke：随机输入经 RMSNorm 后 **平方均值**被归一化到 1（注意：RMSNorm 不做中心化，均值一般不为 0）",
