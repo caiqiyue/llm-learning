@@ -1,5 +1,9 @@
 # Qwen3 学习笔记：SwiGLU MLP
 
+> **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/model/gpt2.py`](../gpt-learning/gpt-learning-pytorch/model/gpt2.py) → `MLP`（`c_fc` → **GELU** → `c_proj`，两矩阵，FFN 宽度 `4 × n_embd`）
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/common/mlp.py`](qwen3-pytorch/model/common/mlp.py) → `SwiGLUMLP.forward`（Gate / Up / Down 三矩阵）、`GELUMLP.forward`（**只给退化对照用**）、`align_intermediate_size`
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_swiglu.py`](qwen3-pytorch/tests/test_swiglu.py)
+
 > **量化实证（feat-017）**：本组件「到底改了什么」的实测数字见
 > `qwen3-learning/Qwen3_训练推理完整学习笔记.md` **§12 退化对照**
 > —— 把 Qwen3 退化成 GPT-2 结构、只开 `mlp_type=swiglu` 这一个组件，

@@ -438,12 +438,18 @@ L4 层按 feature 完成度逐步加重：
 
 | 笔记 | 对应代码 |
 |---|---|
-| `Qwen3_RMSNorm_学习笔记.md` | `model/common/rmsnorm.py` |
-| `Qwen3_RoPE_学习笔记.md` | `model/common/rope.py` |
+| `Qwen3_RMSNorm_学习笔记.md` | `model/common/rmsnorm.py`、`model/common/norm.py` |
+| `Qwen3_RoPE_学习笔记.md` | `model/common/rope.py`、`model/common/pos_emb.py` |
 | `Qwen3_QK-Norm_学习笔记.md` | `model/common/attention.py` |
-| `Qwen3_GQA与KV_Cache_完整学习笔记.md` | `model/common/attention.py`、`model/common/kv_cache.py` |
-| `Qwen3_SwiGLU_MLP_学习笔记.md` | `model/qwen3_dense.py` |
+| `Qwen3_GQA与KV_Cache_完整学习笔记.md` | `model/common/attention.py`、`model/common/kv_cache.py`、`inference.py` |
+| `Qwen3_SwiGLU_MLP_学习笔记.md` | `model/common/mlp.py` |
 | `Qwen3_MoE_学习笔记.md` | `model/qwen3_moe.py` |
-| `Qwen3_训练推理完整学习笔记.md` | `inference.py`、`evaluate.py`、`ablations/compare_with_gpt2.py`（§12 退化对照） |
+| `Qwen3_BPE_学习笔记.md` | `data/bpe.py`、`data/tokenizer.py`、`data/build_vocab.py` |
+| `Qwen3_LoRA与DPO_学习笔记.md` | `model/common/lora.py`、`train/train_lora.py`、`train/train_dpo.py` |
+| `Qwen3_训练推理完整学习笔记.md` | `train/train_pretrain.py`、`inference.py`、`evaluate.py`、`ablations/compare_with_gpt2.py`（§12 退化对照） |
 
 GPT-2 主线参照：`gpt-learning/gpt-learning-pytorch/model/gpt2.py`
+
+> **每篇笔记开头都有「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置 / 对应可跑测试」三行**（feat-008），
+> 链接的可点开性由 `qwen3-learning/qwen3-pytorch/tests/test_note_refs.py` 自动校验 ——
+> 链接指向的文件不存在、或某篇笔记漏了引用块，测试直接红。

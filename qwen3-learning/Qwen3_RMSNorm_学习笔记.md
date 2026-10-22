@@ -1,5 +1,9 @@
 # Qwen3 学习笔记：RMSNorm
 
+> **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/model/gpt2.py`](../gpt-learning/gpt-learning-pytorch/model/gpt2.py) → `Block.ln_1` / `Block.ln_2`（`nn.LayerNorm`）与 `GPT2.ln_f`（**GPT-2 用 LayerNorm：减均值、有 bias**）
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/common/rmsnorm.py`](qwen3-pytorch/model/common/rmsnorm.py) → `RMSNorm.forward`；[`qwen3-learning/qwen3-pytorch/model/common/norm.py`](qwen3-pytorch/model/common/norm.py) → `build_norm`（按 `norm_type` 选 RMSNorm / LayerNorm）
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_rmsnorm.py`](qwen3-pytorch/tests/test_rmsnorm.py)（另见 [`qwen3-learning/qwen3-pytorch/tests/test_dense.py`](qwen3-pytorch/tests/test_dense.py)）
+
 > **量化实证（feat-017）**：本组件「到底改了什么」的实测数字见
 > `qwen3-learning/Qwen3_训练推理完整学习笔记.md` **§12 退化对照**
 > —— 把 Qwen3 退化成 GPT-2 结构、只开 `norm_type=rmsnorm` 这一个组件，

@@ -1,5 +1,9 @@
 # Qwen3-LoRA 与 DPO 学习笔记
 
+> **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/train_sft.py`](../gpt-learning/gpt-learning-pytorch/train_sft.py)（**全参 SFT**）/ [`gpt-learning/gpt-learning-pytorch/train_ppo.py`](../gpt-learning/gpt-learning-pytorch/train_ppo.py)（**RLHF 三件套**）—— **GPT-2 线没有 LoRA / DPO**（原理另见 [`gpt-learning/9.强化学习.md`](../gpt-learning/9.强化学习.md)）
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/common/lora.py`](qwen3-pytorch/model/common/lora.py) → `LoRALinear` / `inject_lora` / `merge_lora` / `strip_lora`；[`qwen3-learning/qwen3-pytorch/train/train_lora.py`](qwen3-pytorch/train/train_lora.py)；[`qwen3-learning/qwen3-pytorch/train/train_dpo.py`](qwen3-pytorch/train/train_dpo.py) → `dpo_loss`
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_lora.py`](qwen3-pytorch/tests/test_lora.py)、[`qwen3-learning/qwen3-pytorch/tests/test_dpo.py`](qwen3-pytorch/tests/test_dpo.py)
+
 > 代码位置：`qwen3-learning/qwen3-pytorch/model/common/lora.py`、
 > `qwen3-learning/qwen3-pytorch/train/train_lora.py`、
 > `qwen3-learning/qwen3-pytorch/tests/test_lora.py`

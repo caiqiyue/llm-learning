@@ -1,5 +1,9 @@
 # Qwen3 学习笔记：GQA 与 KV Cache
 
+> **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/model/gpt2.py`](../gpt-learning/gpt-learning-pytorch/model/gpt2.py) → `CausalSelfAttention`（**MHA**：K/V head 数 = Q head 数）；[`gpt-learning/gpt-learning-pytorch/inference.py`](../gpt-learning/gpt-learning-pytorch/inference.py) → `KVCache`
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/common/attention.py`](qwen3-pytorch/model/common/attention.py) → `CausalSelfAttention`（GQA：`n_head_kv < n_head`）；[`qwen3-learning/qwen3-pytorch/model/common/kv_cache.py`](qwen3-pytorch/model/common/kv_cache.py) → `KVCache`；[`qwen3-learning/qwen3-pytorch/inference.py`](qwen3-pytorch/inference.py) → `generate_naive` / `generate_with_cache`
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_attention.py`](qwen3-pytorch/tests/test_attention.py)、[`qwen3-learning/qwen3-pytorch/tests/test_kv_cache.py`](qwen3-pytorch/tests/test_kv_cache.py)、[`qwen3-learning/qwen3-pytorch/tests/test_inference.py`](qwen3-pytorch/tests/test_inference.py)
+
 > **量化实证（feat-017）**：本组件「到底改了什么」的实测数字见
 > `qwen3-learning/Qwen3_训练推理完整学习笔记.md` **§12 退化对照**
 > —— 把 Qwen3 退化成 GPT-2 结构、只开 `use_gqa` 这一个组件，

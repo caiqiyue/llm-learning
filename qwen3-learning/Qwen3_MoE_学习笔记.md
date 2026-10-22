@@ -1,5 +1,9 @@
 # Qwen3-MoE 学习笔记
 
+> **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/model/gpt2.py`](../gpt-learning/gpt-learning-pytorch/model/gpt2.py) → `MLP`（**GPT-2 线没有 MoE**，只有稠密 FFN）
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/qwen3_moe.py`](qwen3-pytorch/model/qwen3_moe.py) → `load_balancing_aux_loss` / `SparseMoeBlock` / `MoEBlock` / `Qwen3MoE`
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_moe.py`](qwen3-pytorch/tests/test_moe.py)
+
 ## 1. MoE 是什么
 
 MoE 全称：

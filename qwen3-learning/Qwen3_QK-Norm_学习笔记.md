@@ -1,5 +1,9 @@
 # Qwen3 学习笔记：QK-Norm
 
+> **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/model/gpt2.py`](../gpt-learning/gpt-learning-pytorch/model/gpt2.py) → `CausalSelfAttention`（**GPT-2 没有 QK-Norm**，Q/K 直接进点积）
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/common/attention.py`](qwen3-pytorch/model/common/attention.py) → `CausalSelfAttention._project_and_rotate`（Q/K 各自过一次 `RMSNorm`）
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_attention.py`](qwen3-pytorch/tests/test_attention.py)
+
 > **量化实证（feat-017）**：本组件「到底改了什么」的实测数字见
 > `qwen3-learning/Qwen3_训练推理完整学习笔记.md` **§12 退化对照**
 > —— 把 Qwen3 退化成 GPT-2 结构、只开 `use_qk_norm` 这一个组件，

@@ -26,10 +26,15 @@ python ablations/compare_with_gpt2.py   # 与 GPT-2 的退化对照（feat-017�
 | RoPE | [RoPE_学习笔记](../Qwen3_RoPE_学习笔记.md) | `model/common/rope.py` |
 | QK-Norm | [QK-Norm_学习笔记](../Qwen3_QK-Norm_学习笔记.md) | `model/common/attention.py` |
 | GQA / KV Cache | [GQA与KV_Cache](../Qwen3_GQA与KV_Cache_完整学习笔记.md) | `model/common/attention.py`、`model/common/kv_cache.py` |
-| SwiGLU | [SwiGLU_MLP_学习笔记](../Qwen3_SwiGLU_MLP_学习笔记.md) | `model/qwen3_dense.py` |
+| SwiGLU | [SwiGLU_MLP_学习笔记](../Qwen3_SwiGLU_MLP_学习笔记.md) | `model/common/mlp.py` |
 | MoE | [MoE_学习笔记](../Qwen3_MoE_学习笔记.md) | `model/qwen3_moe.py` |
+| byte-level BPE | [BPE_学习笔记](../Qwen3_BPE_学习笔记.md) | `data/bpe.py`、`data/tokenizer.py` |
+| LoRA / DPO | [LoRA与DPO_学习笔记](../Qwen3_LoRA与DPO_学习笔记.md) | `model/common/lora.py`、`train/train_lora.py`、`train/train_dpo.py` |
 | 训练 → 推理 | [训练推理完整学习笔记](../Qwen3_训练推理完整学习笔记.md) | `train/`、`inference.py` |
 | 与 GPT-2 的退化对照 | [训练推理完整学习笔记 §12](../Qwen3_训练推理完整学习笔记.md) | `ablations/compare_with_gpt2.py` |
+
+> **每篇笔记开头都有「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置 / 对应可跑测试」三行**，
+> 链接的可点开性由 `python tests/test_note_refs.py` 自动校验（链接指向的文件不存在 ⇒ 测试直接红）。
 
 ## 与 GPT-2 线的对照
 

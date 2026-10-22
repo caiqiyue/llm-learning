@@ -1,6 +1,8 @@
 # llm-learning
 
-> **从零手写 tiny GPT-2，跑通「预训练 → SFT → Reward Model → PPO」全流程**，配套 24 篇中文学习笔记。
+> **从零手写 tiny GPT-2，跑通「预训练 → SFT → Reward Model → PPO」全流程**；副线**从零手写 tiny Qwen3**
+> （RoPE / RMSNorm / QK-Norm / SwiGLU / GQA / MoE + byte-level BPE，走「预训练 → LoRA → DPO」）。
+> 配套 26 篇中文学习笔记（GPT-2 17 篇 + Qwen3 9 篇）。
 > 笔记和代码在同一仓库，**每个结论都能落到具体代码行上**。
 
 模型只有约 0.8M 参数，CPU 上 10 分钟能跑完整个 RLHF 链路 —— 规模小到可以逐行 debugger，规模完整到能看清每个环节在干什么。
@@ -50,8 +52,8 @@ llm-learning/
 │       └── utils.py
 │
 └── qwen3-learning/                      ← 【P2 线】Qwen3 现代架构
-    ├── Qwen3_*.md × 7                   ← 笔记（已有）
-    └── qwen3-pytorch/                   ← 实现（待建，见 feat-011）
+    ├── Qwen3_*.md × 9                   ← 笔记（每篇开头带 GPT-2 / Qwen3 源码交叉引用）
+    └── qwen3-pytorch/                   ← 实现（从零手写，预训练 → LoRA → DPO 全链路）
 ```
 
 > `checkpoints/` 和 `docs/` 被 `.gitignore` 排除：权重文件和本地草稿留在本机，不进仓库。
@@ -62,31 +64,32 @@ llm-learning/
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| **P1** | GPT-2 + RLHF 全流程：17 篇笔记 + 可运行代码 | 代码与笔记就位，**训练链路待 torch 环境修复后复验**（`feat-001`） |
-| **P2（当前）** | Qwen3 从零实现：RoPE / RMSNorm / QK-Norm / SwiGLU / GQA | 7 篇笔记就绪，代码待建（`feat-011` 起） |
-| **P3** | Qwen3 训练与评估、MoE 稀疏前馈 | 规划中 |
+| **P1** | GPT-2 + RLHF 全流程：17 篇笔记 + 可运行代码 | **全链路已复验通过**（torch 环境已修好，训练 + 9 项评估全绿） |
+| **P2（当前）** | Qwen3 从零实现：RoPE / RMSNorm / QK-Norm / SwiGLU / GQA / MoE + 预训练 → LoRA → DPO | **9 篇笔记 + 全部实现就位**，收尾中（交叉引用 + 数字全量核对） |
+| **P3** | Qwen3 更大规模、更多任务 | 规划中 |
 
 当前阶段以 [`feature_list.json`](feature_list.json) 的 `phase` 字段为准。
 
-### P2 计划中的 Qwen3 代码结构
+### P2 的 Qwen3 代码结构（已建成）
 
 ```
 qwen3-learning/qwen3-pytorch/
 ├── config.py          # 独立超参：n_head_kv / head_dim / rope_theta / rms_eps …
 ├── model/
-│   ├── norm.py        # RMSNorm
-│   ├── rope.py        # RoPE（含旋转等变性自测）
-│   ├── attention.py   # QK-Norm + GQA 注意力
-│   ├── mlp.py         # SwiGLU
-│   └── qwen3.py       # 完整前向（接口对齐 GPT2.forward）
-├── data/              # 数据与 tokenizer（方案见 feat-019）
-├── inference.py       # KV Cache prefill/decode + 采样
-├── compare_gpt2.py    # 与 GPT-2 的退化对照（feat-017）
-└── train_pretrain.py  # P3
+│   ├── common/        # rmsnorm / rope / attention(QK-Norm+GQA) / mlp(SwiGLU) / kv_cache / lora / norm / pos_emb
+│   ├── qwen3_dense.py # 完整前向（接口对齐 GPT2.forward）
+│   └── qwen3_moe.py   # Router + 专家 + 负载均衡辅助损失
+├── data/              # byte-level BPE tokenizer + 语料 + 预训练/偏好数据
+├── train/             # train_pretrain.py → train_lora.py → train_dpo.py
+├── inference.py       # KV Cache prefill/decode + temperature/top-k/top-p 采样
+├── evaluate.py        # 精简 5 段评估（pretrain / moe / lora / dpo / speedup）
+├── ablations/         # 与 GPT-2 的退化对照（feat-017，唯一跨目录引用 GPT-2 线的地方）
+└── tests/             # 16 个 test_*.py + run_all.py 汇总
 ```
 
-**核心思路**：不靠"读懂论文"，而是**把 Qwen3 的每个组件做成一个可关掉的开关**（`use_gqa` / `use_rope` / `use_qk_norm` / MLP 选型），
-关掉之后退化出的模型应当与 GPT-2 对齐 —— 这样"Qwen3 到底改了什么、为什么改"就变成一次可重跑的实验，而不是一段文字（见 `feat-017`）。
+**核心思路**：不靠"读懂论文"，而是**把 Qwen3 的每个组件做成一个可关掉的开关**（`use_gqa` / `use_rope` / `use_qk_norm` / `mlp_type` / `norm_type`），
+关掉之后退化出的模型与 GPT-2 **逐位相同**（实测 `max_abs_diff = 0.000e+00`）——
+这样"Qwen3 到底改了什么、为什么改"就变成一次可重跑的实验，而不是一段文字（`feat-017` 已完成）。
 
 ---
 
@@ -116,18 +119,21 @@ qwen3-learning/qwen3-pytorch/
 
 ### 副线：`qwen3-learning/` —— 现代架构在哪些位置做了改进
 
-| 笔记 | 对照主线 |
-|------|----------|
-| [Qwen3 RoPE](qwen3-learning/Qwen3_RoPE_学习笔记.md) | 对比笔记 2 的 Sinusoidal 位置编码 |
-| [Qwen3 RMSNorm](qwen3-learning/Qwen3_RMSNorm_学习笔记.md) | 对比 LayerNorm 在 Pre-LN 结构里的作用 |
-| [Qwen3 QK-Norm](qwen3-learning/Qwen3_QK-Norm_学习笔记.md) | 注意力数值稳定性 |
-| [Qwen3 SwiGLU MLP](qwen3-learning/Qwen3_SwiGLU_MLP_学习笔记.md) | 对比主线 `model/gpt2.py` 的 GELU MLP |
-| [Qwen3 MoE](qwen3-learning/Qwen3_MoE_学习笔记.md) | 从稠密 FFN 到稀疏专家 |
-| [Qwen3 GQA 与 KV Cache](qwen3-learning/Qwen3_GQA与KV_Cache_完整学习笔记.md) | 对比主线笔记 3、12 的 MHA + KV Cache |
-| [Qwen3 训练推理完整学习笔记](qwen3-learning/Qwen3_训练推理完整学习笔记.md) | 端到端训练与推理流程 |
+| 笔记 | 对照主线 | Qwen3 源码 |
+|------|----------|-----------|
+| [Qwen3 RoPE](qwen3-learning/Qwen3_RoPE_学习笔记.md) | 对比笔记 2 的 Sinusoidal 位置编码 | [`model/common/rope.py`](qwen3-learning/qwen3-pytorch/model/common/rope.py) |
+| [Qwen3 RMSNorm](qwen3-learning/Qwen3_RMSNorm_学习笔记.md) | 对比 LayerNorm 在 Pre-LN 结构里的作用 | [`model/common/rmsnorm.py`](qwen3-learning/qwen3-pytorch/model/common/rmsnorm.py) |
+| [Qwen3 QK-Norm](qwen3-learning/Qwen3_QK-Norm_学习笔记.md) | 注意力数值稳定性 | [`model/common/attention.py`](qwen3-learning/qwen3-pytorch/model/common/attention.py) |
+| [Qwen3 SwiGLU MLP](qwen3-learning/Qwen3_SwiGLU_MLP_学习笔记.md) | 对比主线 `model/gpt2.py` 的 GELU MLP | [`model/common/mlp.py`](qwen3-learning/qwen3-pytorch/model/common/mlp.py) |
+| [Qwen3 MoE](qwen3-learning/Qwen3_MoE_学习笔记.md) | 从稠密 FFN 到稀疏专家 | [`model/qwen3_moe.py`](qwen3-learning/qwen3-pytorch/model/qwen3_moe.py) |
+| [Qwen3 GQA 与 KV Cache](qwen3-learning/Qwen3_GQA与KV_Cache_完整学习笔记.md) | 对比主线笔记 3、12 的 MHA + KV Cache | [`model/common/attention.py`](qwen3-learning/qwen3-pytorch/model/common/attention.py)、[`model/common/kv_cache.py`](qwen3-learning/qwen3-pytorch/model/common/kv_cache.py) |
+| [Qwen3 BPE Tokenizer](qwen3-learning/Qwen3_BPE_学习笔记.md) | 对比主线字符级 `CharTokenizer`（主线**没有** BPE 代码） | [`data/bpe.py`](qwen3-learning/qwen3-pytorch/data/bpe.py)、[`data/tokenizer.py`](qwen3-learning/qwen3-pytorch/data/tokenizer.py) |
+| [Qwen3 LoRA 与 DPO](qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md) | 对比主线全参 SFT + RM + PPO（主线**没有** LoRA/DPO） | [`model/common/lora.py`](qwen3-learning/qwen3-pytorch/model/common/lora.py)、[`train/train_lora.py`](qwen3-learning/qwen3-pytorch/train/train_lora.py)、[`train/train_dpo.py`](qwen3-learning/qwen3-pytorch/train/train_dpo.py) |
+| [Qwen3 训练推理完整学习笔记](qwen3-learning/Qwen3_训练推理完整学习笔记.md) | 端到端训练与推理流程 | [`train/train_pretrain.py`](qwen3-learning/qwen3-pytorch/train/train_pretrain.py)、[`inference.py`](qwen3-learning/qwen3-pytorch/inference.py)、[`evaluate.py`](qwen3-learning/qwen3-pytorch/evaluate.py) |
 
-> **P2 阶段进行中**：这 7 篇笔记对应的实现正在手写中（`qwen3-learning/qwen3-pytorch/`，见 `feat-011` 起）。
-> 每完成一个组件，会在本表加一列指向源码位置，并把笔记里的断言换成可重跑的对照实验结果。
+> **每篇笔记开头都有「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置 / 对应可跑测试」三行**，
+> 点开就能跳到具体文件；这些链接由 `qwen3-learning/qwen3-pytorch/tests/test_note_refs.py` **自动校验**
+> —— 链接指向的文件不存在时，测试直接红。
 
 ---
 
@@ -141,8 +147,9 @@ pip install -r gpt-learning/gpt-learning-pytorch/requirements.txt   # torch / nu
 python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
 ```
 
-> ⚠️ **已知问题**：部分 Windows 环境下 `import torch` 会报 `WinError 127`（`torch_python.dll` 加载失败）。
-> 先跑一遍 `bash init.sh` 确认环境，它会明确告诉你哪一层可用。
+> ✅ **torch 环境已就绪**：本机命中 `Python 3.10.4 + torch 2.1.0+cpu`。
+> `init.sh` 会自动挑一个**能 `import torch` 的解释器**（PATH 上的 Python 3.11.0a2 alpha ABI 不兼容 torch）。
+> 仍报 `WinError 127` 时先跑一遍 `bash init.sh`，它会明确告诉你哪一层可用。
 
 ### 一键轻量验证
 
@@ -150,10 +157,10 @@ python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
 bash init.sh
 ```
 
-约 1 分钟，分五层检查：L0 环境 → L1 纯 Python 数据层 → L2 GPT-2 模型前向 → L3 仓库卫生 → L4 Qwen3 结构
-（目录未创建时自动 SKIP，不会阻塞 GPT-2 线的工作）。
+约 1 分钟，分五层检查：L0 环境 → L1 纯 Python 数据层 → L2 GPT-2 模型前向 → L3 仓库卫生 → L4 Qwen3 全链路
+（组件 smoke / 前向 / 训练步 / LoRA / DPO / 推理 / 评估 / 退化对照，共 8 条）。
 
-### 完整训练流程（CPU 约 10 分钟，P1 线；待 `feat-001` 修复后可跑）
+### 完整训练流程（CPU 约 10 分钟，P1 线）
 
 ```bash
 cd gpt-learning/gpt-learning-pytorch
@@ -176,13 +183,33 @@ python evaluate.py --stage all --all_checkpoints checkpoints/
 response quality、SFT vs PPO、toy benchmark、KV speedup。单项评估见
 [`gpt-learning-pytorch/README.md`](gpt-learning/gpt-learning-pytorch/README.md)。
 
+### Qwen3 线完整流程（CPU 约 3 分钟，P2 线）
+
+```bash
+cd qwen3-learning/qwen3-pytorch
+
+python data/build_vocab.py               # 训练并落盘 byte-level BPE 词表（vocab 778）
+
+python train/train_pretrain.py --model dense   # ① 预训练 → checkpoints/pretrain_dense.pt
+python train/train_pretrain.py --model moe     # ①' 预训练（MoE 变体）
+python train/train_lora.py               # ② LoRA 微调（r=4，注入 q_proj / v_proj）
+python train/train_dpo.py                # ③ DPO（π_ref = LoRA 后的 SFT 模型）
+
+python evaluate.py --stage all            # 精简 5 段评估
+python ablations/compare_with_gpt2.py    # 与 GPT-2 的退化对照（6 行消融表）
+python tests/run_all.py                  # 16 个 smoke 汇总
+```
+
+单项说明见 [`qwen3-pytorch/README.md`](qwen3-learning/qwen3-pytorch/README.md)。
+
 ### 推荐学习顺序
 
 1. 读笔记 **0** 拿到全局地图
 2. 按 [代码阅读顺序与进度](gpt-learning/代码阅读顺序与进度.md) 读 `model/gpt2.py` → `data/` → `train_pretrain.py`
 3. 每读完一个模块，回头读对应章节笔记（2 / 4 / 5）
 4. 跑通预训练后读 6、7，再依次跑 SFT → RM → PPO，每跑通一步读一篇对应笔记
-5. 最后读 Qwen3 副线，对照着看现代架构改了什么
+5. 最后读 Qwen3 副线（9 篇），对照着看现代架构改了什么；
+   每篇笔记开头都有「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置 / 对应可跑测试」三行，可直接跳过去读
 
 ---
 

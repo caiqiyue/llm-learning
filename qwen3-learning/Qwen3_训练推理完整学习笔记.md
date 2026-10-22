@@ -1,5 +1,9 @@
 # Qwen3 学习笔记：从训练到 KV Cache 推理，再到 GQA 的 Head 映射
 
+> **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/train_pretrain.py`](../gpt-learning/gpt-learning-pytorch/train_pretrain.py) / [`gpt-learning/gpt-learning-pytorch/train_sft.py`](../gpt-learning/gpt-learning-pytorch/train_sft.py) / [`gpt-learning/gpt-learning-pytorch/inference.py`](../gpt-learning/gpt-learning-pytorch/inference.py) / [`gpt-learning/gpt-learning-pytorch/evaluate.py`](../gpt-learning/gpt-learning-pytorch/evaluate.py)
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/train/train_pretrain.py`](qwen3-pytorch/train/train_pretrain.py) / [`qwen3-learning/qwen3-pytorch/train/train_lora.py`](qwen3-pytorch/train/train_lora.py) / [`qwen3-learning/qwen3-pytorch/train/train_dpo.py`](qwen3-pytorch/train/train_dpo.py) / [`qwen3-learning/qwen3-pytorch/inference.py`](qwen3-pytorch/inference.py) / [`qwen3-learning/qwen3-pytorch/evaluate.py`](qwen3-pytorch/evaluate.py) / [`qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`](qwen3-pytorch/ablations/compare_with_gpt2.py)
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_pretrain.py`](qwen3-pytorch/tests/test_pretrain.py) / [`qwen3-learning/qwen3-pytorch/tests/test_inference.py`](qwen3-pytorch/tests/test_inference.py) / [`qwen3-learning/qwen3-pytorch/tests/test_evaluate.py`](qwen3-pytorch/tests/test_evaluate.py) / [`qwen3-learning/qwen3-pytorch/tests/test_compare_with_gpt2.py`](qwen3-pytorch/tests/test_compare_with_gpt2.py)
+
 > 学习目标：把 Transformer / GPT 基础与 Qwen3 的 RMSNorm、QK-Norm、RoPE、GQA、SwiGLU 和 KV Cache 串起来，重点跟踪 **Tensor Shape**。本笔记是我们多轮问答的综合版。示例是**微型 Qwen3 风格模型**，用于讲解机制，并不是声称能复现真实 Qwen3 的训练结果。
 
 ## 0. 阅读约定和最重要的 Shape

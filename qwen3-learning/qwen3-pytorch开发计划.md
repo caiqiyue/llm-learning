@@ -9804,42 +9804,313 @@ Qwen3 的 `rms_eps=1e-6`。不同步就多一个 ~1% 的相对差，
 ### Task 19: feat-008 笔记与代码交叉引用表
 
 **Files:**
-- Modify: `qwen3-learning/Qwen3_*.md`（每篇开头加引用块）
-- Modify: `qwen3-learning/qwen3-pytorch/README.md`
-- Modify: `README.md`（笔记索引表补 Qwen3 代码列）
+- Create: `qwen3-learning/Qwen3_BPE_学习笔记.md`（**唯一缺过的那篇笔记**）
+- Create: `qwen3-learning/qwen3-pytorch/tests/test_note_refs.py`
+- Modify: `qwen3-learning/Qwen3_*.md`（9 篇，每篇开头加引用块）
+- Modify: `qwen3-learning/qwen3-pytorch/README.md`（概念表补 BPE / LoRA-DPO 两行）
+- Modify: `qwen3-learning/qwen3-pytorch设计.md`（§12 关联笔记表补全）
+- Modify: `README.md`（根目录：Qwen3 索引表补「Qwen3 源码」列 + 目录结构 + 阶段表 + 快速开始）
+- Modify: `feature_list.json`
 
-- [ ] **Step 1: 每篇 Qwen3 笔记开头加引用块**
+- [x] **Step 1: 每篇 Qwen3 笔记开头加引用块**
+
+引用块放在 H1 标题之后，**恰好三行**（可点开的 markdown 链接 + 定位到具体的类 / 函数）：
 
 ```markdown
-> **对应 GPT-2 实现位置**：`gpt-learning/gpt-learning-pytorch/model/gpt2.py` 的 `CausalSelfAttention`
-> **对应 Qwen3 源码位置**：`qwen3-learning/qwen3-pytorch/model/common/attention.py` 的 `CausalSelfAttention.forward`
+> **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/model/gpt2.py`](../gpt-learning/gpt-learning-pytorch/model/gpt2.py) → `Block.ln_1` / `Block.ln_2`（`nn.LayerNorm`）与 `GPT2.ln_f`（**GPT-2 用 LayerNorm：减均值、有 bias**）
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/common/rmsnorm.py`](qwen3-pytorch/model/common/rmsnorm.py) → `RMSNorm.forward`；[`qwen3-learning/qwen3-pytorch/model/common/norm.py`](qwen3-pytorch/model/common/norm.py) → `build_norm`（按 `norm_type` 选 RMSNorm / LayerNorm）
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_rmsnorm.py`](qwen3-pytorch/tests/test_rmsnorm.py)（另见 [`qwen3-learning/qwen3-pytorch/tests/test_dense.py`](qwen3-pytorch/tests/test_dense.py)）
 ```
 
-- [ ] **Step 2: 补齐缺笔记的组件**
+**链接文字是「仓库根相对路径」，链接目标是「相对当前文件」的路径** ——
+前者让人知道文件在仓库里的位置，后者让 markdown 渲染器能真的点开。
+9 篇笔记的引用块内容（逐篇不同，含**诚实标注「本线没有对应实现」**的情况）：
 
-当前 7 篇笔记**没有**覆盖：BPE、LoRA、DPO、采样。需新增或补写：
+| 笔记 | GPT-2 侧 | Qwen3 侧 |
+|---|---|---|
+| RMSNorm | `model/gpt2.py` → `Block.ln_1/ln_2`、`GPT2.ln_f` | `model/common/rmsnorm.py`、`model/common/norm.py` |
+| RoPE | `model/gpt2.py` → `_build_sinusoidal_pos_emb` + `GPT2.pos_emb` | `model/common/rope.py`、`model/common/pos_emb.py` |
+| QK-Norm | `model/gpt2.py` → `CausalSelfAttention`（**GPT-2 没有 QK-Norm**） | `model/common/attention.py` → `_project_and_rotate` |
+| GQA / KV Cache | `model/gpt2.py` → `CausalSelfAttention`（MHA）、`inference.py` → `KVCache` | `model/common/attention.py`、`model/common/kv_cache.py`、`inference.py` |
+| SwiGLU | `model/gpt2.py` → `MLP`（`c_fc` → GELU → `c_proj`） | `model/common/mlp.py` → `SwiGLUMLP` / `GELUMLP` / `align_intermediate_size` |
+| MoE | `model/gpt2.py` → `MLP`（**GPT-2 线没有 MoE**） | `model/qwen3_moe.py` |
+| BPE | `gpt-learning/1.bpe-tokenizer.md` + `data/tokenizer.py` 的 `CharTokenizer`（**主线代码里没有 BPE**） | `data/bpe.py`、`data/tokenizer.py`、`data/build_vocab.py` |
+| LoRA / DPO | `train_sft.py` / `train_ppo.py`（**主线没有 LoRA / DPO**） | `model/common/lora.py`、`train/train_lora.py`、`train/train_dpo.py` |
+| 训练推理 | `train_pretrain.py` / `train_sft.py` / `inference.py` / `evaluate.py` | `train/train_pretrain.py` / `train/train_lora.py` / `train/train_dpo.py` / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py` |
 
-- `Qwen3_BPE_学习笔记.md`（Task 11 完成后写）
-- `Qwen3_LoRA与DPO_学习笔记.md`（Task 15 完成后写）
-- 采样（temperature/top-k/top-p）并入 `Qwen3_训练推理完整学习笔记.md`
+- [x] **Step 2: 补齐缺笔记的组件**
 
-- [ ] **Step 3: 逐条验证链接目标真实存在**
+- ✅ `Qwen3_BPE_学习笔记.md` —— **本次新建**（BPE 代码在 feat-022 就落地了，但一直没写笔记）
+- ✅ `Qwen3_LoRA与DPO_学习笔记.md` —— 已在 feat-023 / feat-024 补齐（LoRA 半部 §1–§7 + DPO 半部 §8 + §9 教训 7 条）
+- ✅ 采样（temperature / top-k / top-p）—— 已在 feat-018 并入 `Qwen3_训练推理完整学习笔记.md` §10
 
-```bash
-cd qwen3-learning/qwen3-pytorch
-grep -rhoE '`(model|data|train|tests)/[a-z_/]+\.py`' ../Qwen3_*.md | tr -d '`' | sort -u | while read f; do
-  [ -f "$f" ] && echo "OK   $f" || echo "MISS $f"
-done
+**BPE 笔记的实测数字**（全部来自本仓库代码实跑，CPU，2026-10-23）：
+
+| 指标 | 数值 | 出处 |
+|---|---|---|
+| 训练语料 | 20000 句 / 785065 字节 | `data/build_vocab.py` |
+| 目标词表 / 实际词表 | 1000 / **778** | `config.DENSE_CONFIG.bpe_vocab_size` |
+| 合并次数 | **521** | `train_bpe` 的 `len(merges)` |
+| 压缩比（语料前 500 句） | 19641 字节 → 2767 tokens = **7.10 字节/token** | `build_vocab.py` |
+| 单句压缩 | `"The student trained a tiny transformer."` 39 B → **6 tokens** | `test_bpe.py` 第 8 组 |
+| GPT-2 线 `CharTokenizer` 词表 | **45** | `gpt-learning/gpt-learning-pytorch/data/vocab.txt` |
+| 同一句的 token 数 | CharTokenizer **39** vs BPE **6** | 实测 |
+| 中文句 | CharTokenizer 14 token（**14 个全 UNK**）vs BPE 42 字节 → **36 token、0 UNK** | 实测 |
+
+**★ 重建词表是幂等的**：同 seed ⇒ `vocab.json` / `merges.txt` 逐字节一致（本次实测 `git status` 干净）。
+
+- [x] **Step 3: 逐条验证链接目标真实存在**
+
+初稿给的验证方法是 `grep -rhoE` + shell 循环，**有两个问题**：
+① 只查了反引号里的路径，**查不到 markdown 链接**（而「可点开」指的正是链接）；
+② shell 循环查不出「某篇笔记压根没有引用块」这种情况。
+
+改成**一个可运行的测试** `tests/test_note_refs.py`（`tests/run_all.py` 自动发现 ⇒ `init.sh` L4 一起覆盖）：
+
+```python
+"""
+笔记 ↔ 源码交叉引用的可运行校验（对应 feat-008）。
+
+要守的东西：
+  1. 每篇 Qwen3 笔记开头都有「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置」两行
+  2. 交叉引用块里的**每个 markdown 链接**都能点开、且目标文件真实存在
+  3. 笔记正文里出现的**路径型反引号串**都能在仓库里找到对应文件
+  4. 根 README 的 Qwen3 索引表覆盖了全部笔记，且每一行都带「Qwen3 源码」列
+  5. 唯一缺过的那篇笔记（Qwen3_BPE_学习笔记.md）已补齐
+
+运行：python tests/test_note_refs.py
+"""
+
+import io
+import os
+import re
+import sys
+
+# tests/ → qwen3-pytorch → qwen3-learning → llm-learning（仓库根）
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(TESTS_DIR)          # qwen3-learning/qwen3-pytorch
+NOTES_DIR = os.path.dirname(PROJECT_ROOT)          # qwen3-learning
+REPO_ROOT = os.path.dirname(NOTES_DIR)             # llm-learning
+
+# 路径查找的候选根（按顺序找，第一个命中的算「解析成功」）
+_SEARCH_ROOTS = [
+    REPO_ROOT,
+    PROJECT_ROOT,
+    os.path.join(REPO_ROOT, "gpt-learning", "gpt-learning-pytorch"),
+    NOTES_DIR,
+]
+
+# 反引号里「像路径」的串：必须含 / + 有文件扩展名 + 只含路径安全字符
+_PATHLIKE_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.一-鿿-]+/)+[A-Za-z0-9_.一-鿿-]+\.(?:py|md|json|txt|pt|sh)$"
+)
+
+# markdown 链接：[文字](目标)
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")
+
+# 交叉引用块的两行标记
+_GPT2_LINE = "> **对应 GPT-2 实现位置**"
+_QWEN3_LINE = "> **对应 Qwen3 源码位置**"
+
+
+def _note_files() -> list:
+    """找出全部 Qwen3 学习笔记（不含设计文档与开发计划）。"""
+    names = [
+        n for n in os.listdir(NOTES_DIR)
+        if n.startswith("Qwen3_") and n.endswith(".md")
+    ]
+    return sorted(names)
+
+
+def _read(path: str) -> str:
+    """读文件（显式 UTF-8）。"""
+    with io.open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def _resolve(rel: str) -> bool:
+    """
+    判断一个相对路径能否在候选根下找到真实文件。
+
+    参数：
+        rel: 相对路径（可能带 `::符号名` 后缀）
+    返回：
+        True 表示命中
+    """
+    rel = rel.split("::", 1)[0]          # 去掉 `::function` 这种定位后缀
+    rel = rel.lstrip("./")
+    for root in _SEARCH_ROOTS:
+        if os.path.isfile(os.path.join(root, rel)):
+            return True
+    return False
+
+
+def _is_skippable(s: str) -> bool:
+    """
+    判断一个反引号串是否**不该**被当成仓库路径。
+
+    跳过的三类：
+      - 绝对路径（带盘符，如 `E:/tmp/xxx.py`）—— 在仓库外
+      - 产物目录（`checkpoints/` / `docs/`）—— 按 AGENTS.md 不入库
+      - 含空格 —— 那是命令或自然语言，不是路径
+    """
+    if " " in s or "\t" in s:
+        return True
+    if re.match(r"^[A-Za-z]:", s):
+        return True
+    if s.startswith(("checkpoints/", "docs/")):
+        return True
+    return False
+
+
+def main() -> int:
+    """跑全部断言。返回进程退出码。"""
+    notes = _note_files()
+
+    # =================================================================
+    # 0) 唯一缺过的那篇笔记必须存在
+    # =================================================================
+    assert "Qwen3_BPE_学习笔记.md" in notes, \
+        "Qwen3_BPE_学习笔记.md 仍缺 —— feat-022 的 BPE 实现没有对应的学习笔记"
+    print(f"[refs] 笔记 {len(notes)} 篇：{', '.join(notes)}")
+
+    n_links = 0
+    n_paths = 0
+
+    for name in notes:
+        path = os.path.join(NOTES_DIR, name)
+        text = _read(path)
+        lines = text.split("\n")
+
+        # =================================================================
+        # 1) 开头必须有「对应 GPT-2 / 对应 Qwen3」两行
+        #    （允许在标题后若干行内，但不能整篇都没有）
+        # =================================================================
+        gpt2_idx = next((i for i, l in enumerate(lines) if l.startswith(_GPT2_LINE)), None)
+        qwen3_idx = next((i for i, l in enumerate(lines) if l.startswith(_QWEN3_LINE)), None)
+        assert gpt2_idx is not None, f"{name}: 缺少「{_GPT2_LINE}」行"
+        assert qwen3_idx is not None, f"{name}: 缺少「{_QWEN3_LINE}」行"
+        assert gpt2_idx < 12, f"{name}: 交叉引用块不在开头（第 {gpt2_idx + 1} 行）"
+
+        # =================================================================
+        # 2) 交叉引用块里的每个 markdown 链接都要能点开
+        # =================================================================
+        block_lines = [l for l in lines if l.startswith("> ") and "](" in l]
+        assert block_lines, f"{name}: 交叉引用块里没有 markdown 链接"
+        for line in block_lines:
+            for _text, target in _MD_LINK_RE.findall(line):
+                if target.startswith(("http://", "https://", "#")):
+                    continue
+                n_links += 1
+                assert not target.startswith("/"), \
+                    f"{name}: 链接用了绝对路径「{target}」，应改成相对路径"
+                resolved = os.path.normpath(os.path.join(NOTES_DIR, target))
+                assert os.path.isfile(resolved), \
+                    f"{name}: 链接目标不存在 → {target}（解析为 {resolved}）"
+
+        # =================================================================
+        # 3) 正文里路径型的反引号串必须能在仓库里找到
+        # =================================================================
+        for raw in re.findall(r"`([^`\n]+)`", text):
+            if _is_skippable(raw):
+                continue
+            if not _PATHLIKE_RE.match(raw):
+                continue
+            n_paths += 1
+            assert _resolve(raw), f"{name}: 路径不存在 → `{raw}`"
+
+    # =================================================================
+    # 4) 根 README 的 Qwen3 索引表：覆盖全部笔记 + 带「Qwen3 源码」列
+    # =================================================================
+    readme = _read(os.path.join(REPO_ROOT, "README.md"))
+    assert "| Qwen3 源码 |" in readme, \
+        "根 README 的 Qwen3 索引表没有「Qwen3 源码」列"
+    for name in notes:
+        assert f"qwen3-learning/{name}" in readme, \
+            f"根 README 的 Qwen3 索引表缺 {name}"
+        # 索引表里的笔记链接必须能点开
+        target = os.path.join(REPO_ROOT, "qwen3-learning", name)
+        assert os.path.isfile(target), f"根 README 指向的 {name} 不存在"
+
+    # 根 README 里 qwen3-learning/ 下的链接也要能点开
+    for _text, target in _MD_LINK_RE.findall(readme):
+        if not target.startswith("qwen3-learning/"):
+            continue
+        if target.startswith(("http://", "https://", "#")):
+            continue
+        n_links += 1
+        resolved = os.path.normpath(os.path.join(REPO_ROOT, target))
+        assert os.path.exists(resolved), \
+            f"根 README: 链接目标不存在 → {target}"
+
+    # =================================================================
+    # 5) qwen3-pytorch/README.md 的「概念 → 笔记 → 源码」表要覆盖全部笔记
+    # =================================================================
+    q_readme = _read(os.path.join(PROJECT_ROOT, "README.md"))
+    for name in notes:
+        assert name in q_readme, f"qwen3-pytorch/README.md 缺 {name} 的入口"
+
+    print(f"[refs] 交叉引用链接 {n_links} 条全部可点开；"
+          f"正文路径 {n_paths} 处全部存在")
+    print(f"test_note_refs OK  笔记 {len(notes)} 篇 / 链接 {n_links} 条 / 路径 {n_paths} 处")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
-Expected: 全部 `OK`，无 `MISS`。
+守 5 件事：
 
-- [ ] **Step 4: Commit**
+1. `Qwen3_BPE_学习笔记.md` 存在（唯一缺过的那篇）
+2. 每篇笔记开头都有「对应 GPT-2 实现位置」和「对应 Qwen3 源码位置」两行，且**在第 12 行之内**
+3. 交叉引用块里**每个 markdown 链接**都能解析到真实文件（相对当前笔记目录）
+4. 笔记正文里**路径型的反引号串**（含 `/` + 有扩展名 + 只含路径安全字符）都能在仓库里找到
+   —— 查找根依次是：仓库根 → `qwen3-pytorch/` → GPT-2 线的实现目录 → `qwen3-learning/`
+5. 根 README 的 Qwen3 索引表覆盖全部 9 篇笔记、且带「Qwen3 源码」列
+
+**★ 路径匹配的三个排除规则**（否则全是假阳性）：
+
+| 排除 | 例子 | 为什么 |
+|---|---|---|
+| 含空格 | `python tests/test_moe.py`、`n_embd // n_head` | 是命令 / 自然语言，不是路径 |
+| 带盘符 | `E:/tmp/lora_ablation_v2.py` | 在仓库外 |
+| 产物目录 | `checkpoints/pretrain_dense.pt` | 按 AGENTS.md 不入库，**不能拿「本地存在」当「链接有效」** |
+
+另外 `config.json` 也不查 —— 笔记里提到的 `config.json` 指的是 **HuggingFace 模型的配置文件**（外部文件），不是仓库里的文件。
+
+实测输出（2026-10-23）：
+
+```
+$ python tests/test_note_refs.py
+[refs] 笔记 9 篇：Qwen3_BPE_学习笔记.md, Qwen3_GQA与KV_Cache_完整学习笔记.md, Qwen3_LoRA与DPO_学习笔记.md, Qwen3_MoE_学习笔记.md, Qwen3_QK-Norm_学习笔记.md, Qwen3_RMSNorm_学习笔记.md, Qwen3_RoPE_学习笔记.md, Qwen3_SwiGLU_MLP_学习笔记.md, Qwen3_训练推理完整学习笔记.md
+[refs] 交叉引用链接 78 条全部可点开；正文路径 107 处全部存在
+test_note_refs OK  笔记 9 篇 / 链接 78 条 / 路径 107 处
+
+$ python tests/run_all.py
+[run_all] PASS=16  FAIL=0  TOTAL=16
+```
+
+- [x] **Step 4: Commit**
 
 ```bash
 git add qwen3-learning/ README.md
 git commit -m "feat-008: 笔记 ↔ 源码交叉引用表（每篇笔记开头加 GPT-2 / Qwen3 位置）"
 ```
+
+**★ 修正计划初稿的 3 个真问题**
+
+① **初稿的验证方法查不出「链接」** —— `grep -rhoE '`(model|data|train|tests)/...`'` 只匹配反引号，
+而「逐条链接可点开」指的是 markdown 链接 `[文字](目标)`。改用 Python 测试同时校验两类。
+
+② **初稿漏了「根 README」这一层** —— 计划只写了 `qwen3-learning/qwen3-pytorch/README.md`，
+但**根目录 `README.md` 里也有一张 Qwen3 笔记索引表**，它才是学习者第一眼看到的地方。
+两张表都要补「源码」列，且根 README 那张要**覆盖全部 9 篇笔记**（初稿只有 7 篇）。
+
+③ **初稿只说「补 BPE 笔记」，没说清补什么** —— 实际写的时候要落到**本仓库的实测数字**上，
+不能抄 GPT-2 的 BPE 笔记。而且必须写清楚一件容易搞混的事：
+**GPT-2 线的代码里根本没有 BPE**（是字符级 `CharTokenizer`，vocab 45，中文全 UNK），
+`gpt-learning/1.bpe-tokenizer.md` 只是**原理讲解**。交叉引用必须诚实标出这个差别。
 
 ---
 

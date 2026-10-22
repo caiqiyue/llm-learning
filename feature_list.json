@@ -466,15 +466,24 @@
       "priority": 17,
       "area": "docs",
       "title": "笔记与代码交叉引用表",
-      "user_visible_behavior": "学习者从任一概念（GQA、QK-Norm、MoE、SwiGLU、RMSNorm、RoPE）都能在笔记里跳到 GPT-2 主线与 Qwen3 实现的具体源码位置。",
-      "status": "not_started",
+      "user_visible_behavior": "打开任一篇 Qwen3 笔记，开头就能看到「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置 / 对应可跑测试」三行，点开直接跳到具体文件的具体类/函数；根 README 的 Qwen3 索引表多一列「Qwen3 源码」，同样是可点开的链接。缺的那篇 BPE 笔记已补齐（qwen3-learning/Qwen3_BPE_学习笔记.md）。",
+      "status": "passing",
       "verification": [
         "每篇 Qwen3 笔记开头加「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置」两行",
         "README.md 的笔记索引表补上 Qwen3 代码列",
         "逐条链接可点开且目标文件真实存在"
       ],
-      "evidence": [],
-      "notes": "本项从 P1 顺延到 P2：Qwen3 代码落地后再做，交叉引用才有实际目标。BPE / LoRA / DPO 三项目前没有对应学习笔记，需一并补写或在交叉引用表里标注「暂无笔记」。"
+      "evidence": [
+        "2026-10-23 **验证项 ①：每篇 Qwen3 笔记开头加「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置 / 对应可跑测试」三行** —— 共 9 篇（`Qwen3_RMSNorm` / `Qwen3_RoPE` / `Qwen3_QK-Norm` / `Qwen3_GQA与KV_Cache` / `Qwen3_SwiGLU_MLP` / `Qwen3_MoE` / `Qwen3_BPE` / `Qwen3_LoRA与DPO` / `Qwen3_训练推理完整学习笔记`）。引用块放在 H1 标题之后，**恰好三行**：「对应 GPT-2 实现位置」指向主线文件 + 具体类/函数、「对应 Qwen3 源码位置」指向本线文件 + 具体类/函数、「对应可跑测试」指向对应的 `tests/test_*.py`。**链接文字是仓库根相对路径，链接目标是相对当前文件的路径** —— 前者让人知道文件在仓库里的位置，后者让 markdown 渲染器能真的点开。",
+        "2026-10-23 **★ 诚实标注「本线没有对应实现」** —— 交叉引用不能只写「有对应物」：**GPT-2 线的代码里根本没有 BPE**（是字符级 `CharTokenizer`，vocab 45，中文全 UNK），`gpt-learning/1.bpe-tokenizer.md` 只是**原理讲解**；**GPT-2 线没有 MoE**（只有稠密 FFN）；**GPT-2 线没有 LoRA / DPO**（走全参 SFT → RM → PPO）。这三篇笔记的引用块都明确写了「主线没有对应实现」，避免学习者点过去发现对不上。",
+        "2026-10-23 **★ 补齐唯一缺过的笔记：`Qwen3_BPE_学习笔记.md`（新建）** —— BPE 代码在 feat-022 就落地了，但一直没有对应的学习笔记（本 session 前 `qwen3-learning/` 只有 8 篇）。笔记内容全部落到**本仓库代码实跑**的数字上，不抄 GPT-2 的 BPE 笔记：语料 20000 句 / 785065 字节；目标词表 1000 / 实际 **778**（合并 **521** 次后提前退出）；压缩比 **7.10 字节/token**（语料前 500 句 19641 字节 → 2767 tokens）；单句 `\"The student trained a tiny transformer.\"` 39 B → **6 tokens**；GPT-2 线 `CharTokenizer` vocab **45**，同一句 **39 token**；中文句 CharTokenizer **14 token 全部 UNK** vs BPE 42 字节 → **36 token、0 UNK**。笔记还写清了 4 个关键机制与 3 个坑：id 分配（0 特殊 / 1..256 字节 / **257+ 合并**）、**0xFF 撞车**（合并 token 若从 256 开始会静默吞掉字节 0xFF）、**byte→unicode 双射**（空格/换行本身是字节 token ⇒ merges.txt 不能直接写原始字节）、**预分词**（加速 + 无损 + 合并规则不跨块 ⇒ 压缩断言必须用语料内样本）。",
+        "2026-10-23 **★ 验证项 ②：把「链接可点开」变成一个可运行的测试** —— 新增 `qwen3-learning/qwen3-pytorch/tests/test_note_refs.py`（`tests/run_all.py` 自动发现 ⇒ `init.sh` L4 一起覆盖）。守 5 件事：① `Qwen3_BPE_学习笔记.md` 存在；② 每篇笔记开头有那两行且**在第 12 行之内**；③ 交叉引用块里**每个 markdown 链接**都能解析到真实文件（相对当前笔记目录）；④ 笔记正文里**路径型的反引号串**都能在仓库里找到（查找根依次：仓库根 → `qwen3-pytorch/` → GPT-2 线实现目录 → `qwen3-learning/`）；⑤ 根 README 的 Qwen3 索引表覆盖全部 9 篇笔记且带「Qwen3 源码」列。",
+        "2026-10-23 **★ 路径匹配的三条排除规则**（否则全是假阳性）：含空格（`python tests/test_moe.py`、`n_embd // n_head` 是命令/自然语言，不是路径）、带盘符（`E:/tmp/lora_ablation_v2.py` 在仓库外）、产物目录（`checkpoints/pretrain_dense.pt` 按 AGENTS.md 不入库，**不能拿「本地存在」当「链接有效」**）。另外 `config.json` 也不查 —— 笔记里提到的 `config.json` 指的是 **HuggingFace 模型的配置文件**（外部文件）。",
+        "2026-10-23 **验证项 ③：README.md 的笔记索引表补上 Qwen3 代码列** —— **根目录 `README.md` 的「副线：`qwen3-learning/`」索引表**新增第三列「Qwen3 源码」，覆盖全部 9 篇笔记（含新补的 BPE 与原本漏掉的 LoRA/DPO），每行的源码都是**可点开的 markdown 链接**。同时把根 README 里几处**过期描述**改成现状：目录树（`Qwen3_*.md × 7` → `× 9`、`qwen3-pytorch/ 实现（待建）` → 真实目录结构）、阶段表（P1「待 torch 环境修复后复验」→ 全链路已复验通过；P2「代码待建」→ 实现就位）、「P2 计划中的 Qwen3 代码结构」→ 实况结构（`model/common/`、`train/`、`ablations/` 等）、「核心思路」段（补上 feat-017 的实测结论 `max_abs_diff = 0.000e+00`）、torch 环境段（「已知问题 WinError 127」→ 已解除）、并新增 **「Qwen3 线完整流程」** 小节（词表 → 预训练 dense/moe → LoRA → DPO → 评估 → 退化对照）。`qwen3-learning/qwen3-pytorch/README.md` 的「概念 → 笔记 → 源码」表同步补 BPE 与 LoRA/DPO 两行。",
+        "2026-10-23 `qwen3-learning/qwen3-pytorch设计.md` §12「关联笔记」表补全（补 BPE、LoRA/DPO 两行，并把 SwiGLU 那行的 `model/qwen3_dense.py` 修正为真实位置 `model/common/mlp.py`），末尾补一句「每篇笔记开头都有三行引用块，由 `tests/test_note_refs.py` 自动校验」。",
+        "2026-10-23 验证命令与实测输出：`python tests/test_note_refs.py` → `[refs] 笔记 9 篇` / `[refs] 交叉引用链接 78 条全部可点开；正文路径 107 处全部存在` / `test_note_refs OK  笔记 9 篇 / 链接 78 条 / 路径 107 处`；`python tests/run_all.py` → **PASS=16 FAIL=0 TOTAL=16**（新增 1 个 test）；`bash init.sh` → **PASS=28 SKIP=0 FAIL=0**（L4 的「组件 smoke」跑的是 `tests/run_all.py`，新测试自动被覆盖，L4 的检查条数不变）；`python data/build_vocab.py` → 词表 778 / 合并 521 / 压缩比 7.10 字节/token，**重建后 `git status` 干净**（重建词表是幂等的）。"
+      ],
+      "notes": "**交叉引用要能点开，而且要能自动发现它坏了** —— 所以不是一个「写给人看的表格」，而是一个 `tests/test_note_refs.py`：链接指向的文件不存在、某篇笔记漏了引用块、根 README 漏了某篇笔记，**测试直接红**。本 session 实测 9 篇笔记 / 78 条链接 / 107 处正文路径全部有效。**补齐了唯一缺过的笔记 `Qwen3_BPE_学习笔记.md`**，内容全部用本仓库代码实跑的数字（词表 778 / 合并 521 / 压缩比 7.10 字节/token / 单句 39 B → 6 tokens）。**交叉引用必须诚实**：GPT-2 线的代码里**没有 BPE、没有 MoE、没有 LoRA/DPO** —— 这几篇笔记的引用块明确写出「主线没有对应实现」，不硬凑对照。受影响的文件：`qwen3-learning/Qwen3_*.md`（9 篇，各加 3 行引用块）、`qwen3-learning/Qwen3_BPE_学习笔记.md`（新建）、`qwen3-learning/qwen3-pytorch/tests/test_note_refs.py`（新建）、`qwen3-learning/qwen3-pytorch/README.md`、`qwen3-learning/qwen3-pytorch设计.md`（§12）、根 `README.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 19 就地换成真代码 + 3 个真问题记录）。**未改任何 config.py 超参** ⇒ 对既有笔记里的数字零影响（feat-009 核对时不必重算）。"
     },
     {
       "id": "feat-009",
