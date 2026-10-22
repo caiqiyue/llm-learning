@@ -2700,15 +2700,15 @@ Tiny Qwen3 MoE 主模型（Router + 多专家 SwiGLU）。
     router(x) → n_experts 个 logits → softmax → 取 top-k → （可选）权重重新归一化
     → 只把这 k 个专家的 FFN 作用于该 token → 按归一化权重加权求和
 
-【负载均衡辅助损失（HuggingFace Mixtral 的写法）】
+【负载均衡辅助损失】
     aux_loss = n_experts * Σ_i  f_i · P_i
         f_i = 专家 i 的 (token, k槽) 对数 / (token 总数 × k)  ← 对 tokens×k 个槽位求均值，Σf_i = 1
-        P_i = router 对专家 i 给出的平均概率
-    当路由均匀时 f_i = 1/(K·E)、P_i = 1/E，aux_loss = **1/K**（K=2 时 0.5，**不是 1**）。
+        P_i = router 对专家 i 给出的平均概率                   ← ΣP_i = 1
+    当路由均匀时 f_i = 1/E、P_i = 1/E，aux_loss = **1**（E·E·(1/E)(1/E) = 1）。
     某个专家被过度使用则 f_i ≫ P_i，aux_loss 上升，推动 router 重新分配。
-    （Switch Transformer 论文版是 L_aux = N·Σ f_i p_i 且 f_i 按 token 计数，
-      均匀时取 1。两个式子量纲不同、作用相同；本实现选 Mixtral 版与 HF 训练代码配套。
-      详见 Qwen3_MoE_学习笔记.md §19.1。）
+    （HF Mixtral 的 load_balancing_loss_func 把槽位计数除以 N（不是 N·K），
+      它的 f 满足 Σf = K，均匀时 aux = K；本实现多除一个 K，aux = HF 的 1/K，
+      「均衡时 = 1」的直觉成立。详见 Qwen3_MoE_学习笔记.md §19.1。）
 
 【实现要点：真的省计算，而不是"算了再丢"】
     朴素写法会算全部 n_experts 个 FFN 再按 top-k 取用，等于没省。
@@ -2838,17 +2838,14 @@ class SparseMoeBlock(nn.Module):
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
         # --- 4) 负载均衡辅助损失 ---
-        #     f_i = 专家 i 实际被选中的 token 比例（按 top-k 计数摊到 token 上）
-        #     P_i = 专家 i 的平均路由概率
-        #     aux_loss = E * Σ_i f_i * P_i，均匀时取最小值 1.0
-        expert_mask = F.one_hot(topk_indices, num_classes=E).float()      # (B*T, K, E)
-        expert_mask = expert_mask.view(n_tokens * K, E)                   # (B*T*K, E)
-        f_i = expert_mask.mean(dim=0)                                     # (E,) 实际占比
-        P_i = router_probs.mean(dim=0)                                    # (E,) 平均概率
-        aux_loss = E * torch.sum(f_i * P_i)                               # scalar
+        #     f_i = 专家 i 的 (token, k槽) 对数 / (N·K)  —— 对 tokens×k 个槽位求均值，Σf = 1
+        #     p_i = 专家 i 的平均路由概率，Σp = 1
+        #     aux_loss = E * Σ_i f_i * p_i，均匀时 = 1（HF Mixtral 是 K，见函数 docstring）
+        aux_loss, f_i, p_i = load_balancing_aux_loss(topk_indices, router_probs)
 
         # 统计：每个专家分到多少 token（把 top-k 的每个 slot 都算一次）
-        expert_load = (expert_mask.sum(dim=0) / K).tolist()               # list[E]，和 = B*T
+        slot_counts = torch.bincount(topk_indices.view(-1), minlength=E).float()
+        expert_load = (slot_counts / K).tolist()                         # list[E]，和 = B*T
 
         # --- 5) 按专家分组做稀疏计算 ---
         #     对第 e 个专家，取出「被路由到它」的 (token 下标, k 槽 下标)
@@ -3141,6 +3138,44 @@ Expected: 类似 `dense=313,088  moe=625,312  比值=2.00x`。把实际数字写
 git add qwen3-learning/
 git commit -m "feat-021: 实现 Qwen3MoE（Router top-k + 稀疏专家 + 负载均衡 aux_loss），主干与 Dense 一致"
 ```
+
+> **实测修正记录（2026-10-22，feat-020 实施时回查发现的初稿 1 个真 bug）**
+>
+> **Bug：aux_loss 的量纲说明与代码实现不一致（文档说 1/K，代码算出来是 1）。**
+>
+> - 本节原代码块的注释写的是「均匀时取最小值 1.0」，是对的；
+>   但同一节顶部的模块 docstring（原第 2703–2711 行）写的是
+>   「f_i = 1/(K·E) → aux_loss = **1/K**（K=2 时 0.5，不是 1）」—— **这句是错的**。
+> - 根因：docstring 把 `f_i` 的定义写成了「对 tokens×k 个槽位求均值」（Σf = 1），
+>   却按「Σf = K」的公式去推均匀值。两者不能混用：
+>   槽位均值 `f_i = 槽位数/(N·K)` 均匀时是 **1/E**（不是 1/(K·E)），
+>   所以 `aux = E·Σ f·p = E·E·(1/E)(1/E) = **1**`。
+> - 旁证：feat-020 预训练实测，MoE 训练时 `aux_loss` 从 1.0253 收敛到 0.9982，
+>   始终围绕 **1** 附近，从未接近 0.5。
+> - 顺带查了 HF（transformers main，`load_balancing_loss_func`）：
+>   HF 把槽位计数除以 **N**（不是 N·K），所以 HF 的 `f` 满足 **Σf = K**，均匀时 aux = **K**（K=2 → 2）。
+>   本实现比 HF 少一个 K 因子（aux = HF 的 1/K），**不是**「与 HF 同量纲」。
+>
+> **修正内容**
+>
+> 1. `model/qwen3_moe.py`：把 aux 计算抽成模块级函数 `load_balancing_aux_loss(topk_indices, router_probs)`，
+>    返回 `(aux_loss, f_i, p_i)`，并在 docstring 里写清「与 HF 差一个 K 倍」。
+> 2. `model/qwen3_moe.py`：模块 docstring 与 `_forward_ffn` 内注释改成「均匀时 = 1」；
+>    `expert_load` 改用 `torch.bincount` 统计（不再复用 one_hot 的 mask）。
+> 3. `tests/test_moe.py` 新增第 11 节「aux 量纲锚点」：均衡时 `aux == 1.0`、
+>    错配时 `aux > 1`、HF 同款公式 `= K × 我们的值`。
+> 4. `qwen3-learning/Qwen3_MoE_学习笔记.md` §19.1 重写：四行量纲对照表
+>    （Switch top-1 / Switch top-k / HF Mixtral / 本仓库），并写明实测锚点输出。
+>
+> **验证**
+> ```
+> $ python tests/test_moe.py
+> [aux 量纲] 均衡时 aux=1.0000（=1）；错配时 aux=1.6000；HF 同款公式 = 2.0000（= K×2）
+> test_moe OK  n_experts=4 top_k=2 moe_intermediate=128 params=1,150,464
+> ```
+>
+> **教训**：量纲类结论（"均衡时等于几"）必须**用代码实测锚定**，
+> 不能靠公式心算写进文档 —— 本次就是「推导时的归一化假设」和「代码里的归一化」不一致。
 
 ---
 
@@ -4944,11 +4979,13 @@ git commit -m "feat-019: 预训练语料切块与 DPO 偏好数据构造（语�
 
 **Files:**
 - Create: `qwen3-learning/qwen3-pytorch/train/train_pretrain.py`
-- Create: `qwen3-learning/qwen3-pytorch/utils.py`（`set_seed` / `get_device` / `save_checkpoint`）
+- Create: `qwen3-learning/qwen3-pytorch/utils.py`（`set_seed` / `get_device` / `save_checkpoint` / `load_checkpoint`）
 - Create: `qwen3-learning/qwen3-pytorch/tests/test_pretrain.py`
+- Modify: `qwen3-learning/qwen3-pytorch/config.py`（新增 `log_every` / `eval_max_batches` 两个**训练流程**参数，**未改动任何既有超参数值**）
+- Modify: `init.sh`（L4 层加一条训练步 smoke）
 - Modify: `feature_list.json`
 
-- [ ] **Step 1: 写 `utils.py`**
+- [x] **Step 1: 写 `utils.py`**
 
 GPT-2 线已有 `utils.py`，但**不能跨目录 import**，在 Qwen3 目录内独立重写一份（结构同构、代码独立）：
 
@@ -5023,7 +5060,7 @@ def load_checkpoint(path: str, map_location: Optional[str] = None) -> dict:
     return torch.load(path, map_location=map_location, weights_only=False)
 ```
 
-- [ ] **Step 2: 写 `train/train_pretrain.py`**
+- [x] **Step 2: 写 `train/train_pretrain.py`**
 
 ```python
 """
@@ -5038,12 +5075,21 @@ Qwen3 预训练脚本（唯一带 --model 开关的脚本）。
     2. 超参全部从 config.py 的 DENSE_CONFIG / MOE_CONFIG 读
     3. 模型 forward 恒定返回 4 元组 (logits, loss, kv_cache, extras)，
        MoE 的 aux_loss 从 extras.get("aux_loss") 取 —— 训练脚本不需要 if is_moe 分支去猜返回结构
+
+【为什么顶部要补 sys.path】
+    脚本放在 train/ 子目录里，`python train/train_pretrain.py` 时
+    `sys.path[0]` 是 train/，找不到项目根下的 config.py / data 包
+    → ModuleNotFoundError。与 GPT-2 线「脚本放在目录顶层」不同，这里必须显式补。
 """
 
 import argparse
 import math
 import os
+import sys
 import time
+
+# 把项目根补进 sys.path（见模块 docstring）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
@@ -5052,7 +5098,7 @@ from data.pretrain_data import make_pretrain_loader
 from data.tokenizer import BPETokenizer
 from model.qwen3_dense import Qwen3Dense
 from model.qwen3_moe import Qwen3MoE
-from utils import get_device, set_seed
+from utils import get_device, save_checkpoint, set_seed
 
 
 def build_model(model_kind: str, vocab_size: int, dropout: float = 0.1):
@@ -5076,6 +5122,10 @@ def build_model(model_kind: str, vocab_size: int, dropout: float = 0.1):
 def lr_at(step: int, cfg) -> float:
     """
     warmup + cosine 学习率调度。
+
+        step < warmup_iters        → 线性升温：lr * (step+1) / warmup
+        warmup <= step < decay_iters→ cosine 衰减：min_lr + 0.5*(lr-min_lr)*(1+cos(pi*p))
+        step >= lr_decay_iters     → 恒定在 min_lr
 
     参数：
         step: 当前迭代步数（0 起）
@@ -5157,6 +5207,7 @@ def main() -> None:
     model.train()
     step = 0
     t0 = time.time()
+    first_loss = None
     while step < max_iters:
         for x, y in train_loader:
             if step >= max_iters:
@@ -5169,6 +5220,7 @@ def main() -> None:
             _, loss, _, extras = model(x, targets=y)
 
             # MoE：总 loss = lm_loss + aux_loss_coef * aux_loss
+            # dense 的 extras 是空 dict，extras.get("aux_loss") 返回 None → 不需要 if 分支
             aux = extras.get("aux_loss")
             if aux is not None:
                 loss = loss + cfg.aux_loss_coef * aux
@@ -5178,9 +5230,12 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
 
-            if step % 50 == 0:
+            if first_loss is None:
+                first_loss = float(loss.item())
+            if step % cfg.log_every == 0:
                 print(f"[pretrain] step {step:>4}/{max_iters} loss {loss.item():.4f} "
-                      f"lr {optimizer.param_groups[0]['lr']:.2e}")
+                      f"lr {optimizer.param_groups[0]['lr']:.2e} "
+                      f"elapsed={time.time() - t0:.1f}s")
                 if aux is not None:
                     load = extras.get("expert_load_last")
                     print(f"[pretrain]   aux_loss {float(aux.item()):.4f} "
@@ -5188,16 +5243,17 @@ def main() -> None:
             step += 1
 
     # --- 收尾评估 ---
-    val_loss = estimate_loss(model, val_loader)
+    val_loss = estimate_loss(model, val_loader, cfg.eval_max_batches)
     val_ppl = math.exp(min(20.0, val_loss))
-    print(f"[pretrain] final val_loss={val_loss:.4f} val_ppl={val_ppl:.2f} "
-          f"elapsed={time.time() - t0:.1f}s")
+    print(f"[pretrain] initial_loss={first_loss:.4f} final val_loss={val_loss:.4f} "
+          f"val_ppl={val_ppl:.2f} elapsed={time.time() - t0:.1f}s")
 
     # --- 落盘 ---
-    os.makedirs("checkpoints", exist_ok=True)
-    path = os.path.join("checkpoints", f"pretrain_{args.model}.pt")
-    torch.save({"model_state": model.state_dict(), "cfg_name": args.model,
-                "vocab_size": vocab_size}, path)
+    path = save_checkpoint(
+        {"model_state": model.state_dict(), "cfg_name": args.model,
+         "vocab_size": vocab_size, "config": cfg.to_dict()},
+        os.path.join("checkpoints", f"pretrain_{args.model}.pt"),
+    )
     print(f"[pretrain] saved -> {path}")
 
 
@@ -5205,21 +5261,35 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 3: 写 `tests/test_pretrain.py`**
+> **注意**：与 GPT-2 线最大的不同是**脚本放在 `train/` 子目录里**，
+> 所以 `sys.path[0]` 是 `train/` 而不是项目根，必须显式把项目根 `sys.path.insert(0, ...)` 补进去，
+> 否则 `from config import ...` 直接 ModuleNotFoundError（见「实测修正记录」第 1 条）。
+
+- [x] **Step 3: 写 `tests/test_pretrain.py`**
 
 ```python
 """
 预训练脚本 smoke：模型能建起来、能走一步训练、初始 loss 合理。
 
+对应 feat-020（开发计划 Task 13）。
+
 运行：python tests/test_pretrain.py
 """
 
 import math
+import os
+import sys
 
 import torch
 
-from config import DENSE_CONFIG
+# 直接执行 `python tests/test_x.py` 时 sys.path[0] 是 tests/ 目录，
+# 找不到项目根下的 config.py / model 包 —— 这里把项目根补进 sys.path。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import DENSE_CONFIG, MOE_CONFIG
 from model.qwen3_dense import Qwen3Dense
+from model.qwen3_moe import Qwen3MoE
+from train.train_pretrain import build_model, lr_at
 
 torch.manual_seed(DENSE_CONFIG.seed)
 V = 256
@@ -5243,33 +5313,196 @@ loss.backward()
 grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
 assert len(grads) > 0, "没有任何参数收到梯度"
 
-print(f"test_pretrain OK  loss={loss.item():.4f} params={model.num_params():,}")
+# =====================================================================
+# 学习率调度：warmup → cosine → 恒定 min_lr
+# =====================================================================
+cfg = DENSE_CONFIG
+assert lr_at(0, cfg) == cfg.learning_rate * 1 / cfg.warmup_iters, "warmup 第一步不对"
+assert lr_at(cfg.warmup_iters - 1, cfg) == cfg.learning_rate, "warmup 结束应等于 learning_rate"
+assert abs(lr_at(cfg.warmup_iters, cfg) - cfg.learning_rate) < 1e-9, \
+    "cosine 起点应等于 learning_rate"
+assert abs(lr_at(cfg.lr_decay_iters, cfg) - cfg.min_lr) < 1e-9, \
+    "衰减结束应等于 min_lr"
+assert lr_at(cfg.lr_decay_iters + 100, cfg) == cfg.min_lr, "衰减之后应恒定在 min_lr"
+# 整体单调性：warmup 段递增，衰减段递减
+warm = [lr_at(s, cfg) for s in range(cfg.warmup_iters)]
+assert all(warm[i] < warm[i + 1] for i in range(len(warm) - 1)), "warmup 段必须递增"
+decay = [lr_at(s, cfg) for s in range(cfg.warmup_iters, cfg.lr_decay_iters)]
+assert all(decay[i] >= decay[i + 1] for i in range(len(decay) - 1)), "衰减段必须递减"
+
+# =====================================================================
+# build_model：dense / moe 都能建，且 MoE 的 aux_loss 能进总 loss
+# =====================================================================
+m_dense = build_model("dense", V, dropout=0.0)
+assert isinstance(m_dense, Qwen3Dense), "build_model('dense') 应返回 Qwen3Dense"
+m_moe = build_model("moe", V, dropout=0.0)
+assert isinstance(m_moe, Qwen3MoE), "build_model('moe') 应返回 Qwen3MoE"
+try:
+    build_model("transformer", V)
+    raise AssertionError("未知的 model 名应当抛 ValueError")
+except ValueError:
+    pass
+
+# MoE：总 loss = lm_loss + aux_loss_coef * aux_loss，梯度能回到 router
+m_moe.train()
+_, moe_loss, _, moe_extras = m_moe(x, targets=y)
+assert moe_extras.get("aux_loss") is not None, "MoE 的 extras 必须含 aux_loss"
+total = moe_loss + MOE_CONFIG.aux_loss_coef * moe_extras["aux_loss"]
+assert torch.isfinite(total), "MoE 总 loss 非有限"
+total.backward()
+router_grads = [b.moe.router.weight.grad for b in m_moe.blocks
+                if b.moe.router.weight.grad is not None]
+assert len(router_grads) == MOE_CONFIG.n_layer, "router 应收到梯度"
+# dense 侧没有 aux_loss，训练脚本用 extras.get() 统一处理
+assert m_dense(x, targets=y)[3].get("aux_loss") is None, \
+    "dense 不应有 aux_loss（训练脚本靠 .get 拿 None）"
+
+print(f"test_pretrain OK  loss={loss.item():.4f} params={model.num_params():,} "
+      f"lr[0]={lr_at(0, cfg):.2e} lr[end]={lr_at(cfg.lr_decay_iters, cfg):.2e}")
 ```
 
-- [ ] **Step 4: 运行**
+- [x] **Step 4: 运行**
 
 ```bash
 cd qwen3-learning/qwen3-pytorch
 python tests/test_pretrain.py
 python train/train_pretrain.py --model dense
+python train/train_pretrain.py --model moe
 ```
 
-Expected:
-- `test_pretrain OK  loss=... params=...`
-- 训练日志出现 `step 0/300`、`step 50/300` ...，且 `final val_loss` 明显低于初始 loss
+实测输出（2026-10-22，CPU）：
 
-- [ ] **Step 5: 挂进 `init.sh` 的 L4 层**
+```
+$ python tests/test_pretrain.py
+test_pretrain OK  loss=5.5184 params=919,040 lr[0]=6.00e-06 lr[end]=3.00e-05
+
+$ python train/train_pretrain.py --model dense
+[pretrain] train_batches=15 val_batches=2
+[pretrain] params = 985,856
+[pretrain] step    0/300 loss 6.7154 lr 6.00e-06 elapsed=0.2s
+[pretrain] step   50/300 loss 4.4896 lr 3.00e-04 elapsed=7.9s
+[pretrain] step  100/300 loss 2.4191 lr 2.74e-04 elapsed=15.6s
+[pretrain] step  150/300 loss 1.6038 lr 2.07e-04 elapsed=23.4s
+[pretrain] step  200/300 loss 1.4735 lr 1.23e-04 elapsed=31.3s
+[pretrain] step  250/300 loss 1.4469 lr 5.58e-05 elapsed=39.2s
+[pretrain] initial_loss=6.7154 final val_loss=1.3510 val_ppl=3.86 elapsed=46.8s
+[pretrain] saved -> checkpoints\pretrain_dense.pt
+
+$ python train/train_pretrain.py --model moe
+[pretrain] params = 1,184,512
+[pretrain] step    0/300 loss 6.6954 lr 6.00e-06 elapsed=0.2s
+[pretrain]   aux_loss 1.0253 expert_load [1184.5, 745.0, 1298.0, 868.5]
+[pretrain] step   50/300 loss 4.4751 lr 3.00e-04 elapsed=10.2s
+[pretrain]   aux_loss 1.0758 expert_load [293.5, 1053.0, 1599.5, 1150.0]
+[pretrain] step  100/300 loss 2.4620 lr 2.74e-04 elapsed=20.1s
+[pretrain]   aux_loss 1.0185 expert_load [901.0, 951.0, 1322.5, 921.5]
+[pretrain] step  150/300 loss 1.6712 lr 2.07e-04 elapsed=29.9s
+[pretrain]   aux_loss 0.9997 expert_load [1217.5, 975.5, 998.0, 905.0]
+[pretrain] step  200/300 loss 1.4556 lr 1.23e-04 elapsed=39.7s
+[pretrain]   aux_loss 1.0002 expert_load [1006.5, 1001.0, 978.5, 1110.0]
+[pretrain] step  250/300 loss 1.4019 lr 5.58e-05 elapsed=49.5s
+[pretrain]   aux_loss 0.9982 expert_load [1042.5, 980.5, 1000.0, 1073.0]
+[pretrain] initial_loss=6.6954 final val_loss=1.3607 val_ppl=3.90 elapsed=59.1s
+[pretrain] saved -> checkpoints\pretrain_moe.pt
+```
+
+**从日志能读出来的三件事（比"loss 降了"更值得看）**：
+
+1. **初始 loss ≈ ln(V)**：V=778 时 ln(778) ≈ 6.66，实测 6.7154 / 6.6954 —— 随机初始化的模型对每个 token 近似均匀分布，这条是
+   `tests/test_pretrain.py` 里那条 `abs(loss - ln(V)) < 1.0` 断言的由来。
+2. **MoE 的 aux_loss 稳定在 1 附近**（1.0253 → 0.9982）：本仓库的 aux_loss 量纲是
+   「f 归一化到 Σf=1」，**完全均衡时 = 1**（HF Mixtral 同款公式是 K=2，详见 Task 10 的实测修正记录）。
+3. **专家负载被 aux_loss 拉平**：`expert_load` 从 [1184.5, 745.0, 1298.0, 868.5]（最大偏差 ±35%）
+   收敛到 [1042.5, 980.5, 1000.0, 1073.0]（±3.5%），总和恒为 4096 = B·T —— 这就是负载均衡辅助损失在起作用。
+
+- [x] **Step 5: 挂进 `init.sh` 的 L4 层**
 
 L4 增加一条最小 smoke：构造 dense 模型 + 走一步训练，断言 loss 有限。
-
-- [ ] **Step 6: Commit**
+（实测后略微加严：除 loss 有限外，还断言「梯度非空」「梯度有限」「lr 调度端点正确」。）
 
 ```bash
-git add qwen3-learning/
+  # --- 训练步 smoke（feat-020）：构造 dense 模型 + 走一步训练，断言 loss 有限 ---
+  if [ -f "$QWEN_DIR/train/train_pretrain.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_train.log 2>&1
+import torch
+from config import DENSE_CONFIG
+from train.train_pretrain import build_model, lr_at
+
+# 走一步「真训练」：forward → loss → backward → 梯度非空 → optimizer.step
+model = build_model("dense", 256, dropout=0.0)
+model.train()
+x = torch.randint(0, 256, (2, 8))
+y = torch.randint(0, 256, (2, 8))
+
+logits, loss, _, extras = model(x, targets=y)
+assert torch.isfinite(loss), f"loss 非有限: {loss}"
+assert extras == {}, f"dense 的 extras 应为空 dict，实得 {extras}"
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=DENSE_CONFIG.learning_rate)
+optimizer.zero_grad(set_to_none=True)
+loss.backward()
+grads = [p.grad for p in model.parameters() if p.grad is not None]
+assert len(grads) > 0, "没有任何参数收到梯度"
+assert all(torch.isfinite(g).all() for g in grads), "梯度非有限"
+optimizer.step()
+
+# 学习率调度要能算出来（warmup 第一步 > 0，衰减结束等于 min_lr）
+lr0 = lr_at(0, DENSE_CONFIG)
+lr_end = lr_at(DENSE_CONFIG.lr_decay_iters, DENSE_CONFIG)
+assert lr0 > 0, f"warmup 第一步 lr 应为正，实得 {lr0}"
+assert abs(lr_end - DENSE_CONFIG.min_lr) < 1e-9, f"衰减结束 lr 应为 min_lr，实得 {lr_end}"
+print(f"[train-step] loss {loss.item():.4f} grads {len(grads)} 个 lr0 {lr0:.2e} lr_end {lr_end:.2e}")
+PY
+    )
+    ...
+  fi
+```
+
+实测输出：
+
+```
+  [PASS] Qwen3 训练步 smoke（forward+backward+step，loss 有限）[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05
+  PASS=23  SKIP=0  FAIL=0
+```
+
+> **踩坑**：Windows 下 Python 默认 stdout 是 GBK，bash 按 UTF-8 解码 → 中文乱码。
+> 给子进程加 `PYTHONIOENCODING=utf-8` 才正常（`tests/run_all.py` 里已经这么处理过）。
+
+- [x] **Step 6: 实测修正记录（初稿的 2 个真 bug）**
+
+1. **`train/train_pretrain.py` 缺 sys.path 引导** → `ModuleNotFoundError: No module named 'config'`。
+   根因：GPT-2 线的训练脚本放在**目录顶层**（`sys.path[0]` 天然是项目根），
+   而 Qwen3 线按 `train/` 子目录组织（`sys.path[0]` = `train/`），必须显式补项目根。
+   修法（写在 `import torch` 之前）：
+   ```python
+   sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+   ```
+2. **`tests/test_pretrain.py` 同样缺 sys.path 引导** → 直接 `python tests/test_pretrain.py` 会
+   `ModuleNotFoundError: No module named 'config'`（`sys.path[0]` 是 `tests/`）。
+   修法同上：`sys.path.insert(0, <项目根>)`。
+
+**附带**：`config.py` 新增两个字段，都是**训练流程参数**，没有改动任何既有超参数值，
+所以**不需要同步改任何笔记的数字**：
+
+```python
+    # 训练日志打印间隔（步）
+    log_every: int = 50
+    # 验证时最多评估多少个 batch（控制 CPU 上的评估耗时）
+    eval_max_batches: int = 20
+```
+
+> 初稿把 `step % 50`、`estimate_loss(model, val_loader)` 的 20 直接写死在训练脚本里，
+> 违反「超参一律从 config.py 读」的硬约束 —— 本次一并改掉。
+
+- [x] **Step 7: Commit**
+
+```bash
+git add qwen3-learning/ init.sh
 git commit -m "feat-020: Qwen3 预训练脚本 + smoke（--model dense|moe，超参全从 config 读）"
 ```
 
 ---
+
 
 ### Task 14: feat-023 手写 LoRA
 

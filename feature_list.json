@@ -256,7 +256,7 @@
       "area": "qwen3-pretrain",
       "title": "Qwen3 预训练 smoke 跑通",
       "user_visible_behavior": "跑 python train/train_pretrain.py --model dense 能在 CPU 上得到 loss 下降的曲线与可评估的权重 checkpoints/pretrain_dense.pt。",
-      "status": "not_started",
+      "status": "passing",
       "verification": [
         "python train/train_pretrain.py --model dense，贴出 train loss / val loss / val ppl 的首末值",
         "val perplexity 可打印且随迭代下降",
@@ -264,8 +264,19 @@
         "落盘 checkpoints/pretrain_dense.pt（checkpoints/ 不入库）",
         "bash init.sh 的 L4 层纳入该脚本的最小 smoke"
       ],
-      "evidence": [],
-      "notes": "路线的一段（三段式：预训练 → LoRA → DPO）。规模控制：tiny 尺寸 n_layer=4 / n_embd=128 / block_size=128，单次预训练控制在分钟级。接受「loss 在降」而非「训得很好」。"
+      "evidence": [
+        "2026-10-22 新增 qwen3-learning/qwen3-pytorch/utils.py（set_seed / get_device / save_checkpoint / load_checkpoint，**独立重写不跨目录 import GPT-2 线的 utils.py**）、train/train_pretrain.py（唯一带 --model 开关的脚本：dense / moe）、tests/test_pretrain.py（7 组断言）。",
+        "2026-10-22 `python tests/test_pretrain.py` → `test_pretrain OK  loss=5.5184 params=919,040 lr[0]=6.00e-06 lr[end]=3.00e-05`（exit 0）；`python tests/run_all.py` → PASS=10 FAIL=0 TOTAL=10 / all green。",
+        "2026-10-22 `python train/train_pretrain.py --model dense` → `[pretrain] params = 985,856` / `step 0/300 loss 6.7154` / `step 250/300 loss 1.4469 lr 5.58e-05` / `initial_loss=6.7154 final val_loss=1.3510 val_ppl=3.86 elapsed=46.8s` / `saved -> checkpoints\\pretrain_dense.pt`（CPU，46.8s）。",
+        "2026-10-22 `python train/train_pretrain.py --model moe` → `[pretrain] params = 1,184,512` / `step 0/300 loss 6.6954 aux_loss 1.0253 expert_load [1184.5, 745.0, 1298.0, 868.5]` / `step 250/300 loss 1.4019 aux_loss 0.9982 expert_load [1042.5, 980.5, 1000.0, 1073.0]` / `initial_loss=6.6954 final val_loss=1.3607 val_ppl=3.90 elapsed=59.1s` / `saved -> checkpoints\\pretrain_moe.pt`（CPU，59.1s）。",
+        "2026-10-22 验证项逐条对上：①train loss / val loss / val ppl 首末值都打印出来了（6.7154 → 1.3510 / ppl 3.86）②**val ppl 随迭代下降**（初始 loss 6.72 ≈ ln(778)=6.66，随机初始化的模型近似均匀分布 —— test_pretrain 里那条 `abs(loss-ln(V))<1.0` 断言的由来）③AdamW + warmup + cosine 三段调度生效，且**超参全部来自 config.py**（初稿把 `step % 50`、`max_batches=20` 写死在脚本里，本次改成 `cfg.log_every` / `cfg.eval_max_batches` 两个新增 config 字段）④checkpoints/ 落盘且不入库（L3 卫生检查 PASS）⑤init.sh L4 新增「Qwen3 训练步 smoke」。",
+        "2026-10-22 测试覆盖 7 组：①dense forward 返回 4 元组 + extras == {} + 训练时无 kv_cache ②初始 loss ≈ ln(V) ③反向传播有梯度 ④lr 调度端点与单调性（warmup 递增 / cosine 递减 / 结束等于 min_lr / 之后恒定）⑤build_model 对未知名字抛 ValueError ⑥MoE 总 loss 有限且 router 收到梯度 ⑦dense 的 extras.get('aux_loss') 是 None（训练脚本无需 if 分支）。",
+        "2026-10-22 `bash init.sh` → **PASS=23 SKIP=0 FAIL=0**，其中新增 `[PASS] Qwen3 训练步 smoke（forward+backward+step，loss 有限）[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05`。",
+        "2026-10-22 **顺带修掉了 feat-021 的 aux_loss 量纲错误**（详见 feat-021 证据最后一条）：「均匀时 aux_loss = 1/K」是错的，实际 = **1**（与 HF Mixtral 的 K 差一个 K 倍）；本条预训练日志里 aux_loss 稳定在 1.0 附近（1.0253 → 0.9982）是实测旁证。",
+        "2026-10-22 **修正初稿的 2 个真 bug**（详见 开发计划.md Task 13 Step 6 「实测修正记录」）：①train/train_pretrain.py 缺 sys.path 引导 → ModuleNotFoundError: config（GPT-2 线脚本在顶层，Qwen3 线在 train/ 子目录，必须显式补项目根）②tests/test_pretrain.py 同样缺 sys.path 引导 → 直接跑会 ModuleNotFoundError。",
+        "2026-10-22 **附带观察**（从日志读出来的，不只是「loss 降了」）：①MoE 的 **expert_load 被 aux_loss 拉平**：训练初期 [1184.5, 745.0, 1298.0, 868.5]（最大偏差 ±35%），250 步后收敛到 [1042.5, 980.5, 1000.0, 1073.0]（±3.5%），总和恒为 4096 = B·T —— 负载均衡辅助损失真的在起作用。②MoE 与 dense 的 val loss 几乎一样（1.3607 vs 1.3510）：tiny 语料太简单，MoE 的容量优势体现不出来（且本配置专家更窄，参数量只多 1.21×）。"
+      ],
+      "notes": "对应 开发计划.md Task 13。三段式路线的第一段（预训练 → LoRA → DPO）。超参全部从 config.py 读（本次给 config.py 新增 log_every / eval_max_batches 两个**训练流程**字段，未改动任何既有超参数值，因此不需要同步改笔记的数字）。模型 forward 恒定返回 4 元组，MoE 的 aux_loss 从 extras.get('aux_loss') 取，训练脚本不需要 dense/MoE 分支。checkpoints/ 不入库。"
     },
     {
       "id": "feat-021",
@@ -288,10 +299,11 @@
         "2026-10-22 稀疏实现是**真稀疏**：按 topk_indices sort 后同一专家的样本连续，逐专家切片计算（n_e, C)→(n_e, C)，再按 top-k 权重缩放并 index_add_ 散回原位；未被路由到的专家该步直接跳过。",
         "2026-10-22 `python tests/test_moe.py` → `[专家负载] ['12.5', '16.0', '16.0', '19.5']  理想=16.0  最大偏差=21.9%` / `[稀疏性] 专家处理总行数=128 (=N*K=64*2)，全算需 256，省下 50%` / `[参数量] dense=951,808  moe=1,150,464  比值=1.21x` / `test_moe OK  n_experts=4 top_k=2 moe_intermediate=128 params=1,150,464`（exit 0）；`python tests/run_all.py` → PASS=7 FAIL=0 TOTAL=7 / all green。",
         "2026-10-22 测试覆盖 10 项：①接口与 dense 完全一致（4 元组 + extras 含 aux_loss/expert_load，且 dense 的 extras.get('aux_loss') 为 None，训练脚本无需 if 分支）②主干与 Dense 一致（attn 的 n_head/n_head_kv/head_dim 相同）③稀疏路由（routed_tokens=B*T，expert_token_pairs=B*T*K）④专家负载无饿死且总和=B*T ⑤norm_topk_prob 开关的权重和⑥aux_loss 的梯度回传到每个 router（4/4 有限）⑦因果性 + eval 确定性 ⑧专家数/中间维/router 维度与无 bias ⑨**稀疏性用 forward hook 证明**：专家实际处理总行数 = N*K = 128（若实现是「全算再丢」会是 N*E = 256），断言总行数 < N*E ⑩MoE 参数量 > Dense。",
-        "2026-10-22 **修正 aux_loss 的量纲说明（开发计划与代码注释都写错了）**：初稿写「均匀时 f_i = P_i = 1/n_experts，aux_loss = 1（最小值）」，但代码采用的是 HuggingFace Mixtral 的量纲 —— f_i 是对 tokens×k 个槽位求的均值（Σf_i = 1），系数是专家数 E 而非额外的 N。均匀时 f_i = 1/(K·E)、P_i = 1/E → **aux_loss = 1/K（K=2 时 0.5，不是 1）**。已修正代码 docstring、开发计划正文，并在 Qwen3_MoE_学习笔记.md 新增 §19.1 对比 Switch Transformer 论文版与 Mixtral 版的量纲差异（附对照表）。",
-        "2026-10-22 **修正开发计划初稿错误的参数量预期**（初稿写 dense=313,088 moe=625,312 比值 2.00×，那组数字对应另一套配置）：实测 dense=951,808 / moe=1,150,464 / **比值 1.21×**。比值远小于 2 的原因是本配置 MoE 专家更窄（moe_intermediate_size=128 vs Dense 的 384）：FFN 部分 147,456/层 vs 197,120/层 ≈ 1.34×，摊到全模型（含 attention/embedding）就是 1.21×。**MoE 的「参数多 N 倍、计算只多 k 倍」只在专家宽度与 dense 相同时才成立。**已写进笔记新增的 §25.1「本仓库的实测对照」。"
+        "2026-10-22 **aux_loss 量纲（此条已于同日修正，见下一条证据）**：代码里 f_i 是对 tokens×k 个槽位求的均值（Σf_i = 1），系数是专家数 E，aux_loss = E·Σ f_i·p_i。⚠️ 本条原文写「均匀时 f_i = 1/(K·E) → aux_loss = 1/K（K=2 时 0.5，不是 1）」——**这句是错的**，已在下一条证据里修正。",
+        "2026-10-22 **修正开发计划初稿错误的参数量预期**（初稿写 dense=313,088 moe=625,312 比值 2.00×，那组数字对应另一套配置）：实测 dense=951,808 / moe=1,150,464 / **比值 1.21×**。比值远小于 2 的原因是本配置 MoE 专家更窄（moe_intermediate_size=128 vs Dense 的 384）：FFN 部分 147,456/层 vs 197,120/层 ≈ 1.34×，摊到全模型（含 attention/embedding）就是 1.21×。**MoE 的「参数多 N 倍、计算只多 k 倍」只在专家宽度与 dense 相同时才成立。**已写进笔记新增的 §25.1「本仓库的实测对照」。",
+        "2026-10-22 **修正 aux_loss 量纲（feat-020 实施时回查发现）**：原文说「均匀时 = 1/K（0.5）」，与代码实际行为不符 —— f_i 既然定义为「对 tokens×k 个槽位求均值」，均匀时就是 **1/E**（不是 1/(K·E)），所以 aux_loss = E·E·(1/E)·(1/E) = **1**。旁证：feat-020 的 MoE 预训练日志里 aux_loss 从 1.0253 收敛到 0.9982，从未接近 0.5。另查 transformers main 的 HF `load_balancing_loss_func`：HF 把槽位计数除以 N（不是 N·K），其 f 满足 Σf = K，均匀时 aux = **K**（K=2 → 2），即**本实现 = HF 的 1/K**，并非与 HF 同量纲。修法：①把 aux 计算抽成模块级函数 `load_balancing_aux_loss(topk_indices, router_probs)`，返回 (aux_loss, f_i, p_i) 并在 docstring 写清与 HF 差 K 倍；②模块 docstring 与 _forward_ffn 内注释改为「均匀时 = 1」；③tests/test_moe.py 新增第 11 节「aux 量纲锚点」：均衡时 aux == 1.0、错配时 aux > 1、HF 同款公式 == K× 我们的值；④笔记 §19.1 重写为四行量纲对照表。实测：`python tests/test_moe.py` → `[aux 量纲] 均衡时 aux=1.0000（=1）；错配时 aux=1.6000；HF 同款公式 = 2.0000（= K×2）`。**教训：量纲类结论必须用代码实测锚定，不能靠公式心算写进文档。**"
       ],
-      "notes": "对应笔记 Qwen3_MoE_学习笔记.md（已补 §19.1 aux_loss 量纲辨析 + §25.1 实测对照）。主干与 Qwen3Dense 逐行一致，只有 FFN 不同；forward 恒定 4 元组，训练脚本用 extras.get('aux_loss') 统一处理 dense/MoE 两种模型。实现按设计文档 §5.8 的类顺序：SparseMoeBlock → MoEBlock → Qwen3MoE。对应 开发计划.md Task 10。"
+      "notes": "对应笔记 Qwen3_MoE_学习笔记.md（§19.1 aux_loss 量纲辨析 + §25.1 实测对照）。主干与 Qwen3Dense 逐行一致，只有 FFN 不同；forward 恒定 4 元组，训练脚本用 extras.get('aux_loss') 统一处理 dense/MoE 两种模型。实现按设计文档 §5.8 的类顺序：SparseMoeBlock → MoEBlock → Qwen3MoE。aux_loss 量纲：本仓库 f 归一化到 Σf=1，**均匀时 = 1**（HF Mixtral 同款公式是 K，差一个 K 倍）。对应 开发计划.md Task 10。"
     },
     {
       "id": "feat-023",

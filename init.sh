@@ -284,6 +284,48 @@ PY
   else
     skip "Qwen3 前向 smoke" "model/qwen3_dense.py 尚未就绪（feat-016），或 torch 不可用"
   fi
+
+  # --- 训练步 smoke（feat-020）：构造 dense 模型 + 走一步训练，断言 loss 有限 ---
+  if [ -f "$QWEN_DIR/train/train_pretrain.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_train.log 2>&1
+import torch
+from config import DENSE_CONFIG
+from train.train_pretrain import build_model, lr_at
+
+# 走一步「真训练」：forward → loss → backward → 梯度非空 → optimizer.step
+model = build_model("dense", 256, dropout=0.0)
+model.train()
+x = torch.randint(0, 256, (2, 8))
+y = torch.randint(0, 256, (2, 8))
+
+logits, loss, _, extras = model(x, targets=y)
+assert torch.isfinite(loss), f"loss 非有限: {loss}"
+assert extras == {}, f"dense 的 extras 应为空 dict，实得 {extras}"
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=DENSE_CONFIG.learning_rate)
+optimizer.zero_grad(set_to_none=True)
+loss.backward()
+grads = [p.grad for p in model.parameters() if p.grad is not None]
+assert len(grads) > 0, "没有任何参数收到梯度"
+assert all(torch.isfinite(g).all() for g in grads), "梯度非有限"
+optimizer.step()
+
+# 学习率调度要能算出来（warmup 第一步 > 0，衰减结束等于 min_lr）
+lr0 = lr_at(0, DENSE_CONFIG)
+lr_end = lr_at(DENSE_CONFIG.lr_decay_iters, DENSE_CONFIG)
+assert lr0 > 0, f"warmup 第一步 lr 应为正，实得 {lr0}"
+assert abs(lr_end - DENSE_CONFIG.min_lr) < 1e-9, f"衰减结束 lr 应为 min_lr，实得 {lr_end}"
+print(f"[train-step] loss {loss.item():.4f} grads {len(grads)} 个 lr0 {lr0:.2e} lr_end {lr_end:.2e}")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 训练步 smoke（forward+backward+step，loss 有限）$(tail -1 /tmp/llm_init_l4_train.log)"
+    else
+      fail "Qwen3 训练步 smoke" "$(tail -3 /tmp/llm_init_l4_train.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 训练步 smoke" "train/train_pretrain.py 尚未就绪（feat-020），或 torch 不可用"
+  fi
 fi
 
 # -----------------------------------------------------------------------------

@@ -11,12 +11,12 @@
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（WIP=0；下一条是 `feat-019` 预训练语料与偏好数据构造）
-- 当前最高优先级未完成 feature：`feat-019` Qwen3 预训练语料与 DPO 偏好数据构造
+- 当前活跃 feature：**无**（WIP=0；下一条是 `feat-023` 手写 LoRA）
+- 当前最高优先级未完成 feature：`feat-023` Qwen3 手写 LoRA（→ feat-024 手写 DPO → feat-025 评估）
 - ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
 - 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-22 在修复后的环境里重跑产出**，指标可信（见 `feature_list.json` feat-002~007 的 evidence）
 - 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` 7 篇（缺 BPE / LoRA / DPO 三篇，见 feat-008）
-- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层已全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE），`bash init.sh` L4 前向 smoke 已用真实词表（778）跑通；**训练侧（预训练 / LoRA / DPO）与评估侧尚未开工**
+- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 预训练已就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 语料与偏好数据 / `--model dense|moe` 预训练脚本），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke」三条；**LoRA / DPO / 评估侧尚未开工**
 
 ---
 
@@ -212,7 +212,8 @@ $ bash E:/tmp/run_l3.sh        # P1 全量
 
 - **QK-Norm 在 RoPE 前 vs 后，用均匀 gain 测不出来**：两者数值几乎相同（max|diff| ≈ 3.6e-07），因为 `rotate_half` 把第 i 维和第 i+half 维配对，逐维 gain 与旋转不对易。**只有非均匀 gain 才暴露差异（7.38 ~ 14.9）**。⇒ 任何用 `gain.mul_(3.0)` 这类均匀增益的测试都**证明不了顺序**。
 - **SwiGLU 与 GPT-2 4×-GELU 的参数量差 = `矩阵数 × H × I`**。I 严格取 8/3·H 时两者**完全相等**（都是 8H²，这正是 8/3 规则的目的）；本仓库把 341.33 向上取整到 384（=3×128），比值 = 9/8 = **1.125×**，超出部分全部来自取整。另注：Qwen3-0.6B 实际用的是 **3×hidden**，8/3 是 LLaMA 的规则。
-- **aux_loss 的量纲有 Switch 版和 Mixtral 版两套**：Switch 论文版 `L=N·Σf_i p_i` 均匀时 = 1；HF Mixtral 版对 tokens×k 槽位求均值、系数是专家数 E，均匀时 = **1/K**（本仓库 K=2 → 0.5）。混用会得出「均匀时 aux_loss=1」的错误结论。已写进 `Qwen3_MoE_学习笔记.md` §19.1。
+- **aux_loss 的量纲有 Switch 版和 Mixtral 版两套**：Switch 论文版 `L=N·Σf_i p_i` 均匀时 = 1；本仓库实现对 tokens×k 槽位求均值（Σf=1）、系数是专家数 E，均匀时同样 = **1**；HF Mixtral 版把槽位计数除以 N（Σf=K），均匀时 = **K**（本仓库 K=2 → 2）。三者只差归一化，**与 HF 的数值不能直接比大小（要乘 K）**。已写进 `Qwen3_MoE_学习笔记.md` §19.1。
+  > ⚠️ 这条结论在 Session 004 写成「均匀时 = 1/K（0.5）」，**是错的**，已在 Session 005 用预训练日志（aux_loss 稳定在 1.0 附近）实测纠正。
 - **RoPE 是相对位置编码**：把所有绝对位置整体平移，注意力输出**不变**（max|diff| < 1e-5）；只有改变**相对距离**才会改变输出。初稿测试「不同绝对位置应产生不同输出」本身是错的，已改成「整体平移不变 + 插入 token 改变相对距离则输出改变」两条。
 
 **feat-022 修正的 5 个真 bug**（开发计划 Task 11 的初稿设计里全都有）
@@ -270,3 +271,96 @@ L4 [PASS] Qwen3 前向 smoke（logits 形状 + loss 有限 + 参数量）[vocab.
 `qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–11 就地纠错）、`qwen3-learning/qwen3-pytorch设计.md`（§4 中间维说明）、
 `qwen3-learning/Qwen3_{SwiGLU_MLP,MoE}_学习笔记.md`（新增 §2.1 / §19.1 / §25.1）、
 `feature_list.json`、`claude-progress.md`
+
+### Session 005 — Qwen3 数据层 + 预训练（feat-019 → feat-020）+ aux_loss 量纲纠错
+
+- **日期**：2026-10-22
+- **目标**：把 Qwen3 线从「组件层」推到「能真训练」：补齐语料/偏好数据层（feat-019），
+  再写预训练脚本（feat-020），最后按三段式路线进入 LoRA / DPO。
+
+**做了什么**
+
+1. **feat-019 数据层**（commit `b60006c`）
+   - `data/corpus.py` —— 合成语料的**唯一真源**（纯 Python，不依赖 torch）。
+     BPE 训练语料与预训练语料从此同源，重建词表后 `vocab.json` / `merges.txt` **逐字节一致**。
+   - `data/pretrain_data.py` —— `build_token_stream` / `build_blocks` / `PretrainDataset` / `make_pretrain_loader`；
+     **文档分隔符用特殊 token id 0**，不用它的字面文本。
+   - `data/preference_data.py` —— 5 组 prompt × 5 组 chosen × 4 种「变差」策略（wrong_entity / unrelated / too_short / noisy）。
+   - `tests/test_data.py` —— 5 组断言（切块错位、语料可复现、分隔符、偏好数据不变量、DataLoader 形状与 train/val 划分）。
+2. **feat-020 预训练**（本次）
+   - `utils.py`（set_seed / get_device / save_checkpoint / load_checkpoint，独立重写不跨目录 import）
+   - `train/train_pretrain.py` —— 唯一带 `--model dense|moe` 的脚本，**超参全部来自 config.py**，
+     模型恒定返回 4 元组，MoE 的 aux_loss 从 `extras.get("aux_loss")` 取（训练脚本无 dense/MoE 分支）。
+   - `tests/test_pretrain.py` —— 7 组断言（4 元组契约 / 初始 loss ≈ ln(V) / 梯度 / lr 调度端点与单调性 /
+     build_model 报错 / MoE 总 loss 与 router 梯度 / dense 无 aux_loss）。
+   - `init.sh` L4 新增第三条 smoke：「Qwen3 训练步 smoke」（forward → backward → step，断言 loss 有限 + 梯度非空 + lr 端点正确）。
+   - `config.py` 只**新增**两个训练流程字段 `log_every` / `eval_max_batches`，**未改动任何既有超参数值** ⇒ 不需要同步改笔记数字。
+3. **aux_loss 量纲纠错**（feat-021 的回查修正）
+   - 原文档说「均匀时 aux_loss = 1/K（K=2 → 0.5）」，**与代码行为不符**：f_i 定义为「对 tokens×k 槽位求均值」时，
+     均匀值是 1/E，aux = E·E·(1/E)(1/E) = **1**。
+   - 查 transformers main 的 HF `load_balancing_loss_func`：HF 把槽位计数除以 N（Σf=K），均匀时 = **K**（=2），
+     所以**本实现 = HF 的 1/K**，并非同量纲。
+   - 修法：抽出模块级 `load_balancing_aux_loss(topk_indices, router_probs)`；代码 docstring / 注释 / 笔记 §19.1 / 开发计划 Task 10 全部改对；
+     `tests/test_moe.py` 新增第 11 节「aux 量纲锚点」把数值钉死。
+
+**三条可迁移的实测结论**
+
+- **量纲类结论必须用代码实测锚定**：本次 aux_loss 的教训 —— 推导时的归一化假设（Σf=K）和代码里的归一化（Σf=1）不一致，
+  公式心算出来的「0.5」和代码实际输出的「1.0」差一倍。写进文档前必须有一条能红的断言兜底。
+- **Windows 下子进程输出编码**：`bash` 按 UTF-8 解码，Windows Python 默认 stdout 是 GBK → 中文乱码。
+  证据命令一律加 `PYTHONIOENCODING=utf-8`（`tests/run_all.py` 里对子进程也这么做了）。
+- **脚本放在子目录 = 必须补 sys.path**：GPT-2 线的脚本在目录顶层（`sys.path[0]` 天然是项目根），
+  Qwen3 线按 `train/`、`tests/` 子目录组织，不显式补项目根就是 ModuleNotFoundError。
+
+**验证**
+
+```
+$ python tests/test_pretrain.py
+test_pretrain OK  loss=5.5184 params=919,040 lr[0]=6.00e-06 lr[end]=3.00e-05
+
+$ python train/train_pretrain.py --model dense
+[pretrain] params = 985,856
+[pretrain] step    0/300 loss 6.7154 ... step 250/300 loss 1.4469 lr 5.58e-05
+[pretrain] initial_loss=6.7154 final val_loss=1.3510 val_ppl=3.86 elapsed=46.8s
+[pretrain] saved -> checkpoints\pretrain_dense.pt
+
+$ python train/train_pretrain.py --model moe
+[pretrain] params = 1,184,512
+[pretrain]   aux_loss 1.0253 expert_load [1184.5, 745.0, 1298.0, 868.5]
+[pretrain]   aux_loss 0.9982 expert_load [1042.5, 980.5, 1000.0, 1073.0]
+[pretrain] initial_loss=6.6954 final val_loss=1.3607 val_ppl=3.90 elapsed=59.1s
+
+$ python tests/test_moe.py
+[aux 量纲] 均衡时 aux=1.0000（=1）；错配时 aux=1.6000；HF 同款公式 = 2.0000（= K×2）
+
+$ python tests/run_all.py
+[run_all] PASS=10  FAIL=0  TOTAL=10
+
+$ bash init.sh
+  [PASS] Qwen3 训练步 smoke（forward+backward+step，loss 有限）[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05
+  PASS=23  SKIP=0  FAIL=0
+```
+
+**未解决 / 风险**
+
+- **MoE 在本仓库体现不出容量优势**：val_loss 1.3607 vs dense 1.3510，MoE 反而略差 ——
+  语料太简单（合成句式）+ 专家更窄（128 vs 384，参数量只多 1.21×）+ 只训 300 步。
+  结论要写进笔记，别让读者误以为「MoE 一定更好」。
+- **专家负载是被 aux_loss 拉平的，但只在末段可见**：初期最大偏差 ±35%，250 步后 ±3.5%（总和恒为 B·T）。
+- 笔记缺口仍在：`Qwen3_BPE_学习笔记.md` / `Qwen3_LoRA与DPO_学习笔记.md`（feat-008 / Task 19 补）。
+
+**下一步**
+
+1. `feat-023` 手写 LoRA（`model/common/lora.py` + `train/train_lora.py` + `tests/test_lora.py`）
+2. `feat-024` 手写 DPO（π_θ = LoRA 开着 / π_ref = LoRA 关着，无 Reward Model 无 PPO）
+3. `feat-025` 精简评估脚本 → `feat-018` KV Cache 推理与采样 → `feat-017` 与 GPT-2 的退化对照
+4. `feat-008` 笔记↔源码交叉引用（含补 BPE / LoRA-DPO 两篇笔记）→ `feat-009` 数字全量核对 → 收班
+
+**本次改动涉及的文件**
+
+`qwen3-learning/qwen3-pytorch/`：`utils.py`、`train/train_pretrain.py`、`tests/test_pretrain.py`、
+`config.py`（+log_every/eval_max_batches）、`model/qwen3_moe.py`（aux 抽函数 + docstring 纠错）、
+`tests/test_moe.py`（+第 11 节量纲锚点）、`tests/run_all.py`（UTF-8 子进程解码）、
+`qwen3-learning/qwen3-pytorch开发计划.md`（Task 10 纠错 + Task 13 就地换成真代码）、
+`qwen3-learning/Qwen3_MoE_学习笔记.md`（§19.1 重写）、
+仓库根 `init.sh`（L4 +训练步 smoke）、`feature_list.json`、`claude-progress.md`、`session-handoff.md`

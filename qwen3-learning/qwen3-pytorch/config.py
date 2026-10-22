@@ -68,6 +68,10 @@ class Qwen3Config:
     warmup_iters: int = 50
     lr_decay_iters: int = 300
     min_lr: float = 3e-5
+    # 训练日志打印间隔（步）
+    log_every: int = 50
+    # 验证时最多评估多少个 batch（控制 CPU 上的评估耗时）
+    eval_max_batches: int = 20
 
     # ---------------- tokenizer / 数据 ----------------
     # byte-level BPE 目标词表大小。实际大小由训练语料决定，可能略小于该值
