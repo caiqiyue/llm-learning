@@ -106,7 +106,7 @@
       "area": "qwen3-rope",
       "title": "实现 RoPE 位置编码",
       "user_visible_behavior": "model/common/rope.py 能生成 (max_seq_len, head_dim) 的旋转位置编码表，支持外推长度参数，且能演示相同相对距离的两对位置旋转后内积相等。",
-      "status": "in_progress",
+      "status": "passing",
       "verification": [
         "实现 inv_freq / cos / sin 缓存，theta 可配（Qwen3 默认 1e6）",
         "smoke：head_dim=8 时验证内积只依赖相对位置（旋转等变性），误差 < 1e-5",
@@ -114,8 +114,15 @@
         "支持 position_ids 参数，为 KV Cache 的增量位置预留接口；None 时默认 0..T-1；越界抛 IndexError",
         "笔记 Qwen3_RoPE_学习笔记.md ↔ 源码位置互相标注"
       ],
-      "evidence": [],
-      "notes": "对照笔记 2.位置编码.md 的 Sinusoidal：说明「加到 embedding」vs「旋转 QK」的机制差异，以及 theta 对长上下文的影响。实现细节用 HF 风格 _rotate_half（[-x2, x1]），cos/sin 以 persistent=False buffer 注册。对应 开发计划.md Task 5。"
+      "evidence": [
+        "2026-10-22 实现 model/common/rope.py::RoPE：预计算 (max_seq_len, head_dim) 的 cos / sin 表（persistent=False buffer，不训练、不入 checkpoint），频率 inv_freq[i] = 1 / theta^(2i/head_dim)，theta=1e6（Qwen3 默认，GPT-2 是 1e4）。",
+        "2026-10-22 `python tests/test_rope.py` → `test_rope OK  head_dim=8 theta=1000000.0`（exit 0）；`python tests/run_all.py` → PASS=2 FAIL=0 TOTAL=2 / all green。",
+        "2026-10-22 测试覆盖 9 项：①cos/sin 表形状 ②cos²+sin²==1 ③位置 0 处 cos=1 sin=0 ④前向不改变形状 ⑤【核心】旋转等变性：同一 q/k 向量、相对距离相同 → 内积相等（atol 1e-4），相对距离不同 → 内积不同 ⑥不同 position_ids 产生不同旋转 ⑦position_ids=None 等价于 0..T-1 ⑧theta 影响低频维度（最高频维度与 theta 无关，最低频维度差异明显）⑨越界位置抛 IndexError。",
+        "2026-10-22 **修正开发计划初稿里的两处测试错误**（否则测试本身不成立）：①第 5 条的 dot_at 初稿取的是「不同位置的 q / k 向量」，但旋转等变性说的是 qᵀR(m)ᵀR(n)k 只依赖 n-m，q/k 本身不能换 —— 已改为固定同一组向量、只改绝对位置；②第 8 条初稿用位置 64（= max_seq_len，越界会抛 IndexError），且断言「前两维不受 theta 影响」在 head_dim=8 时不成立（inv_freq = [1, θ^-0.25, θ^-0.5, θ^-0.75]，只有第 0 维与 theta 无关）—— 已改为位置 63 + 只断言第 0 维。两处均已就地修正开发计划正文。",
+        "2026-10-22 实现层同步修正：forward 把 position_ids 统一 reshape 成 2D (B', T)，以支持 (B,T) / (1,T) / (B,1,T) 等形状（初稿只支持 2D，而测试第 6 条传的是 3D）。",
+        "2026-10-22 `bash init.sh --quiet` → PASS=21 SKIP=1 FAIL=0（L4 组件 smoke 走 run_all.py 全绿）。"
+      ],
+      "notes": "theta=1e6 是 Qwen3 相对 GPT-2（1e4）的关键改动：低频维度波长更长，长上下文下位置信息退化更晚。该数字目前没有对应笔记支撑，已在 feat-009 待核清单里记下（需补 Qwen3_RoPE_学习笔记 的 theta 论证）。"
     },
     {
       "id": "feat-014",
@@ -123,7 +130,7 @@
       "area": "qwen3-attn",
       "title": "实现 QK-Norm 注意力与 GQA",
       "user_visible_behavior": "model/common/attention.py 同时支持 GQA（n_head_kv < n_head）与 QK-Norm，KV Cache 长度按 kv 头数分配。",
-      "status": "not_started",
+      "status": "in_progress",
       "verification": [
         "Q、K 在进入 RoPE 前各过一次 RMSNorm（QK-Norm 必须在 RoPE 之前，代码注释写明理由）",
         "KV 通过 repeat_interleave 扩到 n_head（不可用 repeat——那会退化成 MQA）",

@@ -802,24 +802,31 @@ assert qr.shape == q.shape and kr.shape == k.shape, "RoPE 不应改变形状"
 
 # --- 5) 【核心】旋转等变性：内积只依赖相对距离 ---
 def dot_at(qv, kv, m, n):
-    """位置 m 的 q 与位置 n 的 k 旋转后的内积。"""
+    """
+    把同一个 q 向量放在位置 m、同一个 k 向量放在位置 n，旋转后取内积。
+
+    注意：必须用**同一个** q / k 向量，只改绝对位置。
+    等变性说的是 qᵀR(m)ᵀR(n)k 只依赖 n-m，q/k 本身不能换。
+    （初稿写成「取不同位置的 q / k」，是错的，已修正。）
+    """
     pos = torch.tensor([[[m, n]]])                 # (1,1,2)
     cos, sin = rope.get_cos_sin(pos)               # (1,1,2,HEAD_DIM)
-    qm = qv[:, :, m : m + 1, :]                     # (2,4,1,HEAD_DIM)
-    kn = kv[:, :, n : n + 1, :]
+    qm = qv[:, :, :1, :]                           # 同一个 q 向量
+    kn = kv[:, :, :1, :]                           # 同一个 k 向量
     qm_r = rope._apply_rotation(qm, cos[:, :, :1], sin[:, :, :1])
     kn_r = rope._apply_rotation(kn, cos[:, :, 1:], sin[:, :, 1:])
-    return (qm_r * kn_r).sum(dim=-1)                # (2,4,1)
+    return (qm_r * kn_r).sum(dim=-1)               # (B,H,1)
 
-# (m=0,n=3) 与 (m=10,n=13)：相对距离都是 3
-d1 = dot_at(q, k, 0, 3)
-d2 = dot_at(q, k, 10, 13)
+# 固定 q / k 向量，只改绝对位置：
+# (m=0,n=3) 与 (m=10,n=13) 的相对距离都是 3 → 内积应相等
+d1 = dot_at(q[:, :, :1, :], k[:, :, :1, :], 0, 3)
+d2 = dot_at(q[:, :, :1, :], k[:, :, :1, :], 10, 13)
 assert torch.allclose(d1, d2, atol=1e-4), (
     f"旋转等变性被破坏：dist=3 的两组内积应相等，实得 {d1.flatten()[:3]} vs {d2.flatten()[:3]}"
 )
 
 # 不同相对距离应给出不同内积（否则 RoPE 白做了）
-d3 = dot_at(q, k, 5, 9)   # dist = 4
+d3 = dot_at(q[:, :, :1, :], k[:, :, :1, :], 0, 4)   # dist = 4
 assert not torch.allclose(d1, d3, atol=1e-3), "不同相对距离内积应不同"
 
 # --- 6) position_ids 支持：同一组 q/k 取不同位置应得不同结果 ---
@@ -836,14 +843,20 @@ q_def, _ = rope(q[:, :, :2, :], k[:, :, :2, :])
 assert torch.allclose(q_def, qa, atol=1e-6), "position_ids=None 应等价于 0..T-1"
 
 # --- 8) theta 影响低频维度：theta 越大，低维旋转越慢 ---
+#     注意两点（初稿两处都写错了）：
+#       a) 位置必须 < max_seq_len（初稿用 64 = MAX_LEN，越界会抛 IndexError）
+#       b) head_dim=8 时 inv_freq = [1, θ^-0.25, θ^-0.5, θ^-0.75]，
+#          **只有第 0 维与 theta 无关**（inv_freq[0] = θ^0 = 1），
+#          「前两维都几乎一致」不成立 —— 第 1 维是 θ^-0.25，受影响很大。
 rope_big = RoPE(HEAD_DIM, max_seq_len=MAX_LEN, theta=1e6)
 rope_small = RoPE(HEAD_DIM, max_seq_len=MAX_LEN, theta=1e4)
-pos = torch.tensor([[[64]]])
+pos = torch.tensor([[[MAX_LEN - 1]]])          # 63，合法位置
 cb_, sb_ = rope_big.get_cos_sin(pos)
 cs_, ss_ = rope_small.get_cos_sin(pos)
-# 前两维（频率最高）应几乎一致，后两维（频率最低）差异明显
-assert torch.allclose(cb_[..., :2], cs_[..., :2], atol=1e-3), "高频维度 theta 不应有大影响"
-assert not torch.allclose(cb_[..., -2:], cs_[..., -2:], atol=1e-3), "低频维度 theta 应有影响"
+# 最高频维度（inv_freq = 1）与 theta 无关 → 完全一致
+assert torch.allclose(cb_[..., :1], cs_[..., :1], atol=1e-6), "最高频维度不应受 theta 影响"
+# 最低频维度（inv_freq = θ^-0.75）差异明显
+assert not torch.allclose(cb_[..., -2:], cs_[..., -2:], atol=1e-4), "低频维度 theta 应有影响"
 
 # --- 9) 越界保护 ---
 try:
@@ -1038,7 +1051,11 @@ class RoPE(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(T, dtype=torch.long, device=q.device)
             position_ids = position_ids.unsqueeze(0).expand(B, T)   # (B, T)
-        cos, sin = self.get_cos_sin(position_ids)                    # (B, T, D)
+
+        # 统一成 2D (B', T)：允许调用方传 (B, T) / (1, T) / (B, 1, T) 等形状
+        pos_2d = position_ids.reshape(-1, position_ids.shape[-1])   # (B', T)
+
+        cos, sin = self.get_cos_sin(pos_2d)                        # (B', T, D)
         # unsqueeze(1) 插入 head 维，让同一组 cos/sin 广播给所有 head
         cos = cos.unsqueeze(1)   # (B, 1, T, D)
         sin = sin.unsqueeze(1)
