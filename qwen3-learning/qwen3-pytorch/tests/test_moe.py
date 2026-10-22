@@ -176,5 +176,41 @@ n_moe = model.num_params()
 print(f"[参数量] dense={n_dense:,}  moe={n_moe:,}  比值={n_moe/n_dense:.2f}x")
 assert n_moe > n_dense, "MoE 的 FFN 专家更多，总参数量应大于 Dense"
 
+# =====================================================================
+# 11) 【量纲锚点】aux_loss 的数值必须与笔记 §19.1 一致
+#     —— 完全均衡时 aux_loss == 1（不是 1/K，也不是 HF 的 K）
+# =====================================================================
+from model.qwen3_moe import load_balancing_aux_loss  # noqa: E402
+
+E_ = MOE_CONFIG.n_experts
+K_ = MOE_CONFIG.experts_per_tok
+N_ = 8
+
+# (a) 完全均衡：每个专家恰好拿到 N*K/E 个槽位，router 概率也完全均匀
+topk_balanced = torch.tensor([[0, 1]] * 4 + [[2, 3]] * 4)      # (8, 2)
+probs_uniform = torch.full((N_, E_), 1.0 / E_)                  # (8, 4) 每行和为 1
+aux, f_i, p_i = load_balancing_aux_loss(topk_balanced, probs_uniform)
+assert abs(float(f_i.sum()) - 1.0) < 1e-6, f"f_i 应归一化到 1，实得 {float(f_i.sum())}"
+assert abs(float(p_i.sum()) - 1.0) < 1e-6, f"p_i 应归一化到 1，实得 {float(p_i.sum())}"
+assert torch.allclose(f_i, torch.full((E_,), 1.0 / E_), atol=1e-6), f"均衡时 f 应均匀，实得 {f_i}"
+assert abs(float(aux) - 1.0) < 1e-6, f"完全均衡时 aux_loss 应为 1，实得 {float(aux)}"
+
+# (b) 错配时 aux_loss 必须上升：f 全压在专家 0，router 却偏爱专家 1
+topk_skewed = torch.tensor([[0, 1]] * 8)                        # 全去专家 0/1，专家 2/3 饿死
+probs_skewed = torch.tensor([[0.1, 0.7, 0.1, 0.1]]).repeat(N_, 1)
+aux_skewed, _, _ = load_balancing_aux_loss(topk_skewed, probs_skewed)
+assert float(aux_skewed) > float(aux), \
+    f"路由错配时 aux_loss 应大于均衡值 {float(aux):.3f}，实得 {float(aux_skewed):.3f}"
+
+# (c) 与 HF Mixtral 的关系：HF 把槽位计数除以 N（不是 N*K），所以 HF 的 aux = 我们的 K 倍
+slot_counts = torch.bincount(topk_balanced.reshape(-1), minlength=E_).float()
+f_hf = slot_counts / N_                                          # HF 的 f：Σ = K
+aux_hf = E_ * torch.sum(f_hf * probs_uniform.mean(dim=0))
+assert abs(float(f_hf.sum()) - K_) < 1e-6, f"HF 的 f 应满足 Σf = K={K_}，实得 {float(f_hf.sum())}"
+assert abs(float(aux_hf) - K_ * float(aux)) < 1e-6, \
+    f"HF 的 aux 应等于我们的 K={K_} 倍：{float(aux_hf)} vs {K_ * float(aux)}"
+print(f"[aux 量纲] 均衡时 aux={float(aux):.4f}（=1）；错配时 aux={float(aux_skewed):.4f}；"
+      f"HF 同款公式 = {float(aux_hf):.4f}（= K×{K_}）")
+
 print(f"test_moe OK  n_experts={MOE_CONFIG.n_experts} top_k={MOE_CONFIG.experts_per_tok} "
       f"moe_intermediate={MOE_CONFIG.moe_intermediate_size} params={n_moe:,}")

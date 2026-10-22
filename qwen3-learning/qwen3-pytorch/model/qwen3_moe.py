@@ -16,19 +16,23 @@ Tiny Qwen3 MoE 主模型（Router + 多专家 SwiGLU）。
     router(x) → n_experts 个 logits → softmax → 取 top-k → （可选）权重重新归一化
     → 只把这 k 个专家的 FFN 作用于该 token → 按归一化权重加权求和
 
-【负载均衡辅助损失（HuggingFace Mixtral 的写法）】
-    aux_loss = n_experts · Σ_i  f_i · P_i
+【负载均衡辅助损失】
+    aux_loss = n_experts · Σ_i  f_i · p_i
         f_i = 专家 i 被选中的 (token, k槽) 对数 / (总 token 数 × k)
-              —— 也就是对 tokens×k 个槽位求均值
-        P_i = router 对专家 i 给出的平均概率
+              —— 也就是对 tokens×k 个槽位求均值，恒有 Σf_i = 1
+        p_i = router 对专家 i 给出的平均概率，恒有 Σp_i = 1
 
-    均匀路由时：f_i = 1/(K·E)，P_i = 1/E
-    → aux_loss = E · Σ_i (1/(K·E))·(1/E) = **1/K**（K=2 时是 0.5，**不是 1**）
-    某个专家被过度使用则 f_i ≫ P_i，aux_loss 上升，推动 router 重新分配。
+    均匀路由时：f_i = 1/E，p_i = 1/E
+    → aux_loss = E · Σ_i (1/E)·(1/E) = **1**（本仓库 K=2、E=4 时就是 1）
+    某个专家被过度使用则 f_i ≫ p_i，aux_loss 上升，推动 router 重新分配。
 
-    （Switch Transformer 论文里的原始式子 f_i = 「被路由到专家 i 的 token 比例」
-      在 k>1 时每个 token 会被计多次，与 HF Mixtral 的实现不是同一个量纲。
-      本实现采用 HF Mixtral 的量纲，训练脚本里的 aux_loss_coef 与之配套。）
+    【与 HuggingFace Mixtral 的关系：差一个 K 倍，别混用】
+        HF 的 load_balancing_loss_func 把槽位计数除以 **N**（不是 N·K），
+        所以 HF 的 f_i 恒有 Σf_i = K，均匀时 aux_loss = **K**（K=2 → 2）。
+        本实现除以 N·K，即把 HF 的 f 再除一个 K → aux_loss = HF 的 1/K。
+        这样「完全均衡时 aux_loss = 1」这个直觉数值成立（与 Switch 论文 top-1 版同量纲），
+        代价是与 HF 的数值不能直接比大小（要乘 K）。
+        详见笔记 Qwen3_MoE_学习笔记.md §19.1。
 
 【实现要点：真的省计算，而不是"算了再丢"】
     朴素写法会算全部 n_experts 个 FFN 再按 top-k 取用，等于没省。
@@ -47,6 +51,41 @@ from config import Qwen3Config
 from model.common.attention import CausalSelfAttention
 from model.common.mlp import SwiGLUMLP
 from model.common.rmsnorm import RMSNorm
+
+
+def load_balancing_aux_loss(
+    topk_indices: "torch.Tensor",
+    router_probs: "torch.Tensor",
+) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """
+    负载均衡辅助损失（与笔记 §19.1 的量纲一致）。
+
+        f_i = 专家 i 被选中的 (token, k槽) 对数 / (N·K)   ← 对 tokens×k 个槽位求均值，Σf_i = 1
+        p_i = router 对专家 i 给出的平均概率               ← Σp_i = 1
+        aux = E · Σ_i f_i · p_i
+
+    均匀路由时 f_i = 1/E、p_i = 1/E → aux = E·E·(1/E)·(1/E) = **1**。
+
+    【与 HuggingFace Mixtral 的关系（差一个 K 倍）】
+        HF 的 load_balancing_loss_func 把槽位计数除以 N（不是 N·K），
+        它的 f_i 恒有 Σf_i = K，均匀时 aux = **K**（K=2 → 2）。
+        本实现多除一个 K（f 归一化到 Σf = 1），所以 aux = HF 的 1/K，
+        「均衡时 = 1」的直觉成立，但与 HF 的数值不能直接比大小。
+
+    参数：
+        topk_indices: (N, K) 每个 token 选中的专家 id
+        router_probs:  (N, E) router 的 softmax 概率（top-k 选取**之前**的全 E 维分布）
+    返回：
+        (aux_loss, f_i, p_i)；aux_loss 是标量 tensor，f_i / p_i 形状都是 (E,)
+    """
+    n_tokens, k = topk_indices.shape
+    n_experts = router_probs.size(-1)
+    expert_mask = F.one_hot(topk_indices, num_classes=n_experts).float()
+    expert_mask = expert_mask.view(n_tokens * k, n_experts)   # (N*K, E)
+    f_i = expert_mask.mean(dim=0)                              # (E,) 实际流量占比，Σ = 1
+    p_i = router_probs.mean(dim=0)                             # (E,) 平均路由概率，Σ = 1
+    aux_loss = n_experts * torch.sum(f_i * p_i)
+    return aux_loss, f_i, p_i
 
 
 class SparseMoeBlock(nn.Module):
@@ -158,18 +197,15 @@ class SparseMoeBlock(nn.Module):
         if self.norm_topk_prob and K > 1:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        # --- 4) 负载均衡辅助损失（HF Mixtral 量纲）---
-        #     f_i = 专家 i 的 (token, k槽) 对数 / (N·K)  —— 对 tokens×k 个槽位求均值
-        #     P_i = 专家 i 的平均路由概率
-        #     aux_loss = E · Σ_i f_i · P_i，均匀时 = 1/K
-        expert_mask = F.one_hot(topk_indices, num_classes=E).float()      # (N, K, E)
-        expert_mask = expert_mask.view(n_tokens * K, E)                   # (N*K, E)
-        f_i = expert_mask.mean(dim=0)                                     # (E,) 实际占比
-        P_i = router_probs.mean(dim=0)                                    # (E,) 平均概率
-        aux_loss = E * torch.sum(f_i * P_i)                               # scalar
+        # --- 4) 负载均衡辅助损失 ---
+        #     f_i = 专家 i 的 (token, k槽) 对数 / (N·K)  —— 对 tokens×k 个槽位求均值，Σf = 1
+        #     p_i = 专家 i 的平均路由概率，Σp = 1
+        #     aux_loss = E · Σ_i f_i · p_i，均匀时 = 1（HF Mixtral 是 K，见函数 docstring）
+        aux_loss, f_i, p_i = load_balancing_aux_loss(topk_indices, router_probs)
 
         # 统计：每个专家分到多少 token（把 top-k 的每个 slot 都算一次）
-        expert_load = (expert_mask.sum(dim=0) / K).tolist()               # list[E]，和 = N
+        slot_counts = torch.bincount(topk_indices.view(-1), minlength=E).float()
+        expert_load = (slot_counts / K).tolist()                         # list[E]，和 = N
 
         # --- 5) 按专家分组做稀疏计算 ---
         #     对第 e 个专家，取出「被路由到它」的 (token 下标, k 槽下标)
@@ -202,6 +238,8 @@ class SparseMoeBlock(nn.Module):
         stats = {
             "aux_loss": aux_loss,
             "expert_load": expert_load,
+            "f_i": f_i.detach(),
+            "p_i": p_i.detach(),
             "topk_weights": topk_weights.view(B * T, K).detach(),
             "routed_tokens": n_tokens,
             "expert_token_pairs": n_tokens * K,

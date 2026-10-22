@@ -595,24 +595,39 @@ L_{aux}=1
 （top-1 路由时 `Σf_i = 1`；top-k 路由时一个 token 被计 k 次，`Σf_i = K`），
 且带一个 `N`（专家数）的系数。
 
-本仓库 `model/qwen3_moe.py::_forward_ffn` 用的是 **HuggingFace Mixtral 版**：
+本仓库 `model/qwen3_moe.py::load_balancing_aux_loss` 的写法是：
 
 ```text
 f_i  = 专家 i 的 (token, k槽) 对数 / (token 总数 × k)     ← 对 tokens×k 个槽位求均值，恒有 Σf_i = 1
-p_i  = router 对专家 i 的平均概率                          ← 与 §17 一致
-aux  = E · Σ f_i · p_i                                    ← 系数是专家数 E，没有额外的 N
+p_i  = router 对专家 i 给出的平均概率                       ← 与 §17 一致，恒有 Σp_i = 1
+aux  = E · Σ f_i · p_i                                    ← 系数是专家数 E
 ```
 
-**两者在均匀路由时的取值不同，别混用：**
+**均匀路由时（关键锚点）**：`f_i = 1/E`、`p_i = 1/E`
 
-| 版本 | 均匀时 f | 均匀时 p | 均匀时 L_aux |
-|---|---|---|---|
-| §19 Switch 版（top-1，Σf=1） | 1/E | 1/E | **1** |
-| 代码 Mixtral 版（top-k，Σf=1 over tokens×k） | 1/(K·E) | 1/E | **1/K** |
+\[
+L_{aux} = E \cdot \sum_i \frac1E \cdot \frac1E = E \cdot E \cdot \frac{1}{E^2} = \boxed{1}
+\]
 
-> 本仓库 K=2、E=4，所以**均匀路由时 aux_loss ≈ 0.5，而不是 1**。
-> 两式的作用完全一样（都是逼迫「实际流量 f」贴近「路由偏好 p」），
-> 只是量纲不同。选 Mixtral 版是因为它与 HF 的训练代码、`aux_loss_coef` 的取值配套。
+**三种写法的量纲对比（别混用）**
+
+| 版本 | `f` 的归一化 | 均匀时 f | 均匀时 p | 均匀时 \(L_{aux}\) |
+|---|---|---|---|---|
+| §19 Switch 论文版（top-1，按 token 计一次） | Σf = 1 | 1/E | 1/E | **1** |
+| §19 Switch 版直接用在 top-k 上（同一 token 被计 k 次） | Σf = K | K/E | 1/E | **K** |
+| HF Mixtral（transformers `load_balancing_loss_func`） | Σf = K | K/E | 1/E | **K** |
+| **本仓库代码** | Σf = 1 | 1/E | 1/E | **1** |
+
+> HF 的 `load_balancing_loss_func` 把槽位计数除以 **N**（不是 N·K），
+> 所以它的 `f` 满足 `Σf = K`，均匀时 aux = K（本仓库 K=2 → 2）。
+> 本实现多除一个 K（把 `f` 归一化到 Σf = 1），因此 **aux = HF 的 1/K**，
+> 好处是「完全均衡时 aux_loss = 1」这个直觉数值成立（与 Switch 论文 top-1 版同量纲），
+> 代价是**不能拿我们的数值和 HF 的数值直接比大小**（要乘 K）。
+>
+> **实测锚点**（`python tests/test_moe.py`）：
+> `[aux 量纲] 均衡时 aux=1.0000（=1）；错配时 aux=1.6000；HF 同款公式 = 2.0000（= K×2）`
+> —— 这条断言写死在 `tests/test_moe.py` 第 11 节，代码一改量纲测试就会红。
+>
 > **看到别人论文里写 "aux loss = 1" 时，先确认他用的是哪一版。**
 
 ## 20. 为什么 \(f_i\) 和 \(p_i\) 都需要
