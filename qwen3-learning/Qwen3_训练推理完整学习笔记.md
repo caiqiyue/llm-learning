@@ -784,3 +784,208 @@ checkpoint 缺失 → **跳过该段并打印原因**（那是「还没跑到那
 ④ naive 每次前向整条序列（T_q = P+s），cache 路径每步只前向 1 个 token（T_q = 1），
 **matmul 的规约顺序不同 ⇒ fp32 末位差异 ~1e-7**（实测 `max|diff| = 5.96e-07`）。
 正确的门槛是「**token 序列逐位相同**」（§10.5 的实测），断言 logits 逐位相等会误报。
+
+---
+
+## 12. 退化对照：把「Qwen3 到底改了什么」变成一个数字（feat-017）
+
+前面 7 篇笔记里全是这样的陈述：
+
+> 「Qwen3 用了 RoPE」「Qwen3 用了 GQA」「Qwen3 用了 QK-Norm」「Qwen3 的 FFN 是 SwiGLU」
+> 「Qwen3 用 RMSNorm 而不是 LayerNorm」
+
+这些陈述**都是对的**，但它们都缺一个东西：**一个数字**。
+「换成 RMSNorm 之后模型行为变了多少？」——没有数字，这个问题就没答案。
+
+本节把它补上。做法是**反过来做**。
+
+### 12.1 反过来做：把 Qwen3 退化成 GPT-2
+
+正着做（从 GPT-2 出发，逐个加 Qwen3 的组件）有个麻烦：
+每加一个组件，输出就变一次，你分不清是哪个组件造成的。
+
+反过来做就干净得多：
+
+1. 给 Qwen3 加 5 个**退化开关**，把它们**全部关掉** ⇒ Qwen3 与 GPT-2 结构完全相同；
+2. 把 GPT-2 的权重按一张**显式映射表**搬进退化的 Qwen3；
+3. 喂同一批输入，比两边的 logits。
+
+| 开关 | 关掉后变成 | 对应 GPT-2 的什么 |
+|---|---|---|
+| `use_gqa` | `n_head_kv = n_head` | GPT-2 就是标准 MHA |
+| `use_rope` | 不用 RoPE，改用加法式 `wpe` | GPT-2 的 sinusoidal 位置嵌入 |
+| `use_qk_norm` | Q/K 不做 RMSNorm | GPT-2 没有 QK-Norm |
+| `mlp_type` | `"swiglu"` → `"gelu"` | `c_fc → GELU → c_proj` |
+| `norm_type` | `"rmsnorm"` → `"layernorm"` | GPT-2 用 `nn.LayerNorm` |
+
+这 5 个开关**默认全部是「开」**（= 主线行为）。
+也就是说：加它们**不改变任何一个既有训练 / 评估的数字**，
+`config.py` 只是多了 5 个字段，主线代码路径一行都没变
+（回归断言在 `tests/test_compare_with_gpt2.py` 第 4 组）。
+
+### 12.2 三个「前提」：少一个就永远对不齐
+
+这是整个实验最容易踩坑的地方，值得单独写。
+
+**前提 ①：`head_dim` 必须回退成 GPT-2 的取法**
+
+| | `n_head` | `head_dim` | `n_head · head_dim` |
+|---|---|---|---|
+| GPT-2 | 4 | `n_embd // n_head` = 32 | 128 = `n_embd` |
+| Qwen3 主线 | 4 | **48**（故意解耦） | **192 ≠ 128** |
+
+Qwen3 主线把 `head_dim` 与 `n_embd` **解耦**（为了体现真实 Qwen3-0.6B 的做法）。
+但 GPT-2 的 `head_dim` 是 `n_embd // n_head` 算出来的。
+`o_proj` 的输入维度是 `n_head · head_dim`，
+不退回去的话连权重矩阵的形状都对不上 —— **这不是精度问题，是根本没法映射**。
+
+**前提 ②：中间层维度必须回退成 GPT-2 的 `n_inner`**
+
+| | 中间层维度 | 依据 |
+|---|---|---|
+| GPT-2 | 512 | `4 × n_embd` |
+| Qwen3 主线 | 384 | `8/3 规则`后再对齐到 128 的倍数 |
+
+`8/3 规则`是 SwiGLU 特有的（两个矩阵升维 ⇒ 宽度要砍）。
+换成 GELU（一个矩阵升维）就必须用回 `4 × n_embd`。
+
+**前提 ③：归一化必须两边同步切，而且 eps 也要一样**
+
+RMSNorm（不减均值、无 bias）与 LayerNorm（减均值、有 bias）**在数学上不等价**。
+只切 Qwen3 一侧 ⇒ 差的是「归一化方式」而不是「Qwen3 的其它组件」。
+
+所以退化配置里 Qwen3 也用 `nn.LayerNorm`，**eps 取 GPT-2 的默认值 `1e-5`**。
+（eps 放在 `sqrt(var + eps)` 内部，`1e-5` vs `1e-6` 会带来 ~1% 的相对差，
+和「减不减均值」这个变量混在一起就分不清了。）
+
+### 12.3 权重映射表（GPT-2 → 退化的 Qwen3）
+
+| GPT-2 | → | 退化的 Qwen3 |
+|---|---|---|
+| `tok_emb.weight` | → | `wte.weight`（`lm_head` 与之绑定，两边都绑定，不用单独映射） |
+| `pos_emb`（**buffer，不在 state_dict 里**） | → | `wpe.weight` |
+| `blocks.{i}.ln_1.weight / .bias` | → | `blocks.{i}.ln_1.weight / .bias` |
+| `blocks.{i}.attn.c_attn.weight[0:C]` | → | `blocks.{i}.attn.q_proj.weight` |
+| `blocks.{i}.attn.c_attn.weight[C:2C]` | → | `blocks.{i}.attn.k_proj.weight` |
+| `blocks.{i}.attn.c_attn.weight[2C:3C]` | → | `blocks.{i}.attn.v_proj.weight` |
+| `blocks.{i}.attn.c_proj.weight` | → | `blocks.{i}.attn.o_proj.weight` |
+| `blocks.{i}.ln_2.weight / .bias` | → | `blocks.{i}.ln_2.weight / .bias` |
+| `blocks.{i}.mlp.c_fc.weight` | → | `blocks.{i}.mlp.up_proj.weight` |
+| `blocks.{i}.mlp.c_proj.weight` | → | `blocks.{i}.mlp.down_proj.weight` |
+| `ln_f.weight / .bias` | → | `ln_f.weight / .bias` |
+
+两点值得记：
+
+- **GPT-2 用一个 `c_attn` 一次投出 Q/K/V，Qwen3 必须拆成三个投影** ——
+  因为 Qwen3 的 `head_dim` 与 `n_embd` 解耦，Q/K/V 的输出维度不再相等。
+  退化时 `head_dim` 回退成 32，Q/K/V 的输出维度又相等了，但**代码仍然是三份**，
+  所以映射是「把 `c_attn` 的 3 段行切开，分别塞进三个 Linear」。
+- **GPT-2 的 `pos_emb` 是 `register_buffer(..., persistent=False)`** ——
+  它**不在 `state_dict` 里**，必须从模型实例上直接取（`gpt2.pos_emb`）。
+  > ⚠️ 开发计划 Task 18 的初稿写的是「GPT-2 用 **learned** PE（可训练参数）」——
+  > **这是错的**。本仓 GPT-2 的位置表是**固定的 sinusoidal buffer**，不训练。
+  > 对齐只关心数值不关心是否可训练，所以把同一张表拷进 `wpe` 即可。
+
+### 12.4 实测结果：消融表
+
+```bash
+cd qwen3-learning/qwen3-pytorch
+python ablations/compare_with_gpt2.py
+```
+
+```
+[compare] Qwen3 ↔ GPT-2 退化对照
+配置                          max_abs_diff       相对差    logit 量级   判定
+----------------------------------------------------------------------------------
+全关（退化成 GPT-2）                  0.000e+00  0.00e+00      0.7422   PASS（< 1e-04）
+只开 use_gqa                     7.514e-02  1.01e-01      0.7422   OK（> 1e-04）
+只开 use_rope                    1.541e+00  2.08e+00      0.7422   OK（> 1e-04）
+只开 use_qk_norm                 9.334e-03  1.26e-02      0.7422   OK（> 1e-04）
+只开 mlp=swiglu                  7.187e-02  9.68e-02      0.7422   OK（> 1e-04）
+只开 norm=rmsnorm                5.449e-01  7.34e-01      0.7422   OK（> 1e-04）
+```
+
+（`vocab=293, seq_len=16, batch=2, seed=42`；`logit 量级` = GPT-2 那边 logits 的最大绝对值，
+用来把绝对差换算成「相对信号有多大」。）
+
+**这张表要这么读：**
+
+- **第 1 行 `0.000e+00` 是全表的地基。** 退化后的 Qwen3 与 GPT-2
+  **逐位相同**（不是「小于 1e-4」，是**一个 bit 都不差**）。
+  这说明：① 退化开关真的把结构改成了 GPT-2；② 权重映射表没有漏项也没有多项；
+  ③ 两边剩下的**数值差异来源为零**（连浮点累加顺序都一致）。
+  > 有意思的是，GPT-2 的融合 `c_attn` 与 Qwen3 的三个独立 Linear，
+  > 在 fp32 下算出了**逐位相同**的结果 —— 因为矩阵足够小，走的是同一套 GEMM 路径。
+  > 所以「融合 vs 拆分」在这个尺寸上连浮点噪声都没有。
+
+- **第 2–6 行每一行都只开一个组件**，diff 立刻从 `0` 跳到 `1e-3 ~ 1e0` 量级。
+  这才是「每个组件到底改了什么」的量化答案：
+
+| 组件 | 相对差 | 怎么读 |
+|---|---|---|
+| `use_rope` | **2.08** | **最大**。位置信息的表达方式换成 RoPE 后，logits 完全不是一回事 |
+| `norm=rmsnorm` | **0.73** | 次大。减不减均值、有没有 bias，对数值的影响是 O(1) |
+| `use_gqa` | **0.10** | K/V head 数减半 ⇒ 注意力看到的 K/V 变了 |
+| `mlp=swiglu` | **0.097** | 多一个门控分支（gate 无 GPT-2 对应物，见 §12.5） |
+| `use_qk_norm` | **0.013** | **最小**。Q/K 各过一次 RMSNorm，主要是「稳住数值尺度」，不改信息量 |
+
+- **`norm=rmsnorm` 那一行是「前提」不是「组件」** ——
+  它回答的是「为什么对照实验必须两边同步切换归一化」：
+  不同步的话，误差就是 O(0.7) 量级，远超 `1e-4` 的阈值。
+
+### 12.5 三条反证：证明它不是「碰巧通过」
+
+一个只看「第 1 行 = 0」的实验是不可信的 —— 万一两边根本没跑呢？
+所以 `tests/test_compare_with_gpt2.py` 里有三条**反证**：
+
+| 反证 | 做法 | 实测 | 证明了什么 |
+|---|---|---|---|
+| A | **不加载权重**（退化 Qwen3 用随机权重） | `max_abs_diff = 1.013` | 差得远 ⇒ 第 1 行的 `0` 不是「拿自己跟自己比」 |
+| B | **逐条核对映射表**（`wte` / `wpe` / `q,k,v,o` / `up,down` / `ln_f` 全部 `torch.equal`） | 全部相等 | 权重真的搬过去了，不是碰巧长得像 |
+| C | **主线默认配置不变**（无 `wpe`、有 `q_norm`、FFN 是 `SwiGLUMLP`、`ln_f` 是 `RMSNorm`） | 全部符合 | 加开关**没有污染主线** |
+
+还有两条「这一行的数字不能过度解读」的说明：
+
+- **「只开 `use_rope`」这一行**：Qwen3 侧此时**完全没有加法式位置嵌入**
+  （`use_rope=False` 才有 `wpe`），GPT-2 侧有 sinusoidal PE。
+  所以这一行测的是「**加法式 sinusoidal PE → RoPE**」这个**整体替换**的影响，
+  不是「在同样的位置信息上换一种编码方式」的差异。
+- **「只开 `mlp=swiglu`」这一行**：SwiGLU 比 GELU 多一个 `gate_proj` 分支，
+  GPT-2 里**没有对应物**，所以这一分支保持随机初值。
+  也就是说这一行的 diff 里混着一份「随机的门控信号」，
+  它测的是「有门控 vs 没门控」的行为差异，而不是「同一份门控的数值差异」。
+
+### 12.6 这套方法能推广
+
+同样的套路可以用在**任何两个模型之间**：
+
+1. 给新模型加一组「退化开关」，默认值 = 新模型的行为；
+2. 开关全关 ⇒ 结构退化成旧模型；
+3. 写一张显式映射表 + 若干条**前提**（形状必须回退到旧模型的取法）；
+4. 全关时 `max_abs_diff` 必须落到阈值内（否则说明映射表漏了东西）；
+5. 逐个开开关，每个组件单独量化。
+
+第 4 步特别有用：**它把「我以为我迁移对了」变成「差值是 0，所以确实迁移对了」**。
+本节那个 `0.000e+00` 就是这么来的 —— 它不是「小于 1e-4」的口头保证，是可复现的实测。
+
+### 12.7 自测题（本节）
+
+1. 为什么 `use_rope=False` 时不能简单地「不给位置信息」？
+2. 为什么退化配置里 `head_dim` 必须改回 32，改成 48 会怎样？
+3. 「只开 `use_qk_norm`」那一行的相对差最小（1.3e-2），能说明 QK-Norm 没用吗？
+4. 为什么第 1 行是 `0.000e+00` 而不是 `1e-7` 级别的浮点噪声？
+
+**答案：**
+① 不给位置信息的话，退化后的模型**连「位置」这个概念都没有了**，
+与 GPT-2 的「有位置表」不是同一个模型，对齐必然失败；
+必须把 GPT-2 的那张 sinusoidal 表搬进 `wpe`；
+② `head_dim=48` 时 `o_proj` 的输入是 `4×48=192`，
+而 GPT-2 的 `c_proj` 输入是 128 ⇒ **形状对不上，权重没法映射**，
+连前向都跑不起来（不是精度问题）；
+③ 不能。相对差小只说明 QK-Norm **不改变信息量**（它只缩放 Q/K 的尺度），
+它改的是**数值稳定性**；要判断「有没有用」得看训练稳定性，
+不能拿这个表当「QK-Norm 不重要」的证据；
+④ 因为两边在 fp32 下走的是**同一套 GEMM / 逐元素算子的顺序**：
+融合 `c_attn` 与三个独立 Linear 在这个尺寸下结果逐位相同，
+LayerNorm / softmax / GELU 都是确定性算子 ⇒ 差异不是「小于浮点噪声」，
+而是**真的一个 bit 都不差**。

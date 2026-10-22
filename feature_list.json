@@ -1,7 +1,7 @@
 {
   "project": "llm-learning",
   "codename": "TinyGPT2-RLHF → TinyQwen3 (LoRA+DPO)",
-  "last_updated": "2026-10-22",
+  "last_updated": "2026-10-23",
   "phase": {
     "current": "P2 — Qwen3 从零实现",
     "previous": "P1 — GPT-2 + RLHF 全流程（笔记与代码已就位；2026-10-22 起 torch 环境已修复，训练链路进入复验）",
@@ -409,8 +409,8 @@
       "priority": 15,
       "area": "qwen3-ablation",
       "title": "与 GPT-2 做结构等价性对照测试",
-      "user_visible_behavior": "有一份对照脚本证明：把 GQA 退化成 MHA、RoPE 退化成 0、QK-Norm 退化成 0、SwiGLU 换成 GELU 后，Qwen3 与 GPT-2 在同样输入下输出可对齐。",
-      "status": "not_started",
+      "user_visible_behavior": "跑 python ablations/compare_with_gpt2.py 打印一张 6 行消融表：「全关（退化成 GPT-2）」的 max_abs_diff = 0（逐位相同），「只开某一个组件」的 5 行分别是各组件的量化影响；全关那行不达标时脚本报错退出。",
+      "status": "passing",
       "verification": [
         "构造退化开关：use_gqa=False / use_rope=False / use_qk_norm=False / mlp='gelu'",
         "同权重加载 GPT-2 与退化 Qwen3，逐层对齐参数名（映射关系显式写在脚本注释里）",
@@ -418,8 +418,20 @@
         "把结论写进 Qwen3 笔记，作为「Qwen3 每个组件到底改了什么」的实证",
         "ablations/compare_with_gpt2.py 独立于 train/ 与 model/，不污染主线代码"
       ],
-      "evidence": [],
-      "notes": "这是 Qwen3 线最有价值的产出：把 7 篇笔记的每个改动点都变成一次可跑的消融，而不是口头断言。已知难点（设计.md §11）：GPT-2 用 learned PE + GELU + LayerNorm，映射需显式列出；use_rope=False 后如何补位置信息、mlp='gelu' 时 down 权重如何与 GPT-2 的第二个 Linear 对齐，都要在脚本注释里说明。允许 max_abs_diff 放宽到 1e-4。"
+      "evidence": [
+        "2026-10-22 新增 `qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`（退化对照脚本）+ `ablations/__init__.py` + `tests/test_compare_with_gpt2.py`（6 组断言）。**做法是反过来做**：给 Qwen3 加 5 个退化开关，全部关掉就退化成 GPT-2 的结构，再把 GPT-2 的权重按显式映射表搬进退化的 Qwen3，比同一批输入的 logits。",
+        "2026-10-22 **验证项 ①：构造退化开关 use_gqa=False / use_rope=False / use_qk_norm=False / mlp='gelu'** —— 实际落地为 `config.Qwen3Config` 的 5 个字段：`use_gqa` / `use_rope` / `use_qk_norm` / `mlp_type` / `norm_type`。**默认值全部等于主线行为 ⇒ 不改变任何既有训练 / 评估的数字**（`config.py` 只多 5 个字段，主线路径一行未改）。新增 `model/common/norm.py`（归一化工厂）、`model/common/pos_emb.py`（sinusoidal 表）、`model/common/mlp.py::GELUMLP`（两矩阵 FFN）、`model/qwen3_dense.py::wpe`（加法式位置嵌入）。",
+        "2026-10-22 **验证项 ②：同权重加载 GPT-2 与退化 Qwen3，逐层对齐参数名** —— 映射表写在 `compare_with_gpt2.py` 的模块 docstring 里：`tok_emb.weight → wte.weight`、`pos_emb(buffer, 不在 state_dict 里) → wpe.weight`、`blocks.{i}.attn.c_attn.weight[0:C]/[C:2C]/[2C:3C] → attn.q_proj/k_proj/v_proj.weight`、`attn.c_proj.weight → attn.o_proj.weight`、`mlp.c_fc.weight → mlp.up_proj.weight`、`mlp.c_proj.weight → mlp.down_proj.weight`、`ln_1/ln_2/ln_f 的 weight+bias` 同名对应（norm_type='rmsnorm' 时 → .gain，bias 丢弃）。**GPT-2 的 `c_attn` 是融合的 Q/K/V 投影，Qwen3 因 head_dim 与 n_embd 解耦必须是三个独立投影** —— 映射时把 c_attn 的三段行切开分别塞进三个 Linear。",
+        "2026-10-22 **验证项 ③：同输入下 max_abs_diff < 1e-4（fp32）** —— **实测 `max_abs_diff = 0.000e+00`（逐位相同）**，比阈值还严。GPT-2 侧 logits 最大绝对值 0.7422（fp32，vocab=293 / seq_len=16 / batch=2 / seed=42）。这个 0 说明：① 退化开关真的把结构改成了 GPT-2；② 映射表没漏项也没多项；③ 两边连浮点累加顺序都一致（融合 c_attn 与三个独立 Linear 在这个尺寸下 fp32 结果逐位相同）。",
+        "2026-10-22 **验证项 ④：逐组件消融表（每个组件到底改了什么）** —— `python ablations/compare_with_gpt2.py` 实测：全关（退化成 GPT-2）= **0.000e+00**；只开 `use_gqa`（n_head_kv=2）= **7.514e-02**（相对差 1.01e-01）；只开 `use_rope` = **1.541e+00**（相对差 2.08e+00，**行为改变最大**）；只开 `use_qk_norm` = **9.334e-03**（相对差 1.26e-02，**最小** —— 它只缩放 Q/K 的尺度、不改信息量）；只开 `mlp=swiglu` = **7.187e-02**（相对差 9.68e-02）；只开 `norm=rmsnorm` = **5.449e-01**（相对差 7.34e-01）。**每一行都只开一个组件**，diff 从 0 跳到 1e-3~1e0 量级 ⇒ 每个组件都确实改变了模型行为。",
+        "2026-10-22 **验证项 ⑤：结论写进 Qwen3 笔记** —— `qwen3-learning/Qwen3_训练推理完整学习笔记.md` 新增 **§12 退化对照**（含想法、三个前提、权重映射表、消融表怎么读、三条反证、方法可推广性、4 道自测题）；5 篇组件笔记（RMSNorm / RoPE / QK-Norm / GQA / SwiGLU）开头各加一行「量化实证」指针，写明本组件对应的实测 `max_abs_diff` 与相对差；`qwen3-learning/qwen3-pytorch设计.md` §9 / §11 / §12 同步；`qwen3-learning/qwen3-pytorch/README.md` 新增「退化对照」一节。",
+        "2026-10-22 **验证项 ⑥：ablations/compare_with_gpt2.py 独立于 train/ 与 model/** —— 脚本放在 `qwen3-pytorch/ablations/`（不在 `train/` 也不在 `model/`），**唯一跨目录引用 GPT-2 线的地方，且是单向的（Qwen3 → GPT-2）**。主线 `model/` 与 `train/` 依然不 import GPT-2 线的任何代码。★ 这里踩了两个坑并已修：① `model` 包名**已被 Qwen3 线占用**，所以不能用 `sys.path.insert(GPT2_DIR)` + `from model.gpt2 import GPT2`（会解析到 Qwen3 的 model/ ⇒ ImportError），改用 `importlib.util.spec_from_file_location` 按文件路径加载、模块名取 `gpt2_ref`；② GPT2_DIR 要 **4 层** dirname（ablations → qwen3-pytorch → qwen3-learning → llm-learning），初稿只写了 3 层，指向不存在的 `qwen3-learning/gpt-learning/...`。",
+        "2026-10-22 **★ 三条反证（证明不是「碰巧通过」）** —— 「全关 < 1e-4」如果两边根本没跑也会「通过」，所以测试里加了 3 条反证：**A** 不加载权重（退化 Qwen3 用随机权重）⇒ `max_abs_diff = 1.013`，差得远，证明全关那行的 0 不是「拿自己跟自己比」；**B** 逐条核对映射表（`wte`/`wpe`/`q,k,v,o`/`up,down`/`ln_f` 全部 `torch.equal`）⇒ 权重真的搬过去了；**C** 主线默认配置不变（无 `wpe`、有 `q_norm`、FFN 是 `SwiGLUMLP`、`ln_f` 是 `RMSNorm`）⇒ 加开关没污染主线。",
+        "2026-10-22 **★ 三个「前提」：少一个就永远对不齐（计划初稿只写了一个）** —— ① **`head_dim` 必须回退**成 `n_embd // n_head`（=32）：Qwen3 主线故意把 head_dim 与 n_embd **解耦**（48 ⇒ `4×48=192 ≠ 128`），不退回去则 `o_proj` 输入维度对不上 ⇒ **形状都映射不了**，不是精度问题；② **中间层必须回退**成 GPT-2 的 `n_inner = 4·n_embd`（=512）：Qwen3 主线是 8/3 规则的 384，那是 SwiGLU 专用的宽度；③ **归一化必须两边同步切**，且 **eps 也要一样**（取 GPT-2 `nn.LayerNorm` 默认的 1e-5）：RMSNorm（不减均值、无 bias）与 LayerNorm（减均值、有 bias）数学上不等价，eps 又在 `sqrt(var+eps)` 内部（1e-5 vs 1e-6 差 ~1%），不同步就分不清是谁造成的。",
+        "2026-10-22 **★ 修正计划初稿的 9 个真 bug**（详见 开发计划.md Task 18）：①`GPT2_DIR` 少一层 dirname；②`from model.gpt2 import GPT2` 撞包名（必须 importlib 按路径加载）；③「GPT-2 用 learned PE」是**事实错误** —— 本仓 GPT-2 的 `pos_emb` 是 `register_buffer(persistent=False)` 的**固定 sinusoidal 表**，不训练、且不在 state_dict 里（初稿自己在代码注释里又写了「buffer，非 state_dict」，前后矛盾）；④映射表里的 `attn.qkv.weight` / `mlp.up.weight` / `mlp.down.weight` **键名不存在**；⑤漏了 head_dim 与中间层维度两个前提；⑥漏了 eps 前提；⑦`compare()` 只有一个点、没有扩展点；⑧**没有反证**；⑨没说明「开关默认全开 ⇒ 主线不变」。",
+        "2026-10-22 验证命令与实测输出：`python ablations/compare_with_gpt2.py` → 消融表 6 行全部符合预期，退出码 0；`python tests/test_compare_with_gpt2.py` → 6 组断言全过；`python tests/run_all.py` → **PASS=15 FAIL=0 TOTAL=15**；`bash init.sh` → **PASS=28 SKIP=0 FAIL=0**，新增 `[PASS] Qwen3 退化对照 smoke（全关 = GPT-2，max_abs_diff < 1e-4）`。"
+      ],
+      "notes": "**这是 Qwen3 线最有价值的产出**：把 7 篇笔记里的每个改动点，从「文字断言」变成「一次可跑的消融」 —— 全关时与 GPT-2 **逐位相同**（max_abs_diff = 0），单开任一组件后 diff 立刻跳到 1e-3~1e0 量级。**做法是反过来做**（把 Qwen3 退化成 GPT-2），正着做分不清是哪个组件造成的差异。**五个开关默认值 = 主线行为 ⇒ 不改变任何既有数字**，这一点由 `tests/test_compare_with_gpt2.py` 第 4 组断言守住。**三个前提**（head_dim 回退 / 中间层回退 / 归一化与 eps 同步）少一个就永远对不齐，已写进笔记 §12.2 与脚本 docstring。受影响的笔记：`Qwen3_训练推理完整学习笔记.md`（新增 §12）、5 篇组件笔记（各加一行量化实证指针）、`qwen3-pytorch设计.md`（§9/§11/§12）、`qwen3-pytorch/README.md`（新增退化对照一节）、`qwen3-pytorch开发计划.md`（Task 18 就地换成真代码 + 9 个 bug 记录）。`config.py` 新增 5 个字段（默认值 = 主线行为）⇒ 既有笔记里的数字**零影响**，feat-009 核对时不必重算。"
     },
     {
       "id": "feat-018",

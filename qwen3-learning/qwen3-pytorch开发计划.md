@@ -9021,149 +9021,785 @@ git commit -m "feat-018: Qwen3 KV Cache 推理与采样（prefill/decode + tempe
 ### Task 18: feat-017 与 GPT-2 的退化对照实验
 
 **Files:**
+- Create: `qwen3-learning/qwen3-pytorch/ablations/__init__.py`
 - Create: `qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`
+- Create: `qwen3-learning/qwen3-pytorch/tests/test_compare_with_gpt2.py`
+- Modify: `qwen3-learning/qwen3-pytorch/config.py`（加 5 个消融开关）
+- Modify: `qwen3-learning/qwen3-pytorch/model/qwen3_dense.py`（接开关 + wpe）
+- Modify: `qwen3-learning/qwen3-pytorch/model/common/attention.py`（use_qk_norm / use_rope）
+- Modify: `qwen3-learning/qwen3-pytorch/model/common/mlp.py`（加 GELUMLP）
+- Create: `qwen3-learning/qwen3-pytorch/model/common/norm.py`（归一化工厂）
+- Create: `qwen3-learning/qwen3-pytorch/model/common/pos_emb.py`（sinusoidal 表）
+- Modify: `init.sh`（L4 加一条退化对照 smoke）
+- Modify: `qwen3-learning/Qwen3_训练推理完整学习笔记.md`（新增 §12）
+- Modify: `qwen3-learning/Qwen3_{RMSNorm,RoPE,QK-Norm,GQA,SwiGLU}_*.md`（各加一行指针）
+- Modify: `qwen3-learning/qwen3-pytorch设计.md`（§9 / §11 / §12 同步）
 - Modify: `feature_list.json`
-- Modify: `qwen3-learning/Qwen3_*.md`（把消融结论写进笔记）
 
 > **这是 Qwen3 线最有价值的产出**：把 7 篇笔记里的每个改动点，从「文字断言」变成「一次可跑的消融」。
 
-- [ ] **Step 1: 设计退化开关**
+- [x] **Step 1: 设计退化开关**
 
-Qwen3 模型需要支持 4 个开关：
+Qwen3 模型支持 5 个开关（全部加在 `config.Qwen3Config` 里，**默认值 = 主线行为**）：
 
 | 开关 | 关掉后 | 对应 GPT-2 的什么 |
 |---|---|---|
 | `use_gqa` | `n_head_kv = n_head` | MHA |
-| `use_rope` | 不加位置信息 | learned PE（`wpe`） |
+| `use_rope` | 不用 RoPE，改用**加法式**位置嵌入 `wpe` | 固定的 sinusoidal PE |
 | `use_qk_norm` | Q/K 不做 RMSNorm | 无（GPT-2 没有） |
-| `mlp` | `"swiglu"` → `"gelu"` | `Linear → GELU → Linear` |
+| `mlp_type` | `"swiglu"` → `"gelu"` | `Linear → GELU → Linear` |
+| `norm_type` | `"rmsnorm"` → `"layernorm"` | `nn.LayerNorm` |
 
-**关键难点（必须在代码注释里写清楚，否则读不懂为什么能对齐）**：
+**★ 开关默认全开 ⇒ 主线行为一字未改**
 
-1. **位置编码**：GPT-2 用 **learned** `pos_emb`（可训练参数），
-   Qwen3 用 **RoPE**（无参数）。`use_rope=False` 时，Qwen3 侧需要一个等价的
-   learned PE 才能对齐 —— 做法是给 Qwen3 加一个 `wpe` 参数，
-   训练/加载时把 GPT-2 的 `pos_emb.weight` 拷进去（两者形状都是 (block_size, n_embd)）。
-   注意 GPT-2 的 `pos_emb` 是 `persistent=False` 的 buffer，不在 `state_dict` 里，
-   所以要单独构造。
+`config.py` 只多 5 个字段，主线训练 / 评估走的还是老路径。
+回归断言在 `tests/test_compare_with_gpt2.py` 第 4 组：
+默认配置下模型**没有** `wpe`、**有** `q_norm`、FFN 是 `SwiGLUMLP`、`ln_f` 是 `RMSNorm`。
 
-2. **LayerNorm vs RMSNorm**：GPT-2 用 `nn.LayerNorm`（减均值），
-   Qwen3 用 RMSNorm（不减均值）。**这两个在数学上不等价**，
-   所以「完全对齐」的前提之一是：对照时两边都换成同一种归一化。
-   **推荐做法**：在对照脚本里两边都用 LayerNorm，再比。
-   否则 max_abs_diff 根本压不到 1e-4。
+**★ 三个「前提」：少一个就永远对不齐（初稿只写了一个）**
 
-3. **MLP 结构**：GPT-2 是 2 矩阵（`c_fc` → GELU → `c_proj`），
-   Qwen3 SwiGLU 是 3 矩阵（gate/up/down）。退化到 GELU 时，
-   把 `gate_proj` 丢弃、`up_proj` 映射到 `c_fc`、`down_proj` 映射到 `c_proj`。
+1. **`head_dim` 必须回退**成 `n_embd // n_head`（= 32）。
+   Qwen3 主线故意把 `head_dim` 与 `n_embd` **解耦**（48 ⇒ `4×48 = 192 ≠ 128`），
+   而 GPT-2 的 `head_dim` 是算出来的。不退回去 ⇒ `o_proj` 的输入维度对不上
+   ⇒ **权重根本没法映射**，不是精度问题。
+2. **中间层维度必须回退**成 GPT-2 的 `n_inner = 4·n_embd`（= 512）。
+   Qwen3 主线是 8/3 规则的 384 —— 那是 SwiGLU 专用的宽度。
+3. **归一化必须两边同步切**，且 **eps 也要一样**（取 GPT-2 的 `nn.LayerNorm` 默认 `1e-5`）。
+   RMSNorm（不减均值、无 bias）与 LayerNorm（减均值、有 bias）数学上不等价；
+   eps 又在 `sqrt(var + eps)` 内部，`1e-5` vs `1e-6` 差 ~1%，
+   不同步的话这个变量会和「减不减均值」混在一起，分不清。
 
-4. **权重绑定与 bias**：GPT-2 的 `bias=False`、Qwen3 的 `attention_bias=False` 对齐；
-   两边 lm_head 都与 tok_emb 绑定，不用单独映射。
-
-- [ ] **Step 2: 写 `ablations/compare_with_gpt2.py`**
+- [x] **Step 2: 写 `ablations/compare_with_gpt2.py`**
 
 ```python
 """
 feat-017：Qwen3 与 GPT-2 的结构等价性对照实验。
 
 【目的】
-    把「Qwen3 相对 GPT-2 改了什么」从文字断言变成一次可跑的实验。
+    把「Qwen3 相对 GPT-2 改了什么」从**文字断言**变成**一次可跑的实验**。
+    做法：把 Qwen3 的 5 个组件开关全部关掉，退化成与 GPT-2 相同的结构，
+    再把 GPT-2 的权重逐层映射进退化的 Qwen3，比对同输入下的 logits。
 
-【做法】
-    把 Qwen3 的 4 个组件开关全部关掉，退化成与 GPT-2 相同的结构，
-    再把 GPT-2 的权重逐层映射进退化的 Qwen3，比对同输入下的输出。
+【为什么这个对照有意义】
+    7 篇 Qwen3 笔记里满是「Qwen3 用了 RoPE / GQA / QK-Norm / SwiGLU / RMSNorm」
+    这样的陈述，但**没有一个数字**能说明「这些改动到底改变了什么」。
+    本脚本给出的就是那个数字：
+        · 全关 ⇒ 与 GPT-2 的输出差异 < 1e-4（说明退化是**真的**退化成 GPT-2）
+        · 只开某一个 ⇒ 差异 > 1e-4（说明那个组件**确实**改变了模型行为）
+    两组数字合起来才是完整的论证。
 
-【参数名映射表（写在代码里，便于核对）】
-    GPT-2                              →  Qwen3（退化后）
+【参数名映射表（GPT-2 → 退化的 Qwen3）】
     ---------------------------------------------------------------------------
-    tok_emb.weight                     →  wte.weight
-    pos_emb（buffer，非 state_dict）   →  wpe.weight        [use_rope=False 时新建]
-    blocks.{i}.ln_1.{weight,bias}      →  blocks.{i}.ln_1.{weight,bias}
-    blocks.{i}.attn.c_attn.weight      →  blocks.{i}.attn.qkv.weight   （拆分后重组）
-    blocks.{i}.attn.c_proj.weight      →  blocks.{i}.attn.o_proj.weight
-    blocks.{i}.ln_2.{weight,bias}      →  blocks.{i}.ln_2.{weight,bias}
-    blocks.{i}.mlp.c_fc.weight         →  blocks.{i}.mlp.up.weight     [mlp='gelu']
-    blocks.{i}.mlp.c_proj.weight       →  blocks.{i}.mlp.down.weight  [mlp='gelu']
-    ln_f.{weight,bias}                 →  ln_f.{weight,bias}
+    GPT-2                                   →  Qwen3（退化后）
+    ---------------------------------------------------------------------------
+    tok_emb.weight                          →  wte.weight
+    pos_emb（buffer，不在 state_dict 里）    →  wpe.weight      [仅 use_rope=False]
+    blocks.{i}.ln_1.weight / .bias          →  blocks.{i}.ln_1.weight / .bias
+                                             （norm_type='layernorm' 时同名同义；
+                                               norm_type='rmsnorm' 时 → .gain，且丢弃 bias）
+    blocks.{i}.attn.c_attn.weight[0:C]      →  blocks.{i}.attn.q_proj.weight
+    blocks.{i}.attn.c_attn.weight[C:2C]     →  blocks.{i}.attn.k_proj.weight
+    blocks.{i}.attn.c_attn.weight[2C:3C]    →  blocks.{i}.attn.v_proj.weight
+        （GPT-2 用**一个** c_attn 一次投出 Q/K/V；Qwen3 因 head_dim 与 n_embd 解耦，
+          必须拆成三个投影。GQA 打开时 K/V 只取前 n_head_kv·head_dim 行。）
+    blocks.{i}.attn.c_proj.weight           →  blocks.{i}.attn.o_proj.weight
+    blocks.{i}.ln_2.weight / .bias          →  blocks.{i}.ln_2.weight / .bias
+    blocks.{i}.mlp.c_fc.weight               →  blocks.{i}.mlp.up_proj.weight   [mlp_type='gelu']
+    blocks.{i}.mlp.c_proj.weight             →  blocks.{i}.mlp.down_proj.weight [mlp_type='gelu']
+    ln_f.weight / .bias                     →  ln_f.weight / .bias
     （lm_head 与 tok_emb 绑定，两边都绑定，不用单独映射）
 
+【关键的三个「前提」，少一个就对不齐】
+    1) **head_dim 必须解耦回 GPT-2 的取法**：GPT-2 是 head_dim = n_embd // n_head = 32，
+       Qwen3 主线是 head_dim = 48（n_head·head_dim = 192 ≠ n_embd = 128）。
+       退化配置里必须把 head_dim 设回 32，否则 o_proj 的输入维度都对不上。
+    2) **中间层维度必须对齐**：GPT-2 的 n_inner = 4·n_embd = 512，
+       Qwen3 主线的 intermediate_size = 384（8/3 规则）。退化配置取 512。
+    3) **归一化必须两边同步**：RMSNorm（不减均值）与 LayerNorm（减均值）数学上不等价，
+       所以退化配置里 Qwen3 也用 LayerNorm（norm_type='layernorm'），
+       并且 eps 取 GPT-2 的 nn.LayerNorm 默认值 1e-5。
+       —— 这一条是**前提**而不是「组件」，所以单列一行（norm_type='rmsnorm'）来量化它。
+
 【阈值】
-    max_abs_diff < 1e-4（fp32）。设计.md §11 允许放宽，但要先确认不是 bug。
+    max_abs_diff < 1e-4（fp32）。设计.md §11 允许放宽，但必须先确认不是 bug。
+
+【怎么跑】
+    cd qwen3-learning/qwen3-pytorch
+    python ablations/compare_with_gpt2.py
+    python ablations/compare_with_gpt2.py --threshold 1e-5
 """
 
 import argparse
+import importlib.util
+import os
+import sys
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+# --- 路径引导 ---------------------------------------------------------------
+# 本文件在 qwen3-pytorch/ablations/ 下，sys.path[0] 是 ablations/，
+# 要 import 项目根下的 config / model，必须把项目根补进去。
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# GPT-2 线在 llm-learning/gpt-learning/gpt-learning-pytorch/ 下。
+# ⚠️ 目录层数：ablations → qwen3-pytorch → qwen3-learning → llm-learning
+#    ⇒ 需要 **4 层** dirname 才能到 llm-learning 根目录。
+#    （开发计划 Task 18 的初稿只写了 3 层 dirname，指向的是不存在的
+#      qwen3-learning/gpt-learning/... —— 已就地纠正）
+REPO_ROOT = os.path.dirname(os.path.dirname(PROJECT_ROOT))
+GPT2_DIR = os.path.join(REPO_ROOT, "gpt-learning", "gpt-learning-pytorch")
+
+from config import Qwen3Config  # noqa: E402
+from model.qwen3_dense import Qwen3Dense  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# 加载 GPT-2 线的模型定义
+# ---------------------------------------------------------------------------
+def load_gpt2_module():
+    """
+    按**文件路径**加载 GPT-2 线的 `model/gpt2.py`。
+
+    【为什么不用 `sys.path.insert(0, GPT2_DIR)` 然后 `from model.gpt2 import GPT2`】
+        本项目里 `model` 这个包名**已经被 Qwen3 线占用了**（qwen3-pytorch/model/）。
+        只要 Qwen3 的 `model` 包先被 import 过，Python 的 `import model.gpt2`
+        就会去 Qwen3 的 model/ 里找 gpt2.py —— 找不到，直接 ImportError。
+        改用一个**不冲突的模块名**（gpt2_ref）按路径加载即可绕开。
+        这也是「主线代码不跨目录 import」这条约束在本脚本里的落地方式：
+        只有 ablations/ 里这一个文件单向引用 GPT-2 线。
+
+    返回：
+        加载好的模块对象
+    """
+    gpt2_path = os.path.join(GPT2_DIR, "model", "gpt2.py")
+    if not os.path.exists(gpt2_path):
+        raise FileNotFoundError(
+            f"找不到 GPT-2 线的模型定义：{gpt2_path}\n"
+            "对照实验需要 gpt-learning/gpt-learning-pytorch/model/gpt2.py"
+        )
+    spec = importlib.util.spec_from_file_location("gpt2_ref", gpt2_path)
+    assert spec is not None and spec.loader is not None, f"无法加载 {gpt2_path}"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["gpt2_ref"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# ---------------------------------------------------------------------------
+# 对照用的形状参数（全部照抄 GPT-2 线的 config）
+# ---------------------------------------------------------------------------
+GPT2_N_LAYER = 4
+GPT2_N_HEAD = 4
+GPT2_N_EMBD = 128
+GPT2_N_INNER = 512          # = 4 * n_embd
+GPT2_BLOCK_SIZE = 128
+GPT2_HEAD_DIM = GPT2_N_EMBD // GPT2_N_HEAD   # 32 —— 与 Qwen3 主线的 48 不同
+
+
+def degraded_config(**overrides) -> Qwen3Config:
+    """
+    构造「退化到 GPT-2 结构」的 Qwen3 配置。
+
+    默认值即**全关**状态：
+        use_gqa=False      → n_head_kv = n_head（MHA）
+        use_rope=False     → 用加法式 wpe 承担位置信息
+        use_qk_norm=False  → Q/K 不做 RMSNorm
+        mlp_type='gelu'    → 两矩阵 FFN
+        norm_type='layernorm' → 与 GPT-2 同步切到 LayerNorm
+
+    参数：
+        overrides: 覆盖任意字段
+    返回：
+        Qwen3Config
+    """
+    base = dict(
+        n_layer=GPT2_N_LAYER,
+        n_head=GPT2_N_HEAD,
+        n_embd=GPT2_N_EMBD,
+        n_head_kv=GPT2_N_HEAD,          # use_gqa=False 时会被忽略，但填成 MHA 更直观
+        head_dim=GPT2_HEAD_DIM,        # ★ 必须回退成 n_embd // n_head
+        intermediate_size=GPT2_N_INNER,  # ★ 必须等于 GPT-2 的 n_inner
+        block_size=GPT2_BLOCK_SIZE,
+        dropout=0.0,
+        attention_bias=False,          # GPT-2 bias=False
+        tie_embeddings=True,
+        rms_eps=1e-5,                  # = GPT-2 的 nn.LayerNorm 默认 eps
+        use_gqa=False,
+        use_rope=False,
+        use_qk_norm=False,
+        mlp_type="gelu",
+        norm_type="layernorm",
+    )
+    base.update(overrides)
+    return Qwen3Config(**base)
+
+
+# ---------------------------------------------------------------------------
+# 权重映射
+# ---------------------------------------------------------------------------
+def build_target_state(
+    gpt2,
+    qwen3: Qwen3Dense,
+    cfg: Qwen3Config,
+) -> Dict[str, "torch.Tensor"]:
+    """
+    构造「退化 Qwen3 应有的 state_dict」，内容全部来自 GPT-2。
+
+    做法：以 qwen3 自己的 state_dict 为底（没被映射到的键保持它自己的初值），
+    再逐条覆盖被映射的键。这样 `load_state_dict(..., strict=True)` 一定不报缺键。
+
+    参数：
+        gpt2:   GPT-2 线模型实例
+        qwen3:  退化后的 Qwen3 模型实例
+        cfg:    qwen3 用的配置（决定映射走哪条分支）
+    返回：
+        state_dict（可直接喂给 load_state_dict）
+    """
+    g = gpt2.state_dict()
+    sd = {k: v.detach().clone() for k, v in qwen3.state_dict().items()}
+    C = cfg.n_embd
+
+    # --- token embedding / lm_head（两边都绑定，映射一份就够）---
+    sd["wte.weight"] = g["tok_emb.weight"].detach().clone()
+    if "lm_head.weight" in sd:
+        sd["lm_head.weight"] = g["tok_emb.weight"].detach().clone()
+
+    # --- 位置嵌入 ---
+    # GPT-2 的 pos_emb 是 register_buffer(persistent=False) ⇒ **不在 state_dict 里**，
+    # 必须从模型实例上直接取（gpt2.pos_emb）。
+    # ⚠️ 开发计划初稿说 GPT-2 用的是「learned PE（可训练参数）」——**这是错的**：
+    #    本仓 GPT-2 的 pos_emb 是**固定的 sinusoidal buffer**，不训练。
+    #    对齐只关心数值，不关心它是否可训练，所以把同一张表拷进 wpe 即可。
+    if "wpe.weight" in sd:
+        sd["wpe.weight"] = gpt2.pos_emb.detach().clone()
+
+    # --- 逐层映射 ---
+    for i in range(cfg.n_layer):
+        p = f"blocks.{i}."
+
+        # (a) 注意力：GPT-2 的 c_attn 是 (3C, C) 的融合 Linear，拆成 Q/K/V 三段
+        c_attn = g[p + "attn.c_attn.weight"]
+        q_rows = cfg.n_head * cfg.head_dim
+        kv_rows = cfg.n_head_kv * cfg.head_dim
+        sd[p + "attn.q_proj.weight"] = c_attn[0:q_rows].detach().clone()
+        sd[p + "attn.k_proj.weight"] = c_attn[C:C + kv_rows].detach().clone()
+        sd[p + "attn.v_proj.weight"] = c_attn[2 * C:2 * C + kv_rows].detach().clone()
+        sd[p + "attn.o_proj.weight"] = g[p + "attn.c_proj.weight"].detach().clone()
+
+        # (b) 归一化：RMSNorm 只有 gain（对应 GPT-2 的 weight），LayerNorm 有 weight+bias
+        for nm in ("ln_1", "ln_2"):
+            if cfg.norm_type == "layernorm":
+                sd[p + nm + ".weight"] = g[p + nm + ".weight"].detach().clone()
+                sd[p + nm + ".bias"] = g[p + nm + ".bias"].detach().clone()
+            else:
+                # RMSNorm：把 GPT-2 的 weight 当 gain 用，bias 丢弃（RMSNorm 没有 bias）
+                sd[p + nm + ".gain"] = g[p + nm + ".weight"].detach().clone()
+
+        # (c) FFN
+        if cfg.mlp_type == "gelu":
+            sd[p + "mlp.up_proj.weight"] = g[p + "mlp.c_fc.weight"].detach().clone()
+            sd[p + "mlp.down_proj.weight"] = g[p + "mlp.c_proj.weight"].detach().clone()
+        else:
+            # SwiGLU 多一个 gate 分支，GPT-2 没有对应物 ⇒ gate_proj 保持随机初值。
+            # 这一行测的是「SwiGLU 相对 GELU 的行为差异」，
+            # 其中 gate 分支的贡献无法与 GPT-2 对齐，只能保留随机 —— 已在笔记中说明。
+            sd[p + "mlp.up_proj.weight"] = g[p + "mlp.c_fc.weight"].detach().clone()
+            sd[p + "mlp.down_proj.weight"] = g[p + "mlp.c_proj.weight"].detach().clone()
+
+    # --- final norm ---
+    if cfg.norm_type == "layernorm":
+        sd["ln_f.weight"] = g["ln_f.weight"].detach().clone()
+        sd["ln_f.bias"] = g["ln_f.bias"].detach().clone()
+    else:
+        sd["ln_f.gain"] = g["ln_f.weight"].detach().clone()
+
+    return sd
+
+
+# ---------------------------------------------------------------------------
+# 单个对照用例
+# ---------------------------------------------------------------------------
+def run_case(
+    name: str,
+    cfg: Qwen3Config,
+    vocab_size: int,
+    idx: "torch.Tensor",
+    seed: int = 42,
+) -> dict:
+    """
+    跑一个对照用例：造 GPT-2、造退化的 Qwen3、映射权重、比对输出。
+
+    参数：
+        name:        用例名（打印用）
+        cfg:         退化 Qwen3 的配置
+        vocab_size:  词表大小（两边必须一样）
+        idx:         测试输入 (B, T)
+        seed:        随机种子（GPT-2 的随机初值由它决定）
+    返回：
+        {"name", "max_abs_diff", "rel_diff", "logit_scale", "passed"}
+    """
+    gpt2_mod = load_gpt2_module()
+    GPT2 = gpt2_mod.GPT2
+
+    torch.manual_seed(seed)
+    gpt2 = GPT2(
+        vocab_size=vocab_size,
+        n_layer=cfg.n_layer,
+        n_head=cfg.n_head,
+        n_embd=cfg.n_embd,
+        n_inner=cfg.intermediate_size,
+        block_size=cfg.block_size,
+        dropout=0.0,
+        bias=cfg.attention_bias,
+    )
+    gpt2.eval()
+
+    torch.manual_seed(seed)
+    qwen3 = Qwen3Dense(vocab_size=vocab_size, cfg=cfg, dropout=0.0)
+    qwen3.load_state_dict(build_target_state(gpt2, qwen3, cfg), strict=True)
+    qwen3.eval()
+
+    with torch.no_grad():
+        g_logits = gpt2(idx)[0]
+        q_logits = qwen3(idx)[0]
+
+    assert g_logits.shape == q_logits.shape, \
+        f"两边 logits 形状不一致：{tuple(g_logits.shape)} vs {tuple(q_logits.shape)}"
+
+    max_abs_diff = float((g_logits - q_logits).abs().max().item())
+    logit_scale = float(g_logits.abs().max().item())
+    rel = max_abs_diff / logit_scale if logit_scale > 0 else float("inf")
+
+    return {
+        "name": name,
+        "max_abs_diff": max_abs_diff,
+        "rel_diff": rel,
+        "logit_scale": logit_scale,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 消融表
+# ---------------------------------------------------------------------------
+def build_cases() -> List[Tuple[str, Qwen3Config, str]]:
+    """
+    构造消融表的所有用例。
+
+    每一行都是「**只有这一个组件开着**」，其余全部退化掉。
+    这样每一行的 diff 都可以直接归因到那一个组件。
+
+    返回：
+        [(用例名, 配置, 这一行改了什么), ...]
+    """
+    cases: List[Tuple[str, Qwen3Config, str]] = [
+        ("全关（退化成 GPT-2）",
+         degraded_config(),
+         "GQA→MHA、RoPE→sinusoidal wpe、QK-Norm→无、SwiGLU→GELU、RMSNorm→LayerNorm"),
+        ("只开 use_gqa",
+         degraded_config(use_gqa=True, n_head_kv=2),
+         "GQA：n_head_kv=2（K/V 只有一半的 head）"),
+        ("只开 use_rope",
+         degraded_config(use_rope=True),
+         "RoPE：位置信息旋转进 Q/K，**不再有加法式位置嵌入**"),
+        ("只开 use_qk_norm",
+         degraded_config(use_qk_norm=True),
+         "QK-Norm：Q/K 各过一次 RMSNorm"),
+        ("只开 mlp=swiglu",
+         degraded_config(mlp_type="swiglu"),
+         "SwiGLU：多一个 gate 分支（GPT-2 没有对应物，保持随机初值）"),
+        ("只开 norm=rmsnorm",
+         degraded_config(norm_type="rmsnorm"),
+         "RMSNorm 取代 LayerNorm：不减均值、无 bias（**对照实验的前提**）"),
+    ]
+    return cases
+
+
+def run_all(threshold: float = 1e-4, seq_len: int = 16, batch: int = 2,
+            vocab_size: int = 293, seed: int = 42) -> dict:
+    """
+    跑完整张消融表。
+
+    参数：
+        threshold: 全关那一行的 max_abs_diff 上限
+        seq_len:   测试序列长度
+        batch:     batch size
+        vocab_size: 词表大小
+        seed:      随机种子
+    返回：
+        {"cases": [...], "baseline_passed": bool, "all_passed": bool, "threshold": float}
+    """
+    torch.manual_seed(seed)
+    idx = torch.randint(0, vocab_size, (batch, seq_len), dtype=torch.long)
+
+    results = []
+    for name, cfg, desc in build_cases():
+        r = run_case(name, cfg, vocab_size, idx, seed=seed)
+        r["desc"] = desc
+        r["cfg"] = cfg
+        results.append(r)
+
+    baseline = results[0]
+    baseline_passed = baseline["max_abs_diff"] < threshold
+    # 单开组件的行必须**显著**偏离基线（> threshold），
+    # 否则说明那个组件在结构上其实没起作用 —— 消融表就没有说服力。
+    component_rows_passed = all(
+        r["max_abs_diff"] > threshold for r in results[1:]
+    )
+
+    return {
+        "cases": results,
+        "baseline_passed": baseline_passed,
+        "component_rows_passed": component_rows_passed,
+        "all_passed": baseline_passed and component_rows_passed,
+        "threshold": threshold,
+    }
+
+
+def format_table(result: dict) -> str:
+    """把结果格式化成一张对齐的文本表。"""
+    thr = result["threshold"]
+    lines = []
+    lines.append(
+        f"{'配置':<26}{'max_abs_diff':>14}{'相对差':>10}{'logit 量级':>12}   判定"
+    )
+    lines.append("-" * 82)
+    for i, r in enumerate(result["cases"]):
+        if i == 0:
+            verdict = "PASS（< %.0e）" % thr if result["baseline_passed"] else "FAIL（应 < %.0e）" % thr
+        else:
+            verdict = "OK（> %.0e）" % thr if r["max_abs_diff"] > thr else "FAIL（应 > %.0e）" % thr
+        lines.append(
+            f"{r['name']:<26}{r['max_abs_diff']:>14.3e}{r['rel_diff']:>10.2e}"
+            f"{r['logit_scale']:>12.4f}   {verdict}"
+        )
+    lines.append("-" * 82)
+    for i, r in enumerate(result["cases"]):
+        lines.append(f"  · {r['name']}：{r['desc']}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    """命令行入口。返回进程退出码。"""
+    parser = argparse.ArgumentParser(description="feat-017 退化对照")
+    parser.add_argument("--threshold", type=float, default=1e-4,
+                        help="全关那一行的 max_abs_diff 上限（默认 1e-4）")
+    parser.add_argument("--seq-len", type=int, default=16, help="测试序列长度")
+    parser.add_argument("--batch", type=int, default=2, help="batch size")
+    parser.add_argument("--vocab-size", type=int, default=293, help="词表大小")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    args = parser.parse_args()
+
+    result = run_all(
+        threshold=args.threshold,
+        seq_len=args.seq_len,
+        batch=args.batch,
+        vocab_size=args.vocab_size,
+        seed=args.seed,
+    )
+
+    print("[compare] Qwen3 ↔ GPT-2 退化对照")
+    print(format_table(result))
+    print(f"[compare] 基线（全关）通过：{result['baseline_passed']}；"
+          f"单开组件的行均显著偏离：{result['component_rows_passed']}")
+
+    if not result["all_passed"]:
+        print("[compare] 未通过", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+- [x] **Step 3: 写 `tests/test_compare_with_gpt2.py`**
+
+```python
+"""
+退化对照实验的 smoke（feat-017）。
+
+对应开发计划 Task 18。
+
+跑的是「Qwen3 退化成 GPT-2 结构后，输出还能不能对齐」这一条结论，
+外加两条**反证**：证明它不是「碰巧通过」。
+
+运行：python tests/test_compare_with_gpt2.py
+"""
+
 import os
 import sys
 
 import torch
 
-# GPT-2 线在 gpt-learning/gpt-learning-pytorch/ 下，本脚本需要 import 它的模型定义。
-# 这是**跨目录 import**，但只发生在对照实验里，且是单向的（Qwen3 → GPT-2），
-# 不违反「Qwen3 主线代码不跨目录 import」的约束（主线 model/ 与 train/ 都不 import GPT-2）。
-GPT2_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "gpt-learning", "gpt-learning-pytorch",
+# 直接执行 `python tests/test_compare_with_gpt2.py` 时 sys.path[0] 是 tests/，
+# 找不到项目根下的 config.py / ablations/ —— 这里把项目根补进 sys.path。
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from ablations.compare_with_gpt2 import (  # noqa: E402
+    GPT2_N_INNER,
+    build_cases,
+    build_target_state,
+    degraded_config,
+    load_gpt2_module,
+    run_all,
 )
-sys.path.insert(0, GPT2_DIR)
+from config import DENSE_CONFIG  # noqa: E402
+from model.qwen3_dense import Qwen3Dense  # noqa: E402
 
-from model.gpt2 import GPT2  # noqa: E402
+THRESHOLD = 1e-4
+VOCAB = 293
+SEQ_LEN = 16
+BATCH = 2
 
+# =====================================================================
+# 1) 消融表跑通：6 行，全关那行 < 1e-4，单开组件的行都 > 1e-4
+# =====================================================================
+result = run_all(threshold=THRESHOLD, seq_len=SEQ_LEN, batch=BATCH, vocab_size=VOCAB)
+cases = result["cases"]
 
-def compare(max_abs_diff_threshold: float = 1e-4) -> dict:
-    """
-    跑一次对照实验。
+assert len(cases) == 6, f"消融表应有 6 行（1 基线 + 5 单组件），实得 {len(cases)}"
 
-    返回：
-        {"max_abs_diff": float, "passed": bool}
-    """
-    # ---- 造 GPT-2 ----
-    gpt2 = GPT2(vocab_size=64, n_layer=2, n_head=4, n_embd=128, n_inner=512,
-                block_size=128, dropout=0.0, bias=False)
-    gpt2.eval()
+baseline = cases[0]
+assert baseline["max_abs_diff"] < THRESHOLD, \
+    f"全关（退化成 GPT-2）时 max_abs_diff 应 < {THRESHOLD}，实得 {baseline['max_abs_diff']:.3e}"
+print(f"[compare] 全关（退化成 GPT-2）max_abs_diff = {baseline['max_abs_diff']:.3e} "
+      f"（阈值 {THRESHOLD:.0e}）")
 
-    # ---- 造退化的 Qwen3 ----
-    #   use_gqa=False    → n_head_kv = n_head
-    #   use_rope=False   → 用 learned PE 替代 RoPE
-    #   use_qk_norm=False→ 不做 QK-Norm
-    #   mlp='gelu'       → 两矩阵 FFN
-    #   norm='layernorm' → 两边都用 LayerNorm（关键，见上文难点 2）
-    ...
-    return {"max_abs_diff": max_diff, "passed": max_diff < max_abs_diff_threshold}
+for r in cases[1:]:
+    assert r["max_abs_diff"] > THRESHOLD, \
+        f"单开组件「{r['name']}」的 max_abs_diff 应 > {THRESHOLD}，" \
+        f"实得 {r['max_abs_diff']:.3e} —— 该组件在结构上没起作用，消融表失去说服力"
+    print(f"[compare] {r['name']:<16} max_abs_diff = {r['max_abs_diff']:.3e} "
+          f"（相对差 {r['rel_diff']:.2e}）")
 
+# =====================================================================
+# 2) 反证 A：**不加载权重**时，退化的 Qwen3 与 GPT-2 必须差很远
+#    —— 证明第 1 组不是「拿自己跟自己比」
+# =====================================================================
+gpt2_mod = load_gpt2_module()
+GPT2 = gpt2_mod.GPT2
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="feat-017 退化对照")
-    parser.add_argument("--threshold", type=float, default=1e-4)
-    args = parser.parse_args()
-    result = compare(args.threshold)
-    print(f"[compare] max_abs_diff = {result['max_abs_diff']:.3e}  "
-          f"passed = {result['passed']}")
-    if not result["passed"]:
-        sys.exit(1)
+torch.manual_seed(42)
+gpt2 = GPT2(vocab_size=VOCAB, n_layer=4, n_head=4, n_embd=128, n_inner=GPT2_N_INNER,
+            block_size=128, dropout=0.0, bias=False)
+gpt2.eval()
+
+cfg = degraded_config()
+torch.manual_seed(7)          # 故意用**不同**的种子 ⇒ Qwen3 是随机权重
+qwen3_random = Qwen3Dense(vocab_size=VOCAB, cfg=cfg, dropout=0.0)
+qwen3_random.eval()
+
+idx = torch.randint(0, VOCAB, (BATCH, SEQ_LEN), dtype=torch.long)
+with torch.no_grad():
+    diff_no_map = float((gpt2(idx)[0] - qwen3_random(idx)[0]).abs().max().item())
+assert diff_no_map > 1e-3, \
+    f"不加载权重时两者应当差很多（实测 {diff_no_map:.3e}）—— 说明第 1 组不是假通过"
+print(f"[compare] 反证 A：不加载权重 → max_abs_diff = {diff_no_map:.3e}（远大于阈值）")
+
+# =====================================================================
+# 3) 反证 B：**权重确实搬过去了**（逐条核对映射表）
+# =====================================================================
+torch.manual_seed(42)
+qwen3 = Qwen3Dense(vocab_size=VOCAB, cfg=cfg, dropout=0.0)
+sd = build_target_state(gpt2, qwen3, cfg)
+qwen3.load_state_dict(sd, strict=True)      # strict=True：键名对不上就当场红
+
+g = gpt2.state_dict()
+assert torch.equal(qwen3.wte.weight, g["tok_emb.weight"]), "wte ← tok_emb 映射失败"
+assert torch.equal(qwen3.wpe.weight, gpt2.pos_emb), "wpe ← pos_emb 映射失败"
+C = cfg.n_embd
+assert torch.equal(qwen3.blocks[0].attn.q_proj.weight, g["blocks.0.attn.c_attn.weight"][0:C]), \
+    "q_proj ← c_attn[0:C] 映射失败"
+assert torch.equal(qwen3.blocks[0].attn.k_proj.weight, g["blocks.0.attn.c_attn.weight"][C:2 * C]), \
+    "k_proj ← c_attn[C:2C] 映射失败"
+assert torch.equal(qwen3.blocks[0].attn.v_proj.weight, g["blocks.0.attn.c_attn.weight"][2 * C:3 * C]), \
+    "v_proj ← c_attn[2C:3C] 映射失败"
+assert torch.equal(qwen3.blocks[0].attn.o_proj.weight, g["blocks.0.attn.c_proj.weight"]), \
+    "o_proj ← c_proj 映射失败"
+assert torch.equal(qwen3.blocks[0].mlp.up_proj.weight, g["blocks.0.mlp.c_fc.weight"]), \
+    "mlp.up_proj ← c_fc 映射失败"
+assert torch.equal(qwen3.blocks[0].mlp.down_proj.weight, g["blocks.0.mlp.c_proj.weight"]), \
+    "mlp.down_proj ← c_proj 映射失败"
+assert torch.equal(qwen3.ln_f.weight, g["ln_f.weight"]), "ln_f.weight 映射失败"
+assert torch.equal(qwen3.ln_f.bias, g["ln_f.bias"]), "ln_f.bias 映射失败"
+print("[compare] 反证 B：权重映射表逐条核对通过（wte / wpe / q,k,v,o / up,down / ln_f）")
+
+# =====================================================================
+# 4) 消融开关**默认关闭** ⇒ 主线行为一字未改
+#    （这是「不污染主线」的硬保证：默认配置下连模块都不该多出来）
+# =====================================================================
+assert DENSE_CONFIG.use_gqa is True
+assert DENSE_CONFIG.use_rope is True
+assert DENSE_CONFIG.use_qk_norm is True
+assert DENSE_CONFIG.mlp_type == "swiglu"
+assert DENSE_CONFIG.norm_type == "rmsnorm"
+
+main_model = Qwen3Dense(vocab_size=VOCAB, cfg=DENSE_CONFIG, dropout=0.0)
+assert main_model.wpe is None, "主线配置不应存在 wpe（位置信息由 RoPE 承担）"
+assert hasattr(main_model.blocks[0].attn, "q_norm"), "主线配置应有 QK-Norm"
+assert hasattr(main_model.blocks[0], "mlp") and main_model.blocks[0].mlp.__class__.__name__ == "SwiGLUMLP", \
+    "主线配置的 FFN 应是 SwiGLUMLP"
+assert main_model.ln_f.__class__.__name__ == "RMSNorm", "主线配置的 final norm 应是 RMSNorm"
+
+# 退化配置：模块确实换掉了
+deg = Qwen3Dense(vocab_size=VOCAB, cfg=degraded_config(), dropout=0.0)
+assert deg.wpe is not None, "退化配置（use_rope=False）应有 wpe"
+assert not hasattr(deg.blocks[0].attn, "q_norm"), "退化配置不应有 QK-Norm"
+assert deg.blocks[0].mlp.__class__.__name__ == "GELUMLP", "退化配置的 FFN 应是 GELUMLP"
+assert deg.ln_f.__class__.__name__ == "LayerNorm", "退化配置的 final norm 应是 LayerNorm"
+assert deg.blocks[0].attn.n_head_kv == cfg.n_head, "use_gqa=False 时 n_head_kv 应等于 n_head"
+print("[compare] 反证 C：主线默认配置行为不变（无 wpe / 有 QK-Norm / SwiGLU / RMSNorm）")
+
+# =====================================================================
+# 5) 退化配置的关键形状必须回退成 GPT-2 的取法（否则对不齐的根因在这）
+# =====================================================================
+assert cfg.head_dim == cfg.n_embd // cfg.n_head, "head_dim 必须回退成 n_embd // n_head"
+assert cfg.intermediate_size == 4 * cfg.n_embd, "中间层必须等于 GPT-2 的 n_inner = 4·n_embd"
+assert cfg.rms_eps == 1e-5, "eps 必须取 GPT-2 的 nn.LayerNorm 默认值 1e-5"
+assert cfg.attention_bias is False, "bias 必须与 GPT-2 一致（False）"
+
+# =====================================================================
+# 6) 消融表的每一行都必须是「只开一个组件」
+# =====================================================================
+names = [r[0] for r in build_cases()]
+assert names[0].startswith("全关")
+for r in build_cases()[1:]:
+    c = r[1]
+    on = [
+        c.use_gqa, c.use_rope, c.use_qk_norm,
+        c.mlp_type == "swiglu", c.norm_type == "rmsnorm",
+    ]
+    assert sum(on) == 1, f"「{r[0]}」应当只开一个组件，实得 {on}"
+
+print("test_compare_with_gpt2 OK  全关=0 差异 + 5 个单组件行均显著偏离 + 3 条反证")
 ```
 
-- [ ] **Step 3: 逐个组件做消融（逐个打开开关，逐个记录差异）**
-
-不要只跑「全关」这一个点。**逐个组件打开**，记录每一步的 max_abs_diff：
-
-| 配置 | 预期 |
-|---|---|
-| 全关（use_gqa=F, use_rope=F, use_qk_norm=F, mlp=gelu, norm=layernorm） | < 1e-4 |
-| 只开 use_gqa（n_head_kv < n_head） | > 1e-4（结构变了） |
-| 只开 use_rope | > 1e-4 |
-| 只开 use_qk_norm | > 1e-4 |
-| 只开 mlp=swiglu | > 1e-4 |
-
-这张表就是「每个组件到底改了什么」的量化答案，**写进 Qwen3 笔记**。
-
-- [ ] **Step 4: Commit**
+- [x] **Step 4: 运行**
 
 ```bash
-git add qwen3-learning/
+cd qwen3-learning/qwen3-pytorch
+python ablations/compare_with_gpt2.py
+```
+
+实测输出（2026-10-22，CPU，`vocab=293, seq_len=16, batch=2, seed=42`）：
+
+```
+[compare] Qwen3 ↔ GPT-2 退化对照
+配置                          max_abs_diff       相对差    logit 量级   判定
+----------------------------------------------------------------------------------
+全关（退化成 GPT-2）                  0.000e+00  0.00e+00      0.7422   PASS（< 1e-04）
+只开 use_gqa                     7.514e-02  1.01e-01      0.7422   OK（> 1e-04）
+只开 use_rope                    1.541e+00  2.08e+00      0.7422   OK（> 1e-04）
+只开 use_qk_norm                 9.334e-03  1.26e-02      0.7422   OK（> 1e-04）
+只开 mlp=swiglu                  7.187e-02  9.68e-02      0.7422   OK（> 1e-04）
+只开 norm=rmsnorm                5.449e-01  7.34e-01      0.7422   OK（> 1e-04）
+[compare] 基线（全关）通过：True；单开组件的行均显著偏离：True
+```
+
+**★ 全关那一行是 `0.000e+00` —— 逐位相同，不是「小于 1e-4」**
+
+这比阈值还严。说明退化是**真的**退化成 GPT-2、映射表没漏项也没多项、
+两边连浮点累加顺序都一致（GPT-2 的融合 `c_attn` 与 Qwen3 的三个独立 Linear
+在这个尺寸下 fp32 结果逐位相同）。
+
+**★ 消融表怎么读**
+
+| 组件 | 相对差 | 结论 |
+|---|---|---|
+| `use_rope` | **2.08** | 行为改变**最大** —— 位置信息的表达方式换掉后 logits 完全不是一回事 |
+| `norm_type=rmsnorm` | **0.73** | 次大 —— 减不减均值、有没有 bias，O(1) 量级的影响 |
+| `use_gqa` | **1.01e-1** | K/V head 数减半 ⇒ 注意力看到的 K/V 变了 |
+| `mlp_type=swiglu` | **9.68e-2** | 多一个门控分支（gate 无 GPT-2 对应物，保持随机初值） |
+| `use_qk_norm` | **1.26e-2** | **最小** —— 它只缩放 Q/K 的尺度、**不改变信息量**（买的是训练稳定性） |
+
+**★ 三条反证（证明不是「碰巧通过」）**
+
+| 反证 | 做法 | 实测 | 证明了什么 |
+|---|---|---|---|
+| A | **不加载权重**（退化 Qwen3 用随机权重） | `max_abs_diff = 1.013` | 差得远 ⇒ 全关那行的 `0` 不是「拿自己跟自己比」 |
+| B | **逐条核对映射表**（`wte`/`wpe`/`q,k,v,o`/`up,down`/`ln_f` 全部 `torch.equal`） | 全部相等 | 权重真的搬过去了 |
+| C | **主线默认配置不变** | 全部符合 | 加开关**没有污染主线** |
+
+- [x] **Step 5: 挂进 `init.sh` 的 L4 层**
+
+L4 增加一条退化对照 smoke：全关时 `max_abs_diff < 1e-4` + 单开组件的行都显著偏离。
+
+实测输出：
+
+```
+  [PASS] Qwen3 退化对照 smoke（全关 = GPT-2，max_abs_diff < 1e-4）[compare] 全关 diff=0.000e+00（阈值 1e-4）；单开组件：use_gqa=7.5e-02, use_rope=1.5e+00, use_qk_norm=9.3e-03, mlp=swiglu=7.2e-02, norm=rmsnorm=5.4e-01
+  PASS=28  SKIP=0  FAIL=0
+```
+
+- [x] **Step 6: 结论写进笔记**
+
+`Qwen3_训练推理完整学习笔记.md` 新增 **§12 退化对照**（含消融表、三个前提、
+权重映射表、三条反证、方法可推广性）；5 篇组件笔记开头各加一行「量化实证」指针；
+`qwen3-pytorch设计.md` §9 / §11 / §12 同步。
+
+- [x] **Step 7: Commit**
+
+```bash
+git add qwen3-learning/ init.sh
 git commit -m "feat-017: Qwen3 ↔ GPT-2 退化对照实验（逐组件消融 + max_abs_diff 记录）"
 ```
 
+**★ 修正计划初稿的 9 个真 bug**
+
+初稿的骨架**直接跑不起来**，或者跑起来会**静默给出错误结论**：
+
+① **★ `GPT2_DIR` 少了一层 `dirname`** —— 初稿写
+`os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))`。
+脚本在 `qwen3-pytorch/ablations/` 下，3 层 `dirname` 只到 `qwen3-learning/`，
+指向**不存在**的 `qwen3-learning/gpt-learning/gpt-learning-pytorch`。
+正确要 **4 层**（`ablations → qwen3-pytorch → qwen3-learning → llm-learning`）。
+
+② **★ `from model.gpt2 import GPT2` 会撞包名** —— 本仓的 `model` 包**已经被 Qwen3 线占用**
+（`qwen3-pytorch/model/`，有 `__init__.py`）。只要 Qwen3 的 `model` 先被 import 过，
+`import model.gpt2` 就解析到 Qwen3 的 `model/` 里找 `gpt2.py` ⇒ **ImportError**，
+而且加 `sys.path.insert(0, GPT2_DIR)` 也救不了（`model` 已经被缓存）。
+实现改成：**用 `importlib.util.spec_from_file_location` 按文件路径加载，
+模块名取 `gpt2_ref`（不与 Qwen3 的 `model` 冲突）**。
+
+③ **★ 「GPT-2 用 learned PE（可训练参数）」是事实错误** —— 本仓 GPT-2 的 `pos_emb` 是
+`register_buffer(..., persistent=False)`：**固定的 sinusoidal 表**，不训练，
+**且不在 `state_dict` 里**。初稿自己在代码注释里又写了「pos_emb（buffer，非 state_dict）」，
+**前后矛盾**。而且初稿的表格里「关掉后 = 不加位置信息」也是错的 ——
+关掉 RoPE 后**必须补上加法式位置嵌入**，否则两边连「有没有位置信息」都不一样，
+根本不是同一个模型。
+
+④ **★ 映射表里的键名在 Qwen3 里不存在** —— 初稿写
+`attn.qkv.weight` / `mlp.up.weight` / `mlp.down.weight`。
+Qwen3 的注意力是**三个独立投影** `q_proj`/`k_proj`/`v_proj`
+（因为 `head_dim` 与 `n_embd` 解耦，Q/K/V 输出维度不等，不能像 GPT-2 那样融合成一个 `c_attn`），
+MLP 的命名是 `up_proj`/`down_proj`。实现按真实键名写映射。
+
+⑤ **★ 漏了 `head_dim` 与中间层维度这两个前提** —— 初稿只提了归一化。
+但 Qwen3 主线 `head_dim=48`、`intermediate_size=384`，与 GPT-2 的 32 / 512 都对不上
+⇒ **形状都映射不了**，压根不是精度问题。不写出来，读代码的人会一直卡在
+「为什么 load_state_dict 报 shape 不匹配」。
+
+⑥ **★ 漏了 `eps` 前提** —— GPT-2 的 `nn.LayerNorm` 默认 `eps=1e-5`，
+Qwen3 的 `rms_eps=1e-6`。不同步就多一个 ~1% 的相对差，
+和「减不减均值」这个变量混在一起就分不清是谁造成的。
+
+⑦ **`compare()` 只有一个点，没有扩展点** —— 初稿的 `compare()` 只跑「全关」，
+而 Step 3 又要求「逐个组件做消融」。实现把用例表抽成 `build_cases()`，
+`run_all()` 统一跑，命令行与测试共用同一份。
+
+⑧ **★ 没有反证** —— 「全关 < 1e-4」如果两边根本没跑也会「通过」。
+实现加了 3 条反证（不加载权重必须差很远 / 映射表逐条 `torch.equal` / 主线默认配置不变）。
+
+⑨ **★ 没说明「开关默认全开 ⇒ 主线不变」** —— 这是「不污染主线」的关键保证，
+初稿一个字没提。实现把默认值设成主线行为，并加断言守住。
+
 ---
+
 
 ### Task 19: feat-008 笔记与代码交叉引用表
 

@@ -497,6 +497,35 @@ PY
   else
     skip "Qwen3 评估 smoke" "evaluate.py 尚未就绪（feat-025），或 torch 不可用"
   fi
+
+  # --- 退化对照 smoke（feat-017）：全关时 Qwen3 必须与 GPT-2 对齐 ---
+  if [ -f "$QWEN_DIR/ablations/compare_with_gpt2.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_compare.log 2>&1
+import os
+import sys
+
+sys.path.insert(0, os.getcwd())
+
+from ablations.compare_with_gpt2 import run_all
+
+r = run_all(threshold=1e-4, seq_len=16, batch=2, vocab_size=293)
+base = r["cases"][0]
+assert base["max_abs_diff"] < 1e-4, \
+    f"全关（退化成 GPT-2）时 max_abs_diff 应 < 1e-4，实得 {base['max_abs_diff']:.3e}"
+assert r["component_rows_passed"], "单开组件的行必须显著偏离基线，否则消融表没有说服力"
+parts = ", ".join(f"{c['name'].replace('只开 ', '')}={c['max_abs_diff']:.1e}"
+                  for c in r["cases"][1:])
+print(f"[compare] 全关 diff={base['max_abs_diff']:.3e}（阈值 1e-4）；单开组件：{parts}")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 退化对照 smoke（全关 = GPT-2，max_abs_diff < 1e-4）$(tail -1 /tmp/llm_init_l4_compare.log)"
+    else
+      fail "Qwen3 退化对照 smoke" "$(tail -3 /tmp/llm_init_l4_compare.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 退化对照 smoke" "ablations/compare_with_gpt2.py 尚未就绪（feat-017），或 torch 不可用"
+  fi
 fi
 
 # -----------------------------------------------------------------------------

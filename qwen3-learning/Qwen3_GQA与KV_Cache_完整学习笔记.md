@@ -1,5 +1,11 @@
 # Qwen3 学习笔记：GQA 与 KV Cache
 
+> **量化实证（feat-017）**：本组件「到底改了什么」的实测数字见
+> `qwen3-learning/Qwen3_训练推理完整学习笔记.md` **§12 退化对照**
+> —— 把 Qwen3 退化成 GPT-2 结构、只开 `use_gqa` 这一个组件，
+> 与 GPT-2 的 `max_abs_diff` = **7.514e-02**（相对差 **1.01e-01**）。
+> K/V head 数从 4 减到 2（GQA）后，注意力看到的 K/V 变了，相对差 1.01e-1 —— 换来的是 KV Cache 占用减半（见 §7）。
+
 > 学习定位：已掌握 Transformer/GPT、RMSNorm、QK-Norm 和 RoPE；本章从 Attention Head 分配讲到自回归推理时的 KV Cache 生命周期、容量计算和溢出处理，并联系 Qwen3 与 llama.cpp。
 
 ## 0. 先记住五句话

@@ -52,6 +52,29 @@ class Qwen3Config:
     # 权重绑定：lm_head.weight 与 wte.weight 共享同一份参数
     tie_embeddings: bool = True
 
+    # ---------------- 消融开关（feat-017：与 GPT-2 的退化对照）----------------
+    # ★ 这 5 个开关**只服务于对照实验** `ablations/compare_with_gpt2.py`。
+    #   默认值 = 主线的正常行为 ⇒ **不改变任何既有训练 / 评估的数字**，
+    #   所以本文件新增字段对既有笔记里的数字**零影响**（feat-009 核对时不必重算）。
+    #   把它们关掉，Qwen3 就会退化成 GPT-2 的结构，用来量化「每个组件到底改了什么」。
+    #
+    #   开关名            关掉后的行为              对应 GPT-2 的什么
+    #   ------------------------------------------------------------------
+    #   use_gqa           n_head_kv = n_head（MHA）    GPT-2 就是 MHA
+    #   use_rope          不用 RoPE，改用加法式 wpe    GPT-2 的 sinusoidal PE
+    #   use_qk_norm       Q/K 不做 RMSNorm            GPT-2 没有 QK-Norm
+    #   mlp_type="gelu"   两矩阵 FFN                  GPT-2 的 c_fc → GELU → c_proj
+    #   norm_type="layernorm" 归一化换成 LayerNorm     GPT-2 用 nn.LayerNorm
+    #
+    # ⚠️ `norm_type` 不是「可选的优化」，而是**对照实验的前提**：
+    #    RMSNorm（不减均值）与 LayerNorm（减均值）在数学上不等价，
+    #    两边不同步切换就永远压不到 max_abs_diff < 1e-4。详见笔记 §12。
+    use_gqa: bool = True
+    use_rope: bool = True
+    use_qk_norm: bool = True
+    mlp_type: str = "swiglu"      # "swiglu" | "gelu"
+    norm_type: str = "rmsnorm"    # "rmsnorm" | "layernorm"
+
     # ---------------- MoE 专属（dense 配置里为 None）----------------
     # 专家数量
     n_experts: Optional[int] = None

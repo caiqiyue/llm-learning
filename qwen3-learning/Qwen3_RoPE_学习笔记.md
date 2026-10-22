@@ -1,5 +1,11 @@
 # Qwen3 学习笔记：RoPE（Rotary Position Embedding）
 
+> **量化实证（feat-017）**：本组件「到底改了什么」的实测数字见
+> `qwen3-learning/Qwen3_训练推理完整学习笔记.md` **§12 退化对照**
+> —— 把 Qwen3 退化成 GPT-2 结构、只开 `use_rope` 这一个组件，
+> 与 GPT-2 的 `max_abs_diff` = **1.541e+00**（相对差 **2.08**）。
+> 把位置信息从「加法式 sinusoidal PE」换成「RoPE」是**行为改变最大**的一个组件，相对差 2.08 —— 换句话说 logits 已经完全不是一回事。
+
 ## 1. RoPE 是什么
 
 RoPE 全称 **Rotary Position Embedding（旋转位置编码）**。

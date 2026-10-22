@@ -51,6 +51,8 @@ class CausalSelfAttention(nn.Module):
         bias:        投影层是否用 bias（Qwen3 为 False）
         rope_theta:  RoPE 频率基数
         rms_eps:     QK-Norm 的 epsilon
+        use_qk_norm: 是否做 QK-Norm（feat-017 消融开关；默认 True = 主线行为）
+        use_rope:    是否做 RoPE（feat-017 消融开关；默认 True = 主线行为）
     """
 
     def __init__(
@@ -64,6 +66,8 @@ class CausalSelfAttention(nn.Module):
         bias: bool,
         rope_theta: float = 1e6,
         rms_eps: float = 1e-6,
+        use_qk_norm: bool = True,
+        use_rope: bool = True,
     ) -> None:
         """
         初始化 CausalSelfAttention。参数说明见类 docstring。
@@ -77,6 +81,9 @@ class CausalSelfAttention(nn.Module):
         self.n_head_kv = n_head_kv
         self.head_dim = head_dim
         self.block_size = block_size
+        # 消融开关（feat-017）：默认 True = 主线行为；关掉后退化成 GPT-2 的注意力
+        self.use_qk_norm = use_qk_norm
+        self.use_rope = use_rope
         # 每个 KV head 被几个 Q head 共享（GQA 的「组」大小）
         self._kv_group_size = n_head // n_head_kv
 
@@ -89,8 +96,11 @@ class CausalSelfAttention(nn.Module):
 
         # --- QK-Norm：对每个 head 的 head_dim 做 RMSNorm ---
         # 注意作用维度是 head_dim 而非 n_embd —— 逐 head 独立归一化
-        self.q_norm = RMSNorm(head_dim, eps=rms_eps)
-        self.k_norm = RMSNorm(head_dim, eps=rms_eps)
+        # use_qk_norm=False（退化对照）时**不创建**这两个模块，
+        # 这样 state_dict 里也不会有它们，权重映射时不必特判。
+        if use_qk_norm:
+            self.q_norm = RMSNorm(head_dim, eps=rms_eps)
+            self.k_norm = RMSNorm(head_dim, eps=rms_eps)
 
         # --- RoPE：作用在 head_dim 上 ---
         self.rope = RoPE(head_dim, max_seq_len=block_size, theta=rope_theta)
@@ -133,11 +143,15 @@ class CausalSelfAttention(nn.Module):
 
         # --- 2) QK-Norm：在 RoPE 之前 ---
         # 逐 head 对 head_dim 做 RMSNorm，形状不变
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        # use_qk_norm=False（退化对照）时整段跳过 —— GPT-2 没有 QK-Norm
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # --- 3) RoPE：按绝对位置旋转 ---
-        q, k = self.rope(q, k, position_ids=position_ids)
+        # use_rope=False（退化对照）时整段跳过 —— 位置信息改由 embedding 相加承担
+        if self.use_rope:
+            q, k = self.rope(q, k, position_ids=position_ids)
 
         return q, k
 

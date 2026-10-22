@@ -15,6 +15,7 @@ python train/train_pretrain.py --model moe
 python train/train_lora.py
 python train/train_dpo.py
 python evaluate.py --stage all
+python ablations/compare_with_gpt2.py   # 与 GPT-2 的退化对照（feat-017）
 ```
 
 ## 概念 → 笔记 → 源码
@@ -28,12 +29,47 @@ python evaluate.py --stage all
 | SwiGLU | [SwiGLU_MLP_学习笔记](../Qwen3_SwiGLU_MLP_学习笔记.md) | `model/qwen3_dense.py` |
 | MoE | [MoE_学习笔记](../Qwen3_MoE_学习笔记.md) | `model/qwen3_moe.py` |
 | 训练 → 推理 | [训练推理完整学习笔记](../Qwen3_训练推理完整学习笔记.md) | `train/`、`inference.py` |
+| 与 GPT-2 的退化对照 | [训练推理完整学习笔记 §12](../Qwen3_训练推理完整学习笔记.md) | `ablations/compare_with_gpt2.py` |
 
 ## 与 GPT-2 线的对照
 
-本线不跨目录 import GPT-2 线代码，但为对照实验保留了相同接口：
+**主线代码（`model/` 与 `train/`）不 import GPT-2 线的任何代码** ——
+两条线各自独立，避免「抄一份 GPT-2 的 config 再改」。
+
+唯一的例外是 **`ablations/` 目录**，它是**单向**引用 GPT-2 线的
+（Qwen3 → GPT-2），且只为了做对照实验：
+
+| 脚本 | 引用方式 | 为什么这么写 |
+|---|---|---|
+| `ablations/compare_with_gpt2.py` | `importlib.util.spec_from_file_location` 按**文件路径**加载 GPT-2 的 `model/gpt2.py`，模块名取 `gpt2_ref` | 本仓的 `model` 包名**已被 Qwen3 线占用**（`qwen3-pytorch/model/`）。若走 `sys.path.insert` + `from model.gpt2 import GPT2`，`import model.gpt2` 会解析到 Qwen3 的 `model/` 里 ⇒ `ImportError` |
+
+另外，为对照实验保留了相同接口：
 `data/pretrain_data.py::make_pretrain_loader` 与 `data/preference_data.py::generate_preference_dataset`
-的签名与 GPT-2 线一致，见 `ablations/compare_with_gpt2.py`。
+的签名与 GPT-2 线一致。
+
+### 退化对照：把「Qwen3 改了什么」变成一个数字（feat-017）
+
+给 Qwen3 加 5 个**退化开关**（默认值 = 主线行为 ⇒ 不改变任何既有数字），
+把它们全关掉就退化成 GPT-2 的结构；再把 GPT-2 的权重按显式映射表搬进去，比同一批输入的 logits。
+
+```bash
+python ablations/compare_with_gpt2.py
+```
+
+| 配置 | max_abs_diff | 相对差 | 结论 |
+|---|---|---|---|
+| 全关（退化成 GPT-2） | **0.000e+00** | 0 | **逐位相同** —— 退化是真的退化成 GPT-2，映射表没漏项 |
+| 只开 `use_gqa` | 7.514e-02 | 1.01e-01 | K/V head 数减半 ⇒ 注意力看到的 K/V 变了 |
+| 只开 `use_rope` | 1.541e+00 | 2.08e+00 | **行为改变最大** —— 位置信息的表达方式换掉了 |
+| 只开 `use_qk_norm` | 9.334e-03 | 1.26e-02 | **最小** —— 只缩放 Q/K 的尺度，不改信息量 |
+| 只开 `mlp_type=swiglu` | 7.187e-02 | 9.68e-02 | 多一个门控分支（GPT-2 无对应物） |
+| 只开 `norm_type=rmsnorm` | 5.449e-01 | 7.34e-01 | 减不减均值、有没有 bias —— 对照实验必须两边同步切 |
+
+三个**前提**（少一个就永远对不齐，详见笔记 §12.2）：
+① `head_dim` 回退成 `n_embd // n_head`；② 中间层回退成 GPT-2 的 `n_inner = 4·n_embd`；
+③ 归一化两边同步切到 LayerNorm 且 eps 一样（`1e-5`）。
+
+结论与解读见 [`Qwen3_训练推理完整学习笔记.md` §12](../Qwen3_训练推理完整学习笔记.md)。
 
 ### 评估指标：与 GPT-2 线 9 项评估的差异（feat-025 的验收项）
 

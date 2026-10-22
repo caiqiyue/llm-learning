@@ -1,5 +1,11 @@
 # Qwen3 学习笔记：SwiGLU MLP
 
+> **量化实证（feat-017）**：本组件「到底改了什么」的实测数字见
+> `qwen3-learning/Qwen3_训练推理完整学习笔记.md` **§12 退化对照**
+> —— 把 Qwen3 退化成 GPT-2 结构、只开 `mlp_type=swiglu` 这一个组件，
+> 与 GPT-2 的 `max_abs_diff` = **7.187e-02**（相对差 **9.68e-02**）。
+> SwiGLU 比 GELU 多一个门控分支（GPT-2 没有对应物），这一行的 diff 里混着一份随机门控信号 —— 测的是「有门控 vs 没门控」的行为差异。
+
 > 学习主线：Transformer/GPT 的传统 MLP → SwiGLU 的 Gate/Up/Down → SiLU 与逐元素门控 → 手算 → Tensor Shape → Qwen3-0.6B / llama.cpp。
 
 ## 1. 它在 Qwen3 Decoder Layer 的哪里？

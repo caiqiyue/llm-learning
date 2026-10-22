@@ -114,3 +114,71 @@ class SwiGLUMLP(nn.Module):
         hidden = gate * up                        # (B, T, I)
         # 4) 降维回残差流宽度
         return self.dropout(self.down_proj(hidden))   # (B, T, C)
+
+
+class GELUMLP(nn.Module):
+    """
+    两矩阵 GELU 前馈网络（GPT-2 的 MLP 结构）。
+
+    【它存在的唯一理由】
+        feat-017 的退化对照需要把 Qwen3 的 SwiGLU 换成 GPT-2 的
+        `c_fc → GELU → c_proj`，才能在**其余组件全部对齐**的前提下
+        单独度量「SwiGLU 相对 GELU 改了什么」。
+        主线训练**永远不用**这个类（`config.mlp_type` 默认 "swiglu"）。
+
+    【命名约定】
+        用 `up_proj` / `down_proj`（与 Qwen3 主线的 SwiGLU 命名保持一致），
+        对应 GPT-2 的 `c_fc` / `c_proj`。对照脚本的映射表见
+        `ablations/compare_with_gpt2.py`。
+
+    【激活函数】
+        用 `F.gelu(x)` 默认参数 —— **精确 erf 版**，不是 tanh 近似版。
+        GPT-2 的 MLP 用的也是默认 `F.gelu`，两边的近似方式必须一致，
+        否则即使权重完全相同，输出也会有 1e-3 量级的差。
+    """
+
+    def __init__(
+        self,
+        n_embd: int,
+        intermediate_size: int,
+        dropout: float,
+        bias: bool = False,
+    ) -> None:
+        """
+        初始化 GELUMLP。
+
+        参数：
+            n_embd:           输入/输出维度
+            intermediate_size: 中间层维度（对照实验里取 GPT-2 的 n_inner = 4·n_embd）
+            dropout:          输出 dropout
+            bias:             投影层是否用 bias（GPT-2 / Qwen3 均为 False）
+        """
+        super().__init__()
+        self.n_embd = n_embd
+        self.intermediate_size = intermediate_size
+        self.up_proj = nn.Linear(n_embd, intermediate_size, bias=bias)
+        self.down_proj = nn.Linear(intermediate_size, n_embd, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        """
+        GELU MLP forward（位置独立的非线性变换）。
+
+        【形状速查表】（I = intermediate_size）
+        ┌────────────────────┬──────────────────┬──────────────────┐
+        │ 步骤               │ 输入形状         │ 输出形状         │
+        ├────────────────────┼──────────────────┼──────────────────┤
+        │ 输入 x             │ -                │ (B, T, C)        │
+        │ 1. up_proj         │ (B, T, C)        │ (B, T, I)        │
+        │ 2. GELU            │ (B, T, I)        │ (B, T, I)        │
+        │ 3. down_proj       │ (B, T, I)        │ (B, T, C)        │
+        │ 4. dropout         │ (B, T, C)        │ (B, T, C)        │
+        └────────────────────┴──────────────────┴──────────────────┘
+
+        参数：
+            x: (B, T, n_embd)
+        返回：
+            (B, T, n_embd)
+        """
+        return self.dropout(self.down_proj(F.gelu(self.up_proj(x))))
+

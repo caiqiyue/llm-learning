@@ -12,7 +12,9 @@ GPT-2 线**全链路已复验通过**（torch 环境已修好，训练 + 9 项�
 Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO + KV Cache 推理已从零手写完并真跑通**
 （RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE /
 语料与偏好数据 / `--model dense|moe` 预训练 / 手写 LoRA 微调 / 手写 DPO / prefill-decode 推理与采样），
-**精简评估脚本已跑通**（pretrain / moe / lora / dpo / speedup 五段）。
+**精简评估脚本已跑通**（pretrain / moe / lora / dpo / speedup 五段），
+**与 GPT-2 的退化对照实验已跑通**（全关时 `max_abs_diff = 0` 逐位相同，5 个组件各自的影响量已量化）。
+只剩**收尾两件**：笔记 ↔ 源码交叉引用（feat-008）、笔记数字全量核对（feat-009）。
 
 ---
 
@@ -22,24 +24,34 @@ Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO + KV Cache 推理�
 然后走 **预训练 → LoRA 微调 → DPO**（路线已从 SFT/Reward Model/PPO 切到 LoRA+DPO，见 `feature_list.json` 的 `phase`）。
 **不做什么**：不引入 `transformers` / `peft` / `accelerate` / `sentencepiece` / `tokenizers`，不跑真 Qwen3-0.6B。
 
-**核心方法论 —— 组件全部做成可关掉的开关**（feat-017 的退化对照实验用）：
+**核心方法论 —— 组件全部做成可关掉的开关**（feat-017 的退化对照实验，**已跑通**）：
 
 ```
-use_gqa      = False   → 退化为 MHA
-use_rope     = False   → 退化为无位置编码
-use_qk_norm  = False   → 退化为裸注意力
-mlp          = "gelu"  → 退化为 GPT-2 的 FFN
+use_gqa      = False   → 退化为 MHA（n_head_kv = n_head）
+use_rope     = False   → 退化为加法式 sinusoidal wpe（不是「无位置编码」！）
+use_qk_norm  = False   → 退化为裸注意力（Q/K 不做 RMSNorm）
+mlp_type     = "gelu"  → 退化为 GPT-2 的两矩阵 FFN（Linear → GELU → Linear）
+norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，eps 也要一样）
 ```
 
-退化后的 Qwen3 应当与 GPT-2 在同输入下对齐（`max_abs_diff < 1e-4`，fp32）。
+**开关的默认值 = 主线行为 ⇒ 加开关不改变任何既有训练 / 评估数字**（已由
+`tests/test_compare_with_gpt2.py` 第 4 组断言守住）。
+
+退化后的 Qwen3 与 GPT-2 在同输入下对齐（`max_abs_diff < 1e-4`，fp32）——
+**实测 `max_abs_diff = 0.000e+00`（逐位相同）**。
 这把「Qwen3 到底改了什么、为什么改」从**文字断言**变成**可重跑的实验**（`feat-017`）。
+
+**★ 但对齐要满足三个「前提」**（少一个就永远对不齐，详见笔记 §12.2）：
+① `head_dim` 回退成 `n_embd // n_head`（Qwen3 主线故意解耦，`4×48 ≠ 128` ⇒ **形状都映射不了**）；
+② 中间层回退成 GPT-2 的 `n_inner = 4·n_embd`（512，不是 8/3 规则的 384）；
+③ 归一化两边同步切到 LayerNorm，且 **eps 一样**（1e-5，不是 Qwen3 的 `rms_eps=1e-6`）。
 
 ---
 
 ## Verified Now（哪些是已验证的）
 
-- `bash init.sh` → **PASS=27 SKIP=0 FAIL=0**（2026-10-22，L4 已有七条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke** / **评估 smoke**）
-- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=14 FAIL=0 TOTAL=14**
+- `bash init.sh` → **PASS=28 SKIP=0 FAIL=0**（2026-10-23，L4 已有八条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke** / **评估 smoke** / **退化对照 smoke**）
+- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=15 FAIL=0 TOTAL=15**
 - Qwen3 前向 smoke 已用**真实 BPE 词表**（vocab 778）跑通：`logits (2, 8, 778) loss 6.6897 params 985,856`
 - Qwen3 训练步 smoke：`[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05`
 - **预训练真跑通**（CPU，脚本在 `train/train_pretrain.py`，超参全从 `config.py` 读）：
@@ -107,8 +119,22 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 - **偏好指标的长度偏置已量化**：`too_short` 策略（rejected 6.3 token vs chosen 72 token）
   的总 logprob 胜率**恒为 0.000**，把整体胜率天花板压到 ~0.75
   ⇒ **只看整体胜率会误判「模型没进步」**；这也正是 DPO 减 π_ref 的原因
+- **★ 与 GPT-2 的退化对照真跑通**（`qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`）：
+  - 做法是**反过来做** —— 给 Qwen3 加 5 个退化开关（默认值 = 主线行为），
+    全关掉就退化成 GPT-2 的结构，再把 GPT-2 的权重按显式映射表搬进去，比 logits
+  - **全关那一行 = `max_abs_diff = 0.000e+00`（逐位相同，比 1e-4 阈值还严）**
+    ⇒ 退化是真的退化成 GPT-2、映射表没漏项也没多项
+  - 逐组件消融（每行只开一个）：`use_rope` **1.541e+00**（相对差 2.08，**最大**）＞
+    `norm=rmsnorm` 5.449e-01（0.73）＞ `use_gqa` 7.514e-02（1.01e-1）＞
+    `mlp=swiglu` 7.187e-02（9.68e-2）＞ `use_qk_norm` 9.334e-03（**1.26e-2，最小** ——
+    它只缩放 Q/K 的尺度、不改信息量）
+  - **三条反证**（防「碰巧通过」）：A 不加载权重 ⇒ `max_abs_diff = 1.013`（差得远）；
+    B 映射表逐条 `torch.equal`；C 主线默认配置不变（无 `wpe` / 有 `q_norm` / SwiGLU / RMSNorm）
+  - `ablations/` 是本仓**唯一**跨目录引用 GPT-2 线的地方（单向 Qwen3 → GPT-2）；
+    主线 `model/` 与 `train/` 依然不 import GPT-2 线任何代码
+  - 结论写进 `Qwen3_训练推理完整学习笔记.md` §12 + 5 篇组件笔记各一行「量化实证」指针
 - GPT-2 线：`python evaluate.py --stage all` 退出码 0，9 项评估全过
-- 各 feature 的详细证据在 `feature_list.json` 的 `evidence` 数组里（feat-011 ~ feat-023 都有）
+- 各 feature 的详细证据在 `feature_list.json` 的 `evidence` 数组里（feat-011 ~ feat-025 都有）
 
 ## Broken Or Unverified（坏的 / 没验证的）
 
@@ -121,19 +147,22 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 - **BPE 词表只有 778 < 目标 1000**：合成语料的可合并对用尽（521 次后没有频次 ≥ 2 的对），属语料多样性问题，非实现 bug
 - **MoE 在本仓库体现不出容量优势**：val_loss 1.3607 vs dense 1.3510（MoE 反而略差）——
   语料太简单 + 专家更窄（参数量只多 1.21×）+ 只训 300 步。**写笔记时别暗示「MoE 一定更好」**（前提条件见笔记 §25.1）
-- **笔记缺口**：`Qwen3_BPE_学习笔记.md` 仍缺；
+- **笔记缺口**：`Qwen3_BPE_学习笔记.md` **仍缺**（BPE 代码 feat-022 已实现但没写笔记）；
   `Qwen3_LoRA与DPO_学习笔记.md` **已补齐 LoRA 半部（§1–§7）与 DPO 半部（§8）**，§9 教训 7 条
   （全量交叉引用按计划在 feat-008 / Task 19 做）
+- **feat-017 的结论只在 fp32 / 小尺寸下成立**（vocab=293、n_layer=4、n_embd=128、seq_len=16）：
+  「全关逐位相同」**不能外推**到别的 dtype / 别的形状。
+  且单开组件时新引入的参数（SwiGLU 的 gate）是**随机初值** ⇒ 那几行的 diff 适合比**量级**，
+  不等于「这个组件贡献了多少准确率」
 - **本仓库的 aux_loss 与 HF 数值不能直接比大小**：本实现 = HF Mixtral 同款公式的 1/K（见下面的陷阱表）
 
 ## Next Best Step（按顺序，不要跳）
 
 | 顺序 | feature | 做什么 | 为什么是它 |
 |------|---------|--------|--------|
-| 1 | `feat-017` | 与 GPT-2 的**退化对照**（逐组件消融 + max_abs_diff 记录） | 本线最有价值的产出 |
-| 2 | `feat-008` | 笔记 ↔ 源码交叉引用（补 BPE 笔记） | 收尾 |
-| 3 | `feat-009` | 笔记数字与 `config.py` 全量核对 | 收尾 |
-| 4 | 收班 | progress → feature_list → handoff → commit → clean-state-checklist | — |
+| 1 | `feat-008` | 笔记 ↔ 源码交叉引用（**补 `Qwen3_BPE_学习笔记.md`**） | 收尾，唯一还缺的笔记 |
+| 2 | `feat-009` | 笔记数字与 `config.py` 全量核对（已知项：设计文档 §4 的 `intermediate_size=384` vs Qwen3-0.6B 实际 3.0 倍） | 收尾 |
+| 3 | 收班 | progress → feature_list → handoff → commit → clean-state-checklist | — |
 
 **这一步不许动的**：不改 GPT-2 线的任何训练代码或超参；不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值。
 
@@ -161,6 +190,11 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 | **`strict=False` 会让你「评估了一个随机模型」而不报错** | `lora.pt` / `dpo.pt` 的 state_dict 是**注入 LoRA 之后**的键名（`q_proj.base.weight` / `.lora_A` / `.lora_B`），与未注入的模型对不上。`load_state_dict(strict=False)` **只警告不抛异常** ⇒ 权重全部没加载。正确做法：**先 `inject_lora` 再 `load_state_dict(strict=True)`**，键名对不上就当场红 |
 | **「同名」不等于「同口径」** | 同一个叫 `perplexity` 的字段，GPT-2 线是 **token 加权**、本线训练日志是 **batch 均值**（1.3485 vs 1.3510）。直接并排比就是在比两件不同的事。**两个口径都打印**才能既横向比又纵向对 |
 | **LoRA ≠ 弱化版全参** | 低秩约束 + 注入点决定「能学到什么」：内容型任务上全参 loss ~1.06 vs r=4 LoRA ~5.7。**LoRA 是风格/格式型任务的主场** |
+| **「全关 < 阈值」不等于实验成功** | 对照实验的基线（两边都退化成同一个东西）如果**两边根本没跑**，也会「通过」。**必须有反证**：不加载权重时必须差得很远（实测 1.013 vs 阈值 1e-4），且映射表要逐条 `torch.equal` 核对 |
+| **退化开关缺一个「前提」就永远对不齐** | 对齐 GPT-2 需要三个前提同时满足：① `head_dim` 回退成 `n_embd // n_head`（Qwen3 主线故意解耦 ⇒ **形状都映射不了**，不是精度问题）；② 中间层回退成 `4·n_embd`；③ 归一化两边同步切且 **eps 一样**（1e-5 vs 1e-6 差 ~1%，会和「减不减均值」混在一起） |
+| **`model` 包名会被占用 ⇒ 跨目录 import 必须按文件路径加载** | 本仓 `model` 已被 Qwen3 线占用，`sys.path.insert` + `from model.gpt2 import GPT2` 会解析到 Qwen3 的 `model/` ⇒ `ImportError`（加 path 也救不了，`model` 已进 `sys.modules`）。正确做法：`importlib.util.spec_from_file_location(path)`，模块名另取（如 `gpt2_ref`） |
+| **「GPT-2 用 learned PE」是事实错误** | 本仓 GPT-2 的 `pos_emb` 是 `register_buffer(..., persistent=False)` 的**固定 sinusoidal 表** —— 不训练、**且不在 `state_dict` 里**。写对照实验时「关掉 RoPE = 不加位置信息」也是错的：必须补上**加法式** sinusoidal PE，否则两边连「有没有位置信息」都不同，根本不是同一个模型 |
+| **对照实验的 diff ≠ 组件的「贡献」** | 单开某个组件时，新引入的参数（如 SwiGLU 的 gate）是**随机初值** ⇒ diff 是「结构差异 + 随机新参数」的合成效果。**适合比量级，不等于「这个组件贡献了多少准确率」**；且结论只在测过的 dtype / 尺寸下成立，不要外推 |
 
 ---
 
@@ -191,7 +225,7 @@ python evaluate.py --stage all
 # Qwen3 线（组件 + 数据 + 预训练已就位）
 cd qwen3-learning/qwen3-pytorch
 python data/build_vocab.py       # 重建 BPE 词表（vocab.json / merges.txt）
-python tests/run_all.py          # 14 个 smoke 汇总
+python tests/run_all.py          # 15 个 smoke 汇总
 python tests/test_pretrain.py    # 单个 smoke
 python tests/test_lora.py        # LoRA 的 9 组断言
 python train/train_pretrain.py --model dense   # 预训练（dense，~47s CPU）
@@ -201,6 +235,8 @@ python train/train_dpo.py        # DPO（π_ref = SFT 模型，merge → strip �
 python tests/test_dpo.py         # DPO 的 9 组断言
 python tests/test_inference.py   # KV Cache 推理与采样（12 组断言）
 python tests/test_evaluate.py    # 精简评估（7 组断言）
+python ablations/compare_with_gpt2.py   # 与 GPT-2 的退化对照（feat-017，6 行消融表）
+python tests/test_compare_with_gpt2.py # 退化对照的 6 组断言（含 3 条反证）
 
 # 状态
 cat feature_list.json            # 含 phase 阶段标记 + 每条的 evidence
@@ -214,7 +250,8 @@ git log --oneline -5
 |----------|--------|
 | 开工前必读 | `AGENTS.md` §0 framing / §3 硬约束 / §5 验证路径 |
 | 当前阶段与任务顺序 | `feature_list.json` 的 `phase` + priority 最小的非 passing 项 |
-| Qwen3 设计 / 实施计划 | `qwen3-learning/qwen3-pytorch设计.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–17 已就地纠错，含「实测修正记录」） |
-| Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（8 篇，缺 BPE；LoRA-DPO 篇已补齐 DPO 半部；训练推理篇已补 §10 推理实现与采样 + §11 评估） |
-| GPT-2 对照实现 | `gpt-learning/gpt-learning-pytorch/model/gpt2.py` |
+| Qwen3 设计 / 实施计划 | `qwen3-learning/qwen3-pytorch设计.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–18 已就地纠错，含「实测修正记录」与「9 个真 bug」清单） |
+| Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（8 篇，**缺 BPE**；LoRA-DPO 篇已补齐 DPO 半部；训练推理篇已补 §10 推理实现与采样 + §11 评估 + **§12 退化对照**） |
+| GPT-2 对照实现 | `gpt-learning/gpt-learning-pytorch/model/gpt2.py`（**只能按文件路径 import**，见陷阱表） |
+| 对照实验脚本 | `qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`（本仓唯一跨目录引用 GPT-2 线的地方，单向） |
 | 收班自查 | `clean-state-checklist.md` |

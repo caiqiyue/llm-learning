@@ -373,13 +373,31 @@ L4 层按 feature 完成度逐步加重：
 - LoRA → 注入前后输出一致 smoke
 - DPO → aux_loss / margin 非 None smoke
 
-### 退化对照实验（feat-017，保留）
+### 退化对照实验（feat-017，保留）—— **已完成**
 
 目的：把「Qwen3 相对 GPT-2 改了什么」变成实证。
 
-构造退化开关：`use_gqa=False` / `use_rope=False` / `use_qk_norm=False` / `mlp='gelu'`。开关全部关闭后，Qwen3 与 GPT-2 在同样输入、同权重加载下 `max_abs_diff < 1e-4`（fp32）。
+构造退化开关：`use_gqa=False` / `use_rope=False` / `use_qk_norm=False` / `mlp_type='gelu'` /
+`norm_type='layernorm'`。开关全部关闭后，Qwen3 与 GPT-2 在同样输入、同权重加载下
+`max_abs_diff < 1e-4`（fp32）。
 
-要求逐层对齐参数名，映射关系写在脚本注释里。**这是 Qwen3 线最有价值的产出**，写进笔记作为每个组件的实证依据。
+**实测（2026-10-22，`ablations/compare_with_gpt2.py`）**：
+
+| 配置 | max_abs_diff | 相对差 |
+|---|---|---|
+| 全关（退化成 GPT-2） | **0.000e+00**（逐位相同） | 0 |
+| 只开 `use_gqa` | 7.514e-02 | 1.01e-01 |
+| 只开 `use_rope` | 1.541e+00 | 2.08e+00 |
+| 只开 `use_qk_norm` | 9.334e-03 | 1.26e-02 |
+| 只开 `mlp_type=swiglu` | 7.187e-02 | 9.68e-02 |
+| 只开 `norm_type=rmsnorm` | 5.449e-01 | 7.34e-01 |
+
+三个**前提**（少一个就对不齐，详见笔记 §12.2）：
+① `head_dim` 必须回退成 `n_embd // n_head`（主线是解耦的 48）；
+② 中间层必须回退成 GPT-2 的 `n_inner = 4·n_embd`（主线是 8/3 规则的 384）；
+③ 归一化必须**两边同步**切到 LayerNorm，且 eps 取 GPT-2 默认的 `1e-5`。
+
+结论已写进 `Qwen3_训练推理完整学习笔记.md` §12，并在 5 篇组件笔记开头加了指针。
 
 ---
 
@@ -411,7 +429,7 @@ L4 层按 feature 完成度逐步加重：
 | byte-level BPE 训练慢（O(n·merges)） | 语料先截断到合理长度；`vocab_size` 取 1000–4000 量级 |
 | DPO 在 tiny 模型上可能不收敛 | 加大 `β` 或降低学习率；接受「指标上升即可」而非「训得很好」 |
 | MoE 专家塌缩 | 打印负载分布作为 smoke；必要时提高 `aux_loss_coef` |
-| 退化对照难以和 GPT-2 逐层对齐（GPT-2 用 learned PE + GELU + LayerNorm） | 映射关系在 `compare_with_gpt2.py` 注释中显式列出；允许 `max_abs_diff` 放宽到 `1e-4` |
+| 退化对照难以和 GPT-2 逐层对齐（GPT-2 用 **固定的 sinusoidal PE** + GELU + LayerNorm） | ✅ **已解决**（feat-017）。映射关系在 `compare_with_gpt2.py` 注释中显式列出；实测全关时 `max_abs_diff = 0.000e+00`，比 `1e-4` 的阈值还严 |
 | `feat-017` 时间成本高 | 排在训练链路之后，属于「有富余时间再做」 |
 
 ---
@@ -426,6 +444,6 @@ L4 层按 feature 完成度逐步加重：
 | `Qwen3_GQA与KV_Cache_完整学习笔记.md` | `model/common/attention.py`、`model/common/kv_cache.py` |
 | `Qwen3_SwiGLU_MLP_学习笔记.md` | `model/qwen3_dense.py` |
 | `Qwen3_MoE_学习笔记.md` | `model/qwen3_moe.py` |
-| `Qwen3_训练推理完整学习笔记.md` | `inference.py` |
+| `Qwen3_训练推理完整学习笔记.md` | `inference.py`、`evaluate.py`、`ablations/compare_with_gpt2.py`（§12 退化对照） |
 
 GPT-2 主线参照：`gpt-learning/gpt-learning-pytorch/model/gpt2.py`

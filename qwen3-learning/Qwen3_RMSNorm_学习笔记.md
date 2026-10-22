@@ -1,5 +1,11 @@
 # Qwen3 学习笔记：RMSNorm
 
+> **量化实证（feat-017）**：本组件「到底改了什么」的实测数字见
+> `qwen3-learning/Qwen3_训练推理完整学习笔记.md` **§12 退化对照**
+> —— 把 Qwen3 退化成 GPT-2 结构、只开 `norm_type=rmsnorm` 这一个组件，
+> 与 GPT-2 的 `max_abs_diff` = **5.449e-01**（相对差 **0.73**）。
+> RMSNorm 与 LayerNorm 数学上不等价（减不减均值、有没有 bias），这是整张消融表里第二大的一行 —— 也是对照实验必须两边同步切归一化的原因。
+
 ## 1. RMSNorm 是什么
 
 RMSNorm（Root Mean Square

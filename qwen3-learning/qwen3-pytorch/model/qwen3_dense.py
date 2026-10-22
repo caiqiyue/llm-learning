@@ -33,8 +33,9 @@ import torch.nn.functional as F
 
 from config import Qwen3Config
 from model.common.attention import CausalSelfAttention
-from model.common.mlp import SwiGLUMLP
-from model.common.rmsnorm import RMSNorm
+from model.common.mlp import GELUMLP, SwiGLUMLP
+from model.common.norm import build_norm
+from model.common.pos_emb import build_sinusoidal_pos_emb
 
 
 class Block(nn.Module):
@@ -45,6 +46,11 @@ class Block(nn.Module):
         x = x + SwiGLU(RMSNorm(x))
 
     Pre-LN：归一化在子层**之前**，残差路径上不经过任何缩放，梯度能直通，训练更稳。
+
+    【feat-017 消融开关】
+        归一化层类型（`cfg.norm_type`）、FFN 类型（`cfg.mlp_type`）、
+        QK-Norm 与 RoPE 的开关（`cfg.use_qk_norm` / `cfg.use_rope`）
+        全部来自配置，默认值 = 主线行为，不改变任何既有数字。
     """
 
     def __init__(
@@ -65,26 +71,41 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
         d = cfg.dropout if dropout is None else dropout
         # --- 注意力子层 ---
-        self.ln_1 = RMSNorm(cfg.n_embd, eps=cfg.rms_eps)
+        self.ln_1 = build_norm(cfg.norm_type, cfg.n_embd, cfg.rms_eps)
+        # use_gqa=False ⇒ n_head_kv = n_head ⇒ 退化成标准 MHA（GPT-2 的做法）
+        n_head_kv = cfg.n_head if not cfg.use_gqa else cfg.n_head_kv
         self.attn = CausalSelfAttention(
             n_embd=cfg.n_embd,
             n_head=cfg.n_head,
-            n_head_kv=cfg.n_head_kv,
+            n_head_kv=n_head_kv,
             head_dim=cfg.head_dim,
             block_size=cfg.block_size,
             dropout=d,
             bias=cfg.attention_bias,
             rope_theta=cfg.rope_theta,
             rms_eps=cfg.rms_eps,
+            use_qk_norm=cfg.use_qk_norm,
+            use_rope=cfg.use_rope,
         )
         # --- 前馈子层 ---
-        self.ln_2 = RMSNorm(cfg.n_embd, eps=cfg.rms_eps)
-        self.mlp = SwiGLUMLP(
-            n_embd=cfg.n_embd,
-            intermediate_size=cfg.intermediate_size,
-            dropout=d,
-            bias=cfg.attention_bias,
-        )
+        self.ln_2 = build_norm(cfg.norm_type, cfg.n_embd, cfg.rms_eps)
+        if cfg.mlp_type == "gelu":
+            # 退化对照用：两矩阵 FFN（GPT-2 的 c_fc → GELU → c_proj）
+            self.mlp = GELUMLP(
+                n_embd=cfg.n_embd,
+                intermediate_size=cfg.intermediate_size,
+                dropout=d,
+                bias=cfg.attention_bias,
+            )
+        elif cfg.mlp_type == "swiglu":
+            self.mlp = SwiGLUMLP(
+                n_embd=cfg.n_embd,
+                intermediate_size=cfg.intermediate_size,
+                dropout=d,
+                bias=cfg.attention_bias,
+            )
+        else:
+            raise ValueError(f"未知的 FFN 类型：{cfg.mlp_type!r}（只支持 'swiglu' / 'gelu'）")
 
     def forward(
         self,
@@ -165,13 +186,21 @@ class Qwen3Dense(nn.Module):
         self.wte = nn.Embedding(vocab_size, cfg.n_embd)
         self.drop = nn.Dropout(d)
 
+        # --- 加法式位置嵌入（仅 use_rope=False 时存在，见 feat-017）---
+        # 主线用 RoPE，位置信息在 attention 内部处理，**不需要** wpe。
+        # 退化对照要求「关掉 RoPE 后能补回 GPT-2 的位置信息」，
+        # 所以这里加一个 wpe，用 GPT-2 同款 sinusoidal 表初始化。
+        self.wpe: Optional[nn.Embedding] = None
+        if not cfg.use_rope:
+            self.wpe = nn.Embedding(cfg.block_size, cfg.n_embd)
+
         # --- N 个 Pre-LN Block ---
         self.blocks = nn.ModuleList(
             [Block(cfg, layer_idx=i, dropout=d) for i in range(cfg.n_layer)]
         )
 
-        # --- final RMSNorm ---
-        self.ln_f = RMSNorm(cfg.n_embd, eps=cfg.rms_eps)
+        # --- final 归一化（RMSNorm / LayerNorm 由 cfg.norm_type 决定）---
+        self.ln_f = build_norm(cfg.norm_type, cfg.n_embd, cfg.rms_eps)
 
         # --- lm_head ---
         self.lm_head = nn.Linear(cfg.n_embd, vocab_size, bias=False)
@@ -182,6 +211,17 @@ class Qwen3Dense(nn.Module):
 
         # --- 初始化 ---
         self.apply(self._init_weights)
+
+        # ⚠️ wpe 的 sinusoidal 初值必须在 `apply(_init_weights)` **之后**再写：
+        #    `_init_weights` 会把所有 Embedding（含 wpe）重置成 N(0, 0.02)。
+        if self.wpe is not None:
+            with torch.no_grad():
+                self.wpe.weight.copy_(
+                    build_sinusoidal_pos_emb(cfg.block_size, cfg.n_embd)
+                )
+            # GPT-2 的 pos_emb 是固定表（buffer），不训练 ⇒ 这里也冻结，
+            # 保证退化后的 Qwen3 与 GPT-2 是**同一个模型**而不只是同一个初值。
+            self.wpe.weight.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # 初始化
@@ -220,14 +260,15 @@ class Qwen3Dense(nn.Module):
         ├──────────────────────────────┼──────────────┼──────────────────┤
         │ 0. idx                       │ -            │ (B, T)           │
         │ 1. wte                       │ (B, T)       │ (B, T, C)        │
-        │ 2. drop                      │ (B, T, C)    │ (B, T, C)        │
+        │ 2. drop（+wpe 仅退化对照）    │ (B, T, C)    │ (B, T, C)        │
         │ 3. N × Block                 │ (B, T, C)    │ (B, T, C)        │
         │ 4. ln_f                      │ (B, T, C)    │ (B, T, C)        │
         │ 5. lm_head [tied]            │ (B, T, C)    │ (B, T, V)        │
         │ 6. cross_entropy [可选]      │ (B*T,V)/(B*T)│ scalar           │
         └──────────────────────────────┴──────────────┴──────────────────┘
 
-        【注意】没有 +pos_emb 这一步 —— 位置信息由 attention 内部的 RoPE 承担。
+        【注意】主线**没有 +pos_emb 这一步** —— 位置信息由 attention 内部的 RoPE 承担。
+        只有退化对照配置（`use_rope=False`）才会补上加法式的 `wpe(position_ids)`。
 
         【与 GPT2.forward 的差异】
           - **恒定返回 4 元组**：GPT-2 无 value_head 时返回 3 元组，本模型恒 4 元组
@@ -254,8 +295,13 @@ class Qwen3Dense(nn.Module):
             position_ids = torch.arange(T, dtype=torch.long, device=idx.device)
             position_ids = position_ids.unsqueeze(0).expand(B, T)
 
-        # --- 1) token embedding（**不加位置编码**，位置由 RoPE 在 attention 内处理）---
-        x = self.drop(self.wte(idx))          # (B, T, C)
+        # --- 1) token embedding ---
+        # 主线（use_rope=True）：**不加位置编码**，位置由 RoPE 在 attention 内处理
+        # 退化对照（use_rope=False）：补上加法式位置嵌入 wpe(position_ids)
+        x = self.wte(idx)                     # (B, T, C)
+        if self.wpe is not None:
+            x = x + self.wpe(position_ids)    # (B, T, C)
+        x = self.drop(x)                      # (B, T, C)
 
         # --- 2) N × Pre-LN Block ---
         new_kv = kv_cache
