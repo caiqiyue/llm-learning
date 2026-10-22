@@ -10221,10 +10221,36 @@ test_config_sync OK
 
 ### Task 21: 全量收班
 
-- [ ] `bash init.sh` → 全部 PASS，无 FAIL
-- [ ] `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → PASS 全部
-- [ ] `python evaluate.py --stage all` → 四个 stage 全跑通
-- [ ] 更新 `claude-progress.md` / `feature_list.json` / `session-handoff.md`
-- [ ] 跑 `clean-state-checklist.md` 的 6 项，全勾
+- [x] `bash init.sh` → 全部 PASS，无 FAIL（`PASS=28  SKIP=0  FAIL=0`）
+- [x] `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → PASS 全部（`PASS=17  FAIL=0  TOTAL=17`）
+- [x] `python evaluate.py --stage all` → **5/5 段全跑通**
+      （`pretrain ppl=3.852` / `moe ppl=3.889 aux=0.9978` / `lora win_rate=0.6050` /
+      `dpo margin=+4.6512 acc=0.7800 win_rate=0.6650` / `speedup=2.217x consistent=True`）
+- [x] 更新 `claude-progress.md` / `feature_list.json` / `session-handoff.md`
+- [x] 跑 `clean-state-checklist.md` 的 6 项，全勾
+
+**收班时的最终状态**
+
+| 项 | 值 |
+|---|---|
+| `feature_list.json` | **25 passing / 0 in_progress / 0 not_started** |
+| `bash init.sh` | `PASS=28  SKIP=0  FAIL=0` |
+| `python tests/run_all.py` | `PASS=17  FAIL=0  TOTAL=17` |
+| Qwen3 `evaluate.py --stage all` | 5/5 段（pretrain / moe / lora / dpo / speedup） |
+| GPT-2 `evaluate.py --stage all` | **9 个评估函数全部跑完，退出码 0**；compare 段复现 feat-006 记录的数值（`sft_rm_score=0.0696` / `ppo_rm_score=0.0696` / `improvement=0.0000`）|
+| 笔记 | 数字守卫覆盖 **27 篇**：`gpt-learning/` 17 篇 + `qwen3-learning/` 10 篇（9 篇学习笔记 + `qwen3-pytorch设计.md`）；另 `qwen3-pytorch开发计划.md` 走人工核对（跨线文档，见 Task 20） |
+
+**★ 收班时值得记下来的三件事**
+
+1. **25 个 feature 全部 `passing`，但「全部完成」不等于「没有已知缺口」** ——
+   已知缺口都写在 `session-handoff.md` 的「Broken Or Unverified」里
+   （评估只做了精简 5 段、MoE 体现不出容量优势、BPE 词表 778 < 1000、
+   feat-017 结论只在 fp32/小尺寸下成立、feat-009 守卫的 3 个盲区）。
+   **交接卡比「完成」更重要。**
+2. **两条线的「数字防线」现在有三道**：
+   `test_note_refs.py`（链接可点开）→ `test_config_sync.py`（数字对得上）→
+   `init.sh` L4（每次开工都跑）。**这三条都是「文档腐烂」的自动检测器。**
+3. **最后一道防线是被自己打破的** —— 守卫上线当天就抓到了新写的计划文档里的跨线引用。
+   **守卫只有在「先让它跑自己」的时候才算数。**
 
 ---

@@ -1204,6 +1204,46 @@ PASS=28  SKIP=0  FAIL=0
 1. 收班（progress → feature_list → handoff → commit → clean-state-checklist）
 2. `feature_list.json` 现在是 **25 passing / 0 in_progress / 0 not_started** —— 全部 feature 已完成
 
+### Session 012 收班（Task 21）
+
+**最终状态**
+
+| 项 | 值 |
+|---|---|
+| `feature_list.json` | **25 passing / 0 in_progress / 0 not_started** |
+| `bash init.sh` | `PASS=28  SKIP=0  FAIL=0` |
+| `python tests/run_all.py` | `PASS=17  FAIL=0  TOTAL=17` |
+| Qwen3 `evaluate.py --stage all` | **5/5 段**：pretrain ppl=3.852 / moe ppl=3.889 aux=0.9978 / lora win_rate=0.6050 / dpo margin=+4.6512 acc=0.7800 / speedup=2.217x consistent=True |
+| GPT-2 `evaluate.py --stage all` | **9 个评估函数全部跑完，退出码 0**；compare 段复现 feat-006 记录的数值（`sft_rm_score=0.0696` / `ppo_rm_score=0.0696` / `improvement=0.0000`）—— ⚠️ 这个「PPO 相对 SFT 无提升」是**已记录的既有状态**，不是本次引入的 |
+| 笔记 | 数字守卫覆盖 **27 篇**：`gpt-learning/` 17 篇 + `qwen3-learning/` 10 篇（9 篇学习笔记 + `qwen3-pytorch设计.md`）；另 `qwen3-pytorch开发计划.md` 走人工核对（跨线文档） |
+
+**clean-state-checklist 6 项**
+
+| 项 | 结果 |
+|---|---|
+| 标准启动路径仍可用（`bash init.sh` 退出码 0） | ✅ `PASS=28 SKIP=0 FAIL=0` |
+| 标准验证路径仍成立（涉及的层级实际跑过） | ✅ L0/L1/L2/L3/L4 全部实跑；本次只改笔记与文档，**未动任何训练代码** ⇒ 无需重跑 L3 全量训练 |
+| 进度已记录 | ✅ Current Verified State 已更新；Session Log 已追加 Session 012 + 收班 |
+| Feature 状态反映真实情况 | ✅ 25 条全 `passing`，每条 evidence 都是实跑输出；已知缺口写在 handoff 而不是伪装成完成 |
+| 没有没文档化的半成品 | ✅ 新增的 `test_config_sync.py` 已进 `run_all.py`（自动发现）⇒ `init.sh` L4 覆盖；`开发计划.md` 的 Task 20 已就地换真内容 |
+| 下一个 session 能直接继续 | ✅ 干净 clone + `bash init.sh` 无需手工修补；读完 `feature_list.json` 即知「全部完成」+ 已知缺口清单 |
+| 附加 ①：改 `config.py` 要写明影响哪几章笔记 | ✅ 本次**没改 `config.py`**（只读它来核对） |
+| 附加 ②：改了笔记要抽样核对 ≥3 处 | ✅ 核了 5 处：`warmup_iters=50` / `lr_decay_iters=200` / `max_iters=200` / `get_lr` 源码逐字 / 参数量 794,496 |
+| 附加 ③：工作区无待提交的大文件或权重 | ✅ `git status` 干净；`checkpoints/`、`docs/`、权重仍被忽略 |
+
+**★ 收班时值得记下来的三件事**
+
+1. **25 个 feature 全部 `passing`，但「全部完成」不等于「没有已知缺口」** ——
+   已知缺口都写在 `session-handoff.md` 的「Broken Or Unverified」里
+   （评估只做了精简 5 段、MoE 体现不出容量优势、BPE 词表 778 < 1000、
+   feat-017 结论只在 fp32/小尺寸下成立、feat-009 守卫的 3 个盲区）。
+   **交接卡比「完成」更重要。**
+2. **两条线的「数字防线」现在有三道**：
+   `test_note_refs.py`（链接可点开）→ `test_config_sync.py`（数字对得上）→
+   `init.sh` L4（每次开工都跑）。**这三条都是「文档腐烂」的自动检测器。**
+3. **最后一道防线是被自己打破的** —— 守卫上线当天就抓到了新写的计划文档里的跨线引用。
+   **守卫只有在「先让它跑自己」的时候才算数。**
+
 **本次改动涉及的文件**
 
 `qwen3-learning/qwen3-pytorch/tests/test_config_sync.py`（**新建**）、

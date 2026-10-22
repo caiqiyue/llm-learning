@@ -214,7 +214,15 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 | 顺序 | feature | 做什么 | 为什么是它 |
 |------|---------|--------|--------|
-| 1 | 收班 | progress → feature_list → handoff → commit → clean-state-checklist | **25 个 feature 已全部 passing**，没有下一条了 |
+| — | **无** | — | **25 个 feature 全部 passing**，P2 阶段（Qwen3 从零实现）已收班 |
+
+**下一个 session 建议做的第一件事**（不在 `feature_list.json` 里，因为还没立项）：
+读本卡的「Broken Or Unverified」段落，挑一条已知缺口**立项**成新的 feature。
+目前最值得做的三条：
+① **评估侧补齐生成质量指标**（`diversity` / `response_quality`）—— 唯一让两条线能真正并排的缺口；
+② **feat-009 守卫的第 3 个盲点自动化**（散落在散文里的「128 维」「4 层」目前靠人读）；
+③ **把 GPT-2 线的 `get_lr` 等实现细节也做成「笔记抄源码必须逐字一致」的守卫**
+   （本次手抄的 `get_lr` 就抄错了，是靠人眼发现的）。
 
 **这一步不许动的**：不改 GPT-2 线的任何训练代码或超参；不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值。
 
