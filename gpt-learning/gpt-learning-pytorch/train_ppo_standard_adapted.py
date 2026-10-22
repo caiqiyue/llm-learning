@@ -183,8 +183,7 @@ REWARD_WHITEN = cfg("ppo_reward_whiten", False)
 # (1) Tokenizer
 # ===========================================================================
 vocab_path = os.path.join("data", "vocab.txt")
-v = r'E:\ai-learning\05-llm-fundamentals\llm-learning\gpt-learning\gpt-learning-pytorch\data\vocab.txt'
-tokenizer = CharTokenizer(vocab_path=v)
+tokenizer = CharTokenizer(vocab_path=vocab_path)
 vocab_size = tokenizer.vocab_size
 print(f"[ppo] vocab_size = {vocab_size}")
 
@@ -213,7 +212,7 @@ def build_gpt2(dropout: float = 0.0) -> GPT2:
 
 policy_model = build_gpt2(dropout=0.0).to(device) #策略模型，主要被训练的对象
 
-sft_ckpt_path = r"E:\ai-learning\05-llm-fundamentals\llm-learning\gpt-learning\gpt-learning-pytorch\checkpoints\sft.pt"
+sft_ckpt_path = os.path.join("checkpoints", "sft.pt")
 print(f"[ppo] loading SFT checkpoint from {sft_ckpt_path}")
 sft_ckpt = load_checkpoint(sft_ckpt_path)
 
@@ -250,7 +249,7 @@ reward_model = build_gpt2(dropout=0.0) # 奖励模型，不训练
 reward_model.value_head = nn.Linear(reward_model.n_embd, 1, bias=True)
 reward_model.to(device)
 
-reward_ckpt = load_checkpoint(r"E:\ai-learning\05-llm-fundamentals\llm-learning\gpt-learning\gpt-learning-pytorch\checkpoints\reward.pt")
+reward_ckpt = load_checkpoint(os.path.join("checkpoints", "reward.pt"))
 reward_model.load_state_dict(reward_ckpt["model_state"], strict=False)
 reward_model.eval()
 for p in reward_model.parameters():

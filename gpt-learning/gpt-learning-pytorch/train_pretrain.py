@@ -49,10 +49,9 @@ print(f"[pretrain] device = {device}")
 #     - vocab.txt 由 data/build_vocab.py 提前生成
 #     - 注：CharTokenizer(vocab_path) 是唯一支持的形式（与 design §6.2 / dataset_construction §6 对齐）
 
-# 与 data/ 同级目录的 vocab.txt；保持相对路径方便项目搬迁  'data\\vocab.txt' 
+# 与 data/ 同级目录的 vocab.txt；保持相对路径方便项目搬迁  'data\\vocab.txt'
 vocab_path = os.path.join("data", "vocab.txt")
-v = r'E:\ai-learning\05-llm-fundamentals\gpt-learning\gpt-learning-pytorch\data\vocab.txt'
-tokenizer = CharTokenizer(vocab_path=v)
+tokenizer = CharTokenizer(vocab_path=vocab_path)
 vocab_size = tokenizer.vocab_size  # 45 个词
 print(f"[pretrain] vocab_size = {vocab_size}")
 

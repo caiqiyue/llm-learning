@@ -19,6 +19,14 @@
 """
 
 import os
+import sys
+
+# 让 `python data/build_vocab.py` 这种直接执行方式也能 import 到 `data` 包：
+# 直接执行时 sys.path[0] 是脚本所在的 data/ 目录，找不到上层的 `data` 包。
+# 把仓库根（本文件的上一级）补进 sys.path，两种执行方式就都能工作。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # 5 个特殊 token；顺序决定 id，必须与 tokenizer.py 的 UNK_ID=0, PAD_ID=1, BOS_ID=2, EOS_ID=3, SEP_ID=4 一致
 SPECIAL_TOKENS = ["<unk>", "<pad>", "<bos>", "<eos>", "<sep>"]

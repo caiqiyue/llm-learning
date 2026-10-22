@@ -50,8 +50,7 @@ print(f"[reward] device = {device}")
 # (2) 加载 tokenizer（只为拿到 vocab_size）
 # ---------------------------------------------------------------------------
 vocab_path = os.path.join("data", "vocab.txt")
-v = r'E:\ai-learning\05-llm-fundamentals\gpt-learning\gpt-learning-pytorch\data\vocab.txt'
-tokenizer = CharTokenizer(vocab_path=v)
+tokenizer = CharTokenizer(vocab_path=vocab_path)
 vocab_size = tokenizer.vocab_size
 print(f"[reward] vocab_size = {vocab_size}")
 

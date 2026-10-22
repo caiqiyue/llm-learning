@@ -48,10 +48,11 @@ print(f"[sft] device = {device}")
 
 
 # ---------------------------------------------------------------------------
-# (2) 加载 tokenizeros.path.join("data", "vocab.txt")
+# (2) 加载 tokenizer
+#     词表路径用相对路径（相对本脚本所在目录），不写死绝对路径 —— 换机器/换目录不会失效
 # ---------------------------------------------------------------------------
-v = r'E:\ai-learning\05-llm-fundamentals\gpt-learning\gpt-learning-pytorch\data\vocab.txt'
-tokenizer = CharTokenizer(vocab_path=v)
+vocab_path = os.path.join("data", "vocab.txt")
+tokenizer = CharTokenizer(vocab_path=vocab_path)
 vocab_size = tokenizer.vocab_size
 print(f"[sft] vocab_size = {vocab_size}")
 
