@@ -232,7 +232,7 @@
       "area": "qwen3-data",
       "title": "Qwen3 预训练语料与 DPO 偏好数据构造",
       "user_visible_behavior": "qwen3-pytorch/data/ 下有可复现的预训练语料切块与 DPO 偏好对构造脚本，训练脚本直接能吃。",
-      "status": "not_started",
+      "status": "passing",
       "verification": [
         "data/pretrain_data.py：按 block_size + 1 切块（多留 1 个 token 做 label shift），inputs/targets 错位一位",
         "data/preference_data.py：产出 {prompt, chosen, rejected} 三元组，每条 prompt 非空、chosen ≠ rejected",
@@ -240,8 +240,15 @@
         "提供 make_pretrain_loader / make_preference_loader 接口供训练脚本使用",
         "代码独立重写，不跨目录 import GPT-2 线（AGENTS.md 硬约束）"
       ],
-      "evidence": [],
-      "notes": "【与设计.md §10 的差异，已对齐】设计.md §10 把 feat-019 标为 deferred（理由：tokenizer 选型被 feat-022 取代，只剩语料选型并入 feat-020）；但 开发计划.md Task 12 明确要建 pretrain_data.py 与 preference_data.py，且 DPO（feat-024）必须有偏好对才能跑。因此本条保留并明确为「语料 + 偏好数据构造」，与 feat-022（tokenizer）职责不重叠。对应 开发计划.md Task 12。"
+      "evidence": [
+        "2026-10-22 新增 data/corpus.py（合成语料的**唯一真源**，纯 Python，不依赖 torch）+ data/pretrain_data.py（build_token_stream / build_blocks / PretrainDataset / make_pretrain_loader）+ data/preference_data.py（generate_preference_dataset / format_prompt_response / make_preference_loader）+ tests/test_data.py。data/build_vocab.py 改为从 corpus.py 取语料，两条线语料同源。",
+        "2026-10-22 `python tests/test_data.py` → `[token 流] 20 句 -> 145 tokens （原始 784 字节，压缩比 5.41 字节/token）` / `[DataLoader] val batches=50 shape=(4, 32) vocab=778` / `[DataLoader] train=1810 val=200 占比=0.900 (config.train_ratio=0.9)` / `test_data OK  blocks=11 pairs=200`（exit 0，耗时 1.6s）；`python tests/run_all.py` → PASS=9 FAIL=0 TOTAL=9 / all green。",
+        "2026-10-22 **语料同源已用「重建词表逐字节一致」证明**：把语料生成器从 build_vocab.py 搬到 corpus.py 后重跑 `python data/build_vocab.py`，`diff -q` 结果 vocab.json 与 merges.txt **与重构前完全相同**（vocab 778 / merges 521）→ 词表 100% 覆盖预训练语料。",
+        "2026-10-22 测试覆盖 5 组：①切块错位（targets = inputs 左移一位，块数 = (N-step)//step + 1，末尾不足一块丢弃，每块内部都对齐）②语料可复现（同 seed 一致 / 异 seed 不同 / 是句子列表不是长字符串 / 与 BPE 语料同源）③**token 流里的文档分隔符必须是特殊 token id 0**（EOT 数量 = 句子数；字面文本 \"<|endoftext|>\" 编码后不含 id 0 且被拆成多段）④偏好数据结构（prompt/chosen/rejected 非空、chosen ≠ rejected、四种策略都出现、可复现、format 拼接完整、loader 策略合法）⑤DataLoader（形状 (4,32)、long dtype、targets 错位、token id 在词表范围内、train/val 划分稳定且占比 = config.train_ratio）。",
+        "2026-10-22 **修正初稿的 7 个真 bug**（详见 开发计划.md Task 12 Step 7 「实测修正记录」）：①pretrain_data.py 缺 `import torch`（__getitem__ 里用 torch.tensor 会 NameError）②tests/test_data.py 缺 sys.path 引导（直接跑会 ModuleNotFoundError）③**文档分隔符用字面文本 \"<|endoftext|>\" 是错的** —— 特殊 token 不是字节序列，字面文本会被编码成 13 个普通 token，模型学不到「id 0 = 文档边界」，还会打断预分词块边界；改为在 token 层面用 id 0 连接（build_token_stream）④_make_unrelated 有 1/5 概率产出 chosen == rejected，违反不变量且测试随机挂⑤语料生成器不唯一 → 新增 data/corpus.py 作为唯一真源（顺带理顺依赖方向，避免环）⑥encode 太慢（10 万块 × 521 条规则 = 几十秒）→ 加块级记忆化，loader 构造总耗时降到 1.6s⑦缺 make_preference_loader（feat-019 验证项要求）→ 补上。",
+        "2026-10-22 附带说明：DPO 训练路径刻意用「prompt 与 response 分开的两段文本」，而不是 format_prompt_response 拼出的完整文本 —— DPO 只能对回复部分算 logprob，回复起始位置必须精确知道；format_prompt_response 留给评估/生成场景。"
+      ],
+      "notes": "对应 开发计划.md Task 12。语料生成器唯一真源 = data/corpus.py；BPE 词表（data/build_vocab.py）与预训练语料（data/pretrain_data.py）同源，重建后词表逐字节一致。文档分隔符用特殊 token id 0，不用它的字面文本。train/val 按块下标哈希稳定划分（避免合成语料高度重复导致的顺序偏差）。接口与 GPT-2 线同名（make_pretrain_loader / generate_preference_dataset），代码独立重写、不跨目录 import。"
     },
     {
       "id": "feat-020",

@@ -47,6 +47,9 @@ class BPETokenizer:
             i: bytes_to_token_str(b) for i, b in self._vocab_bytes.items()
         }
         self.stoi: Dict[str, int] = {s: i for i, s in self.itos.items()}
+        # 「块 → id 列表」缓存：块的编码与上下文无关，同一块只算一次。
+        # 10 万块的合成语料从几十秒降到接近线性。
+        self._chunk_cache: Dict[str, List[int]] = {}
 
     # ------------------------------------------------------------------
     # 公开接口（对齐 CharTokenizer）
@@ -58,14 +61,14 @@ class BPETokenizer:
 
     def encode(self, s: str) -> List[int]:
         """
-        把文本编码成 token id 列表。
+        把文本编码成 token id 列表（带块级缓存）。
 
         参数：
             s: 输入文本
         返回：
             token id 列表
         """
-        return encode(s, self.merges, self._vocab_bytes)
+        return encode(s, self.merges, self._vocab_bytes, cache=self._chunk_cache)
 
     def decode(self, ids: List[int]) -> str:
         """

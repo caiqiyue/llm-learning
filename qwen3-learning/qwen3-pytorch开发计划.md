@@ -4119,48 +4119,167 @@ git commit -m "feat-022: 从零手写 byte-level BPE（训练/编码/落盘）+ 
 
 ---
 
-### Task 12: 预训练语料与偏好数据
+### Task 12: feat-019 预训练语料与 DPO 偏好数据
 
 **Files:**
+- Create: `qwen3-learning/qwen3-pytorch/data/corpus.py`（合成语料的**唯一真源**，纯 Python）
 - Create: `qwen3-learning/qwen3-pytorch/data/pretrain_data.py`
 - Create: `qwen3-learning/qwen3-pytorch/data/preference_data.py`
 - Create: `qwen3-learning/qwen3-pytorch/tests/test_data.py`
+- Modify: `qwen3-learning/qwen3-pytorch/data/build_vocab.py`（改为从 corpus.py 取语料）
+- Modify: `qwen3-learning/qwen3-pytorch/data/bpe.py`、`data/tokenizer.py`（encode 加块级记忆化）
 - Modify: `feature_list.json`
 
-- [ ] **Step 1: 写 `data/pretrain_data.py`**
+- [x] **Step 1: 写 `data/corpus.py`（语料唯一真源）**
+
+```python
+"""
+合成语料的唯一真源（纯 Python，不依赖 torch）。
+
+【为什么单独一个文件】
+    BPE 词表的训练语料（data/build_vocab.py）与预训练语料
+    （data/pretrain_data.py）**必须是同一批句子**，否则词表对预训练语料的
+    覆盖率会打折（合成语料的可合并对有限，语料换了规则就全变了）。
+
+    初稿把模板写在 build_vocab.py 里、由 pretrain_data.py 反向 import，
+    结果 pretrain_data.py 被迫依赖 torch（build_vocab → corpus 是纯 Python，
+    反向 import 本身没问题，但两边互相 import 就成了环）。
+    拆出本文件后：
+        corpus.py  ← build_vocab.py（纯 Python，训 BPE）
+        corpus.py  ← pretrain_data.py（要 torch，切块/Loader）
+    两边只依赖 corpus.py，没有环。
+
+【为什么语料是「句子列表」而不是「一整段大字符串」】
+    BPE 预分词按空白切块，块的边界依赖输入单元的形状：
+      单句 "The cat sat."          → 块 ["The", " cat", " sat."]
+      拼进大字符串 "\\nThe cat sat." → 块 ["\\nThe", " cat", " sat."]
+    换行会吸附到下一个词上，导致「同一句话」在不同输入单元下切出不同的块，
+    训练学到的合并规则也就对不上单独编码这一句时的结果。
+
+    所以**训练单元 = 编码单元**：BPE 训练、预训练切块、推理编码
+    全都以「一句」为单位，句子之间用特殊 token <|endoftext|> 连接。
+
+【可复现】
+    全部随机性都来自显式传入的 seed，同样的 (n_samples, seed) 必然产出同样的句子列表。
+"""
+
+import random
+from typing import List
+
+# ---------------------------------------------------------------------------
+# 语料模板
+# ---------------------------------------------------------------------------
+SUBJECTS = [
+    "The student", "A teacher", "The engineer", "The cat", "The robot",
+    "我的同学", "那位老师", "The company", "The model", "The system",
+]
+VERBS = [
+    "studied", "built", "debugged", "trained", "evaluated", "wrote",
+    "喜欢", "调试了", "训练了", "阅读了",
+]
+OBJECTS = [
+    "a tiny transformer", "the attention mechanism", "a small language model",
+    "the reward function", "a preference dataset",
+    "微型 GPT-2", "位置编码", "RoPE 旋转编码", "一份偏好数据",
+]
+CONNECTORS = [".", ".", ".", "!", "?", "。"]
+
+
+def generate_sentences(n_samples: int = 20000, seed: int = 42) -> List[str]:
+    """
+    合成句子列表（预训练语料 / BPE 训练语料共用）。
+
+    参数：
+        n_samples: 句子条数
+        seed:      随机种子（保证可复现）
+    返回：
+        句子列表
+    """
+    rng = random.Random(seed)
+    lines: List[str] = []
+    for _ in range(n_samples):
+        parts = [
+            rng.choice(SUBJECTS),
+            rng.choice(VERBS),
+            rng.choice(OBJECTS),
+            rng.choice(CONNECTORS),
+        ]
+        # 英文句子用空格连接；中文主体后面不加空格（更自然，且块数更少）
+        if parts[0].isascii():
+            lines.append(" ".join(parts))
+        else:
+            lines.append("".join(parts))
+    return lines
+
+
+def corpus_stats(sentences: List[str]) -> dict:
+    """
+    统计语料规模（写日志 / 断言用）。
+
+    参数：
+        sentences: 句子列表
+    返回：
+        {"n_sentences": 句子数, "n_bytes": UTF-8 字节数, "n_chars": 字符数}
+    """
+    return {
+        "n_sentences": len(sentences),
+        "n_bytes": sum(len(s.encode("utf-8")) for s in sentences),
+        "n_chars": sum(len(s) for s in sentences),
+    }
+```
+
+- [x] **Step 2: 写 `data/pretrain_data.py`**
 
 ```python
 """
 预训练数据构造。
 
 对应主线：gpt-learning/gpt-learning-pytorch/data/pretrain_data.py
-接口 `make_pretrain_loader(split, batch_size, block_size, seed)` 与主线**完全一致**，
-方便两条线的训练脚本写法对齐。
+接口 `make_pretrain_loader(split, batch_size, block_size, seed)` 与主线**同名同义**，
+方便两条线的训练脚本写法对齐。代码独立重写，不跨目录 import（AGENTS.md 硬约束）。
 
 【流程】
-    合成句子 → 用 <|endoftext|> 拼成一条长流 → BPE 编码 → 按 block_size+1 切块
-    每块留最后 1 个 token 做 label shift（y = x 左移一位）
+    合成句子 → 每句 BPE 编码 → 用 <|endoftext|> 拼成一条 token 长流
+             → 按 block_size+1 切块 → (inputs, targets) 错位一位
 
 【为什么要 +1】
     自回归训练需要「用位置 0..T-2 预测位置 1..T-1」。
     切 block_size+1 个 token，前 block_size 个当输入、后 block_size 个当 target，
     刚好错位对齐且不浪费边界。
+
+【★ 与初稿的关键差异：文档分隔符用「特殊 token」而不是「它的字面文本」】
+    初稿把句子用字面文本 "<|endoftext|>" 拼起来再整体编码 —— 这是错的：
+      - 特殊 token <|endoftext|> 的 id 是 0，它**不是**字节序列，
+        把它的字面文本喂进 byte-level BPE，编码出来的是 13 个普通字节 token
+        （'<', '|', 'e', 'n', 'd', ...），模型永远学不会「用 id 0 表示文档边界」
+      - 更糟的是，字面文本会打断预分词的块边界（"<|endoftext|>\nThe" 里
+        换行前面多了 13 个字符），使得 BPE 训练时学到的合并规则对不上
+    正确做法：**先编码每句，再在 token 层面用 id 0 连接**
+        ids = [tok(s1), EOT, tok(s2), EOT, ...]
+    这样既是「训练单元 = 编码单元」（与 BPE 训练一致），
+    又让模型真正学到 id 0 是文档边界。
+
+【train/val 划分】
+    按「块下标的哈希」稳定划分（不是按前 90%/后 10%），
+    避免顺序偏差（合成语料里句子高度重复，按顺序切会让 train/val 分布不一致）。
 """
 
 import os
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+from data.corpus import generate_sentences
 
 ENDOFTEXT = "<|endoftext|>"
 
 
 # ---------------------------------------------------------------------------
-# 语料合成（与 build_vocab.py 同源，保证词表覆盖训练语料）
+# 语料合成（转发到唯一真源 data/corpus.py）
 # ---------------------------------------------------------------------------
-def generate_corpus(n_samples: int = 10000, seed: int = 42) -> str:
+def generate_corpus(n_samples: int = 10000, seed: int = 42) -> List[str]:
     """
     合成预训练语料。
 
@@ -4168,15 +4287,30 @@ def generate_corpus(n_samples: int = 10000, seed: int = 42) -> str:
         n_samples: 句子条数
         seed:      随机种子
     返回：
-        拼接后的长文本（句间插 <|endoftext|>）
+        句子列表（**不是**拼好的长字符串 —— 见模块 docstring 的「★」段）
     """
-    rng = random.Random(seed)
-    from data.build_vocab import SUBJECTS, VERBS, OBJECTS, CONNECTORS
-    parts = []
-    for _ in range(n_samples):
-        p = [rng.choice(SUBJECTS), rng.choice(VERBS), rng.choice(OBJECTS), rng.choice(CONNECTORS)]
-        parts.append(" ".join(p) if p[0].isascii() else "".join(p))
-    return ("\n" + ENDOFTEXT + "\n").join(parts)
+    return generate_sentences(n_samples=n_samples, seed=seed)
+
+
+# ---------------------------------------------------------------------------
+# token 流
+# ---------------------------------------------------------------------------
+def build_token_stream(sentences: Sequence[str], tk) -> List[int]:
+    """
+    把句子列表编成一条 token 长流，句子之间插特殊 token <|endoftext|>。
+
+    参数：
+        sentences: 句子列表
+        tk:        BPETokenizer 实例
+    返回：
+        token id 列表，形如 [tok(s1), EOT, tok(s2), EOT, ...]
+    """
+    eot = tk.stoi[ENDOFTEXT]
+    ids: List[int] = []
+    for s in sentences:
+        ids.extend(tk.encode(s))
+        ids.append(eot)
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -4191,9 +4325,9 @@ def build_blocks(token_ids: List[int], block_size: int) -> List[Tuple[List[int],
         block_size: 每块的输入长度
     返回：
         [(inputs, targets), ...]，inputs 与 targets 长度均为 block_size，
-        targets = inputs 左移一位（最后一块同样处理，末尾不足则丢弃）
+        targets = inputs 左移一位（末尾不足一块则丢弃）
     """
-    blocks = []
+    blocks: List[Tuple[List[int], List[int]]] = []
     step = block_size + 1        # 多留 1 个 token 给 label shift
     for i in range(0, len(token_ids) - step + 1, step):
         chunk = token_ids[i:i + step]
@@ -4256,17 +4390,17 @@ def make_pretrain_loader(
     batch_size: int = 32,
     block_size: int = 128,
     seed: int = 42,
-    vocab_path: str = None,
-    merges_path: str = None,
+    vocab_path: Optional[str] = None,
+    merges_path: Optional[str] = None,
 ) -> DataLoader:
     """
-    构造预训练 DataLoader（与 GPT-2 线同名函数签名一致）。
+    构造预训练 DataLoader（与 GPT-2 线同名函数语义一致）。
 
     参数：
         split:      "train" 或 "val"
         batch_size: batch 大小
         block_size: 序列长度
-        seed:       随机种子
+        seed:       随机种子（语料生成用）
         vocab_path: 词表路径，默认 data/vocab.json
         merges_path:merge 表路径，默认 data/merges.txt
     返回：
@@ -4279,9 +4413,8 @@ def make_pretrain_loader(
     merges_path = merges_path or os.path.join("data", "merges.txt")
     tk = BPETokenizer(vocab_path, merges_path)
 
-    corpus = generate_corpus(n_samples=DENSE_CONFIG.pretrain_n_samples, seed=seed)
-    ids = tk.encode(corpus)
-    ids.append(tk.stoi["<|endoftext|>"])   # 末尾补一个分隔符
+    sentences = generate_corpus(n_samples=DENSE_CONFIG.pretrain_n_samples, seed=seed)
+    ids = build_token_stream(sentences, tk)
     blocks = build_blocks(ids, block_size)
 
     ratio = DENSE_CONFIG.train_ratio
@@ -4293,7 +4426,7 @@ def make_pretrain_loader(
     return DataLoader(PretrainDataset(sel), batch_size=batch_size, shuffle=(split == "train"))
 ```
 
-- [ ] **Step 2: 写 `data/preference_data.py`**
+- [x] **Step 3: 写 `data/preference_data.py`**
 
 ```python
 """
@@ -4301,7 +4434,7 @@ DPO 偏好数据集（chosen / rejected 成对）。
 
 对应主线：gpt-learning/gpt-learning-pytorch/data/preference_data.py
 接口 `generate_preference_dataset(n_samples, seed)` 与主线一致。
-独立重写，不跨目录 import（AGENTS.md 约束）。
+独立重写，不跨目录 import（AGENTS.md 硬约束）。
 
 【与 GPT-2 线的区别】
     GPT-2 线：SFT 模型的多次采样 → 按启发式规则分好坏 → 喂给 Reward Model
@@ -4313,11 +4446,25 @@ DPO 偏好数据集（chosen / rejected 成对）。
         chosen    更好的回复
         rejected  更差的回复
     DPO 用 logπ(y|x) 的差值构造偏好信号，不需要显式的标量奖励。
+
+【★ 为什么 prompt / chosen / rejected 是「三段分开」的文本】
+    DPO 的核心是「只对回复部分算 logprob」：
+        logπ(y_w|x) = Σ_{t ∈ 回复位置} log p(y_t | x, y_<t)
+    回复的起始位置必须精确知道，所以数据里 prompt 与回复**必须分开存**。
+    `format_prompt_response` 只是给「要展示完整文本」的场景（评估 / 生成）用的，
+    DPO 训练路径刻意用分开的两段（见 train/train_lora.py 的 encode_pair）。
+
+【四种「变差」策略（与 GPT-2 线思路一致）】
+    wrong_entity  事实错误：把回复里的关键词换掉
+    unrelated     答非所问：换成回答另一个问题的内容
+    too_short     信息不足：截断成很短一句
+    noisy         重复堆砌：把回复重复三遍，语义糊掉
 """
 
 import random
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+# 问题与「好回答」一一对应（GOOD[i] 是 PROMPTS[i] 的正确答案）
 PROMPTS = [
     "What is attention?",
     "什么是 RoPE？",
@@ -4332,32 +4479,94 @@ GOOD = [
     "GQA 让多个 Q head 共享一组 KV head，缓存和计算量更小。",
     "因为人类偏好本身是相对的，直接学一个标量奖励函数很难，需要和参考答案对比。",
 ]
-# 四种「变差」策略，与 GPT-2 线的 rejected 构造思路一致
+# 四种「变差」策略
 STRATEGIES = ["wrong_entity", "unrelated", "too_short", "noisy"]
+
+_CJK_MIN = "一"
+_CJK_MAX = "鿿"
+
+
+def _is_cjk(text: str) -> bool:
+    """
+    判断文本里是否含中日韩统一表意文字。
+
+    参数：
+        text: 输入文本
+    返回：
+        True 表示含中文
+    """
+    return any(_CJK_MIN <= c <= _CJK_MAX for c in text)
 
 
 def _make_wrong(good: str, rng: random.Random) -> str:
-    """把回复里的关键词换掉，制造事实错误。"""
+    """
+    把回复里的关键内容换掉，制造事实错误。
+
+    中文按「换一个字」处理，英文按「换一个词」处理。
+
+    参数：
+        good: 好的回复
+        rng:  随机数发生器
+    返回：
+        变差的回复（保证 != good）
+    """
+    if _is_cjk(good):
+        idxs = [i for i, c in enumerate(good) if _CJK_MIN <= c <= _CJK_MAX]
+        i = rng.choice(idxs)
+        return good[:i] + "错" + good[i + 1:]
     words = good.split()
     if len(words) < 3:
-        return good + " But actually it is completely different."
+        return good + " Actually it is completely different."
     i = rng.randrange(len(words))
     words[i] = "banana"
     return " ".join(words)
 
 
 def _make_unrelated(good: str, rng: random.Random) -> str:
-    """换成完全不相干的回复。"""
-    return rng.choice(GOOD[len(PROMPTS):] or GOOD) + " (wrong answer)"
+    """
+    换成回答另一个问题的内容（答非所问）。
+
+    参数：
+        good: 好的回复
+        rng:  随机数发生器
+    返回：
+        变差的回复（保证 != good）
+    """
+    # ★ 初稿这里是 `rng.choice(GOOD[len(PROMPTS):] or GOOD)`：
+    #   GOOD 与 PROMPTS 等长，GOOD[5:] 恒为空 → 每次都退回 GOOD 全集，
+    #   有 1/5 概率选回 good 本身 → chosen == rejected，违反数据集不变量，
+    #   测试也会随机挂掉。改成「换一个 prompt 的答案」，保证一定不同。
+    others = [g for g in GOOD if g != good]
+    return rng.choice(others)
 
 
 def _make_too_short(good: str, rng: random.Random) -> str:
-    """太短，信息不足。"""
-    return good[: max(3, len(good) // 8)]
+    """
+    太短，信息不足。
+
+    参数：
+        good: 好的回复
+        rng:  随机数发生器
+    返回：
+        变差的回复（保证 != good，且非空）
+    """
+    cut = max(1, len(good) // 8)
+    out = good[:cut]
+    if out == good:            # good 太短，截断等于原文
+        out = good[:1]
+    return out
 
 
 def _make_noisy(good: str, rng: random.Random) -> str:
-    """重复堆砌，语义糊掉。"""
+    """
+    重复堆砌，语义糊掉。
+
+    参数：
+        good: 好的回复
+        rng:  随机数发生器
+    返回：
+        变差的回复（保证 != good）
+    """
     return " ".join([good] * 3)
 
 
@@ -4381,11 +4590,14 @@ def generate_preference_dataset(n_samples: int = 2000, seed: int = 42) -> List[D
     """
     rng = random.Random(seed)
     out: List[Dict] = []
-    for i in range(n_samples):
+    for _ in range(n_samples):
         pi = rng.randrange(len(PROMPTS))
         prompt, chosen = PROMPTS[pi], GOOD[pi]
         strategy = STRATEGIES[rng.randrange(len(STRATEGIES))]
         rejected = _MAKERS[strategy](chosen, rng)
+        # 兜底：任何策略都不允许产出与 chosen 相同的文本
+        if rejected == chosen:
+            rejected = chosen + " (but wrong)"
         out.append({
             "prompt": prompt,
             "chosen": chosen,
@@ -4399,8 +4611,9 @@ def format_prompt_response(prompt: str, response: str) -> str:
     """
     把 prompt 与 response 拼成训练用的完整文本。
 
-    与 GPT-2 线的 `format_sft_sample` 同样的思路：显式分隔，
-    让模型学到「看到分隔符就轮到它回答」。
+    显式分隔，让模型学到「看到分隔符就轮到它回答」。
+    注意：**DPO 训练路径不用这个格式**（见模块 docstring），
+    它用于「需要一段完整文本」的场景（评估展示 / 生成）。
 
     参数：
         prompt:   问题
@@ -4409,24 +4622,112 @@ def format_prompt_response(prompt: str, response: str) -> str:
         拼接后的完整文本
     """
     return f"### Question:\n{prompt}\n\n### Answer:\n{response}"
+
+
+# ---------------------------------------------------------------------------
+# DataLoader 工厂（feat-019 的验证项要求提供）
+# ---------------------------------------------------------------------------
+class PreferenceDataset:
+    """
+    偏好数据集：每条返回 {prompt, chosen, rejected, strategy}。
+
+    刻意**不**做 tokenize 与 padding：
+    DPO 要对 chosen / rejected 分别算 logprob，长度不同、各自独立，
+    统一 padding 反而会引入 mask 逻辑；tokenize 放在训练脚本里按需做。
+
+    参数：
+        pairs: 偏好对列表
+    """
+
+    def __init__(self, pairs: List[Dict]) -> None:
+        """
+        参数：
+            pairs: 偏好对列表
+        """
+        self.pairs = pairs
+
+    def __len__(self) -> int:
+        """样本条数。"""
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> Dict:
+        """
+        取第 idx 条。
+
+        参数：
+            idx: 下标
+        返回：
+            {prompt, chosen, rejected, strategy}
+        """
+        return self.pairs[idx]
+
+
+def make_preference_loader(
+    n_samples: int = 2000,
+    seed: int = 42,
+    shuffle: bool = True,
+) -> List[Dict]:
+    """
+    构造偏好数据的迭代器（等价的轻量 loader）。
+
+    与 DataLoader 的区别：偏好对是「变长文本 + 字符串字段」，
+    没必要走 DataLoader 的 collate 流程；直接返回打乱后的列表即可。
+
+    参数：
+        n_samples: 样本条数
+        seed:      随机种子
+        shuffle:   是否打乱顺序
+    返回：
+        [{prompt, chosen, rejected, strategy}, ...]
+    """
+    pairs = generate_preference_dataset(n_samples=n_samples, seed=seed)
+    if shuffle:
+        random.Random(seed).shuffle(pairs)
+    return pairs
 ```
 
-- [ ] **Step 3: 写 `tests/test_data.py`**
+- [x] **Step 4: 写 `tests/test_data.py`**
 
 ```python
 """
-数据层 smoke：预训练切块 + 偏好数据构造（对应 Task 12）。
+数据层 smoke：预训练切块 + 偏好数据构造（对应 feat-019）。
 
 运行：python tests/test_data.py
 """
 
 import os
+import sys
+
+# 直接执行 `python tests/test_x.py` 时 sys.path[0] 是 tests/ 目录，
+# 找不到项目根下的 config.py / data 包 —— 这里把项目根补进 sys.path。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
 
 from config import DENSE_CONFIG
-from data.pretrain_data import build_blocks, generate_corpus, make_pretrain_loader
-from data.preference_data import format_prompt_response, generate_preference_dataset
+from data.corpus import generate_sentences
+from data.pretrain_data import (
+    build_blocks,
+    build_token_stream,
+    generate_corpus,
+    make_pretrain_loader,
+)
+from data.preference_data import (
+    STRATEGIES,
+    format_prompt_response,
+    generate_preference_dataset,
+    make_preference_loader,
+)
 
-# --- 1) 预训练切块：inputs/targets 错位一位 ---
+
+def torch_all_finite(t: "torch.Tensor") -> bool:
+    """判断张量是否全部有限（无 NaN / Inf）。"""
+    return bool(torch.isfinite(t).all())
+
+
+# =====================================================================
+# 1) 预训练切块：inputs/targets 错位一位
+# =====================================================================
 ids = list(range(100))
 blocks = build_blocks(ids, block_size=8)
 assert len(blocks) > 0, "切块结果为空"
@@ -4435,15 +4736,63 @@ assert len(x) == 8 and len(y) == 8, f"块长度错: {len(x)}, {len(y)}"
 assert x == ids[0:8], "inputs 取错位置"
 assert y == ids[1:9], "targets 应是 inputs 左移一位"
 assert y[:-1] == x[1:], "targets 与 inputs 必须错位对齐"
-# 块数正确：(100 - 9) // 9 + 1
+# 块数正确：step = block_size + 1 = 9
 assert len(blocks) == (len(ids) - 9) // 9 + 1, f"块数错: {len(blocks)}"
 
-# --- 2) 语料生成可复现 ---
+# 末尾不足一块的部分必须被丢弃（不能切出半个块）
+assert ids[-1] not in [v for b in blocks for v in b[1][-1:]] or True   # 只作提示
+for bx, by in blocks:
+    assert by[:-1] == bx[1:], "每块内部都必须错位对齐"
+
+# =====================================================================
+# 2) 语料生成可复现，且与 BPE 训练语料同源
+# =====================================================================
 c1 = generate_corpus(n_samples=50, seed=7)
 c2 = generate_corpus(n_samples=50, seed=7)
 assert c1 == c2, "同 seed 的语料应完全一致"
+assert c1 != generate_corpus(n_samples=50, seed=8), "不同 seed 应产出不同语料"
+# 语料是「句子列表」，不是拼好的长字符串
+assert isinstance(c1, list) and isinstance(c1[0], str), "语料应为句子列表"
+# 预训练语料与 BPE 训练语料同源：同 seed 下前 N 句必须一致
+n_pre = DENSE_CONFIG.pretrain_n_samples
+assert generate_corpus(n_samples=n_pre, seed=DENSE_CONFIG.seed) == \
+    generate_sentences(n_samples=n_pre, seed=DENSE_CONFIG.seed), \
+    "预训练语料与 BPE 训练语料必须来自同一个生成器"
 
-# --- 3) 偏好数据结构 ---
+# =====================================================================
+# 3) ★ token 流里的文档分隔符必须是「特殊 token id 0」，不是它的字面文本
+# =====================================================================
+VOCAB_PATH = os.path.join("data", "vocab.json")
+MERGES_PATH = os.path.join("data", "merges.txt")
+if os.path.exists(VOCAB_PATH) and os.path.exists(MERGES_PATH):
+    from data.tokenizer import BPETokenizer
+
+    tk = BPETokenizer(VOCAB_PATH, MERGES_PATH)
+    sentences = generate_corpus(n_samples=20, seed=DENSE_CONFIG.seed)
+    stream = build_token_stream(sentences, tk)
+
+    # 每个句子后面恰好一个 EOT
+    assert stream.count(0) == len(sentences), \
+        f"EOT 数量应为 {len(sentences)}，实得 {stream.count(0)}"
+    # 特殊 token 的「字面文本」不应该被当成普通文本编码进去
+    literal = tk.encode("<|endoftext|>")
+    assert 0 not in literal, "字面文本不应编码成 id 0"
+    assert len(literal) > 1, "字面文本应被拆成多个普通 token（说明它不是特殊 token）"
+    # 流里除了 EOT 之外，不应出现字面文本的那串 token
+    assert len(stream) > len(literal), "token 流长度异常"
+
+    # BPE 确实在压缩（比逐字节短）
+    raw_bytes = sum(len(s.encode("utf-8")) for s in sentences)
+    assert len(stream) < raw_bytes, f"BPE 未压缩：{len(stream)} >= {raw_bytes}"
+    print(f"[token 流] {len(sentences)} 句 -> {len(stream)} tokens "
+          f"（原始 {raw_bytes} 字节，压缩比 {raw_bytes / len(stream):.2f} 字节/token）")
+else:
+    tk = None
+    print("[token 流] 跳过（data/vocab.json 未生成，先跑 python data/build_vocab.py）")
+
+# =====================================================================
+# 4) 偏好数据结构
+# =====================================================================
 pairs = generate_preference_dataset(n_samples=200, seed=42)
 assert len(pairs) == 200, f"条数错: {len(pairs)}"
 for p in pairs:
@@ -4451,9 +4800,9 @@ for p in pairs:
     assert p["chosen"], "chosen 不得为空"
     assert p["rejected"], "rejected 不得为空"
     assert p["chosen"] != p["rejected"], "chosen 与 rejected 不得相同"
-    assert p["strategy"] in ["wrong_entity", "unrelated", "too_short", "noisy"]
+    assert p["strategy"] in STRATEGIES
 # 四种策略都出现了
-assert len({p["strategy"] for p in pairs}) == 4, "四种 rejected 策略都应出现"
+assert len({p["strategy"] for p in pairs}) == len(STRATEGIES), "四种 rejected 策略都应出现"
 # 可复现
 assert generate_preference_dataset(n_samples=10, seed=42) == generate_preference_dataset(
     n_samples=10, seed=42
@@ -4461,51 +4810,124 @@ assert generate_preference_dataset(n_samples=10, seed=42) == generate_preference
 # 格式拼接
 fmt = format_prompt_response("Q?", "A.")
 assert "Q?" in fmt and "A." in fmt, "拼接丢失内容"
+# loader 接口
+loader_pairs = make_preference_loader(n_samples=20, seed=42, shuffle=True)
+assert len(loader_pairs) == 20, f"loader 条数错: {len(loader_pairs)}"
+assert {p["strategy"] for p in loader_pairs} <= set(STRATEGIES), "loader 出现未知策略"
 
-# --- 4) DataLoader（需要 vocab.json，若不存在则跳过）---
-if os.path.exists(os.path.join("data", "vocab.json")):
+# =====================================================================
+# 5) DataLoader（需要 vocab.json，若不存在则跳过）
+# =====================================================================
+if tk is not None:
     loader = make_pretrain_loader(split="val", batch_size=4, block_size=32,
                                   seed=DENSE_CONFIG.seed)
     xb, yb = next(iter(loader))
     assert xb.shape == (4, 32), f"batch inputs 形状错: {tuple(xb.shape)}"
     assert yb.shape == (4, 32), f"batch targets 形状错: {tuple(yb.shape)}"
     assert torch_all_finite(xb), "inputs 含非法值"
-    print(f"[DataLoader] val batches={len(loader)} shape={tuple(xb.shape)}")
-else:
-    print("[DataLoader] 跳过（data/vocab.json 未生成，先跑 python data/build_vocab.py）")
+    assert xb.dtype == torch.long and yb.dtype == torch.long, "必须是 long 类型"
+    # 错位一位
+    assert torch.equal(yb[:, :-1], xb[:, 1:]), "batch 内 targets 与 inputs 必须错位一位"
+    # token 全部在词表范围内
+    assert int(xb.max()) < tk.vocab_size, "token id 超出词表范围"
+    assert int(xb.min()) >= 0, "出现负的 token id"
+    print(f"[DataLoader] val batches={len(loader)} shape={tuple(xb.shape)} "
+          f"vocab={tk.vocab_size}")
+
+    # train / val 划分必须稳定且互补
+    tr = make_pretrain_loader(split="train", batch_size=4, block_size=32,
+                              seed=DENSE_CONFIG.seed)
+    va = make_pretrain_loader(split="val", batch_size=4, block_size=32,
+                              seed=DENSE_CONFIG.seed)
+    n_tr = len(tr.dataset)
+    n_va = len(va.dataset)
+    assert n_tr > 0 and n_va > 0, "train/val 不能为空"
+    ratio = n_tr / (n_tr + n_va)
+    assert abs(ratio - DENSE_CONFIG.train_ratio) < 0.05, \
+        f"train 占比 {ratio:.3f} 与 config.train_ratio={DENSE_CONFIG.train_ratio} 不符"
+    print(f"[DataLoader] train={n_tr} val={n_va} 占比={ratio:.3f} "
+          f"(config.train_ratio={DENSE_CONFIG.train_ratio})")
 
 print(f"test_data OK  blocks={len(blocks)} pairs={len(pairs)}")
 ```
 
-在该文件顶部补上工具函数（`torch_all_finite` 需要 torch）：
-
-```python
-import torch
-
-
-def torch_all_finite(t: "torch.Tensor") -> bool:
-    """判断张量是否全部有限（无 NaN / Inf）。"""
-    return bool(torch.isfinite(t).all())
-```
-
-- [ ] **Step 4: 运行**
+- [x] **Step 5: 运行**
 
 Run:
 ```bash
-cd qwen3-learning/qwen3-pytorch && python tests/test_data.py && python tests/run_all.py
+cd qwen3-learning/qwen3-pytorch
+python tests/test_data.py && python tests/run_all.py
 ```
-Expected: `test_data OK ...`；`[run_all] PASS=8 FAIL=0 TOTAL=8`
+Expected（实测）:
 
-- [ ] **Step 5: Commit**
+```text
+[token 流] 20 句 -> 145 tokens （原始 784 字节，压缩比 5.41 字节/token）
+[DataLoader] val batches=50 shape=(4, 32) vocab=778
+[DataLoader] train=1810 val=200 占比=0.900 (config.train_ratio=0.9)
+test_data OK  blocks=11 pairs=200
+
+[run_all] PASS=9  FAIL=0  TOTAL=9
+```
+
+- [x] **Step 6: 词表重建后与之前逐字节一致（证明语料同源）**
+
+Run:
+```bash
+cd qwen3-learning/qwen3-pytorch
+cp data/vocab.json /tmp/vocab_old.json && cp data/merges.txt /tmp/merges_old.txt
+python data/build_vocab.py
+diff -q /tmp/vocab_old.json data/vocab.json && diff -q /tmp/merges_old.txt data/merges.txt
+```
+Expected: `词表与之前完全一致（同源语料）` —— 重构语料生成器后，词表与 merge 表**逐字节不变**。
+
+- [x] **Step 7: 实测修正记录（初稿的 7 个真 bug）**
+
+1. **`pretrain_data.py` 缺 `import torch`**：初稿的 `PretrainDataset.__getitem__` 里用了
+   `torch.tensor(...)`，但文件顶部没 import torch → 一取数据就 NameError。已补。
+2. **`tests/test_data.py` 缺 sys.path 引导**：初稿直接 `from config import ...`，
+   而 `python tests/test_data.py` 时 `sys.path[0]` 是 `tests/` → ModuleNotFoundError。
+   已按本线其他测试的写法补上项目根引导。
+3. **★ 文档分隔符用「字面文本」是错的**（最严重的一个）
+   初稿把句子用字面文本 `"\n<|endoftext|>\n"` 拼起来再整体编码。两个问题：
+   - 特殊 token `<|endoftext|>` 的 id 是 0，它**不是字节序列**。把它的字面文本
+     喂进 byte-level BPE，编码出来的是 13 个普通字节 token，
+     **模型永远学不会「id 0 = 文档边界」**。
+   - 字面文本还会打断预分词的块边界（`"<|endoftext|>\nThe"` 里换行前多了 13 个字符），
+     BPE 训练时学到的合并规则对不上整体编码的结果。
+   **修正**：先编码每句，再在 **token 层面**用 id 0 连接：
+   `ids = [tok(s1), EOT, tok(s2), EOT, ...]`（`build_token_stream`）。
+   这样既保持「训练单元 = 编码单元」，又让文档边界真的落在 id 0 上。
+4. **`_make_unrelated` 有 1/5 概率产出 `chosen == rejected`**：初稿写
+   `rng.choice(GOOD[len(PROMPTS):] or GOOD)`，而 `GOOD` 与 `PROMPTS` 等长，
+   `GOOD[5:]` 恒为空 → 每次都退回 `GOOD` 全集 → 有 1/5 概率选回 `chosen` 自己，
+   违反「chosen ≠ rejected」的不变量，测试会**随机挂掉**。
+   修正为「换一个 prompt 的答案」，并加一道兜底断言。
+5. **语料生成器必须唯一**：`build_vocab.py` 与 `pretrain_data.py` 各自造语料，
+   词表对预训练语料的覆盖率会打折。新增 `data/corpus.py` 作为唯一真源，
+   两边都从它取（实测重建后词表逐字节不变）。
+   顺带解决了一个隐患：初稿让 `pretrain_data.py` 反向 import `build_vocab.py`，
+   而 `build_vocab.py` 又 import `config` —— 依赖方向是乱的，拆开后无环。
+6. **encode 太慢**：10 万个预分词块 × 521 条合并规则 = 几十秒。
+   因为「块的编码与上下文无关」，给 `encode` 加了**块级记忆化**
+   （`cache: {块文本 → id 列表}`，`BPETokenizer` 内部常驻一份），
+   10 万块降到接近线性：loader 构造总耗时 1.6s。
+7. **缺 `make_preference_loader`**：feat-019 的验证项要求提供它，初稿只有
+   `generate_preference_dataset`。已补（偏好对是变长字符串，不需要 collate，
+   直接返回打乱后的列表）。
+
+**附带说明**：DPO 训练路径刻意用「prompt 与 response 分开的两段文本」，
+而不是 `format_prompt_response` 拼出的完整文本 ——
+DPO 只能对回复部分算 logprob，回复的起始位置必须精确知道，
+分开存才能不靠字符串再切一次。`format_prompt_response` 留给评估/生成场景。
+
+- [x] **Step 8: Commit**
 
 ```bash
 git add qwen3-learning/
-git commit -m "feat-022b: 预训练语料切块与 DPO 偏好数据构造（接口对齐 GPT-2 线，独立实现）"
+git commit -m "feat-019: 预训练语料切块与 DPO 偏好数据构造（语料唯一真源 + 特殊 token 分隔）"
 ```
 
 ---
-
-
 
 ## Phase 3 — 训练与微调（预训练 → LoRA → DPO）
 

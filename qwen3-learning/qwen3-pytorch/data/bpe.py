@@ -49,7 +49,7 @@ import json
 import os
 import re
 from collections import Counter
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # 特殊 token 的 id 固定为 0，保证不会被任何字节 token 或合并结果占用
 ENDOFTEXT = "<|endoftext|>"
@@ -270,7 +270,54 @@ def build_vocab(merges: Sequence[Tuple[int, int]]) -> Dict[int, bytes]:
     return vocab
 
 
-def encode(text: str, merges: Sequence[Tuple[int, int]], vocab: Dict[int, bytes]) -> List[int]:
+def _encode_chunk(chunk: str, merges: Sequence[Tuple[int, int]]) -> List[int]:
+    """
+    编码单个预分词块。
+
+    【为什么可以单独抽出来】
+        合并规则不跨块边界，所以「一个块的编码结果」只取决于
+        (块文本, merges)，与它在语料中的位置无关 —— 这正是可以按块
+        记忆化（memoize）的前提。
+
+    参数：
+        chunk:  块文本
+        merges: merge 表
+    返回：
+        token id 列表
+    """
+    chunk_ids: List[int] = [b + 1 for b in chunk.encode("utf-8")]
+    for i, (a, b) in enumerate(merges):
+        # 快路径：块里根本没有 a 这个 id，这一轮必然无事可做
+        if a not in chunk_ids:
+            continue
+        new_id = MERGE_OFFSET + i
+        out: List[int] = []
+        changed = False
+        j = 0
+        n = len(chunk_ids)
+        while j < n:
+            if j + 1 < n and chunk_ids[j] == a and chunk_ids[j + 1] == b:
+                out.append(new_id)
+                j += 2
+                changed = True
+            else:
+                out.append(chunk_ids[j])
+                j += 1
+        if not changed:
+            continue
+        chunk_ids = out
+        # 若整个块已合并成一个，提前结束
+        if len(chunk_ids) == 1:
+            break
+    return chunk_ids
+
+
+def encode(
+    text: str,
+    merges: Sequence[Tuple[int, int]],
+    vocab: Dict[int, bytes],
+    cache: Optional[Dict[str, List[int]]] = None,
+) -> List[int]:
     """
     用训练好的 merge 表把文本编码成 token id 序列。
 
@@ -290,39 +337,31 @@ def encode(text: str, merges: Sequence[Tuple[int, int]], vocab: Dict[int, bytes]
         因为 merges 是**严格按训练时的优先级**排好的：靠前的合并规则优先级更高。
         顺序应用一次即可得到与训练语料一致的结果，且只需 O(len(merges) × T)。
 
+    【为什么要 cache】
+        合成语料的唯一种块只有几十个，但**出现次数**是几万次。
+        每次都重跑一遍「521 条合并规则 × 块长」的扫描，
+        10 万个块要跑几十秒。
+        由于块的编码与上下文无关，缓存 (块文本 → id 列表) 后，
+        每种块只算一次，整体降到接近线性。
+
     参数：
         text:   输入文本
         merges: merge 表
         vocab:  词表（encode 实际不需要，但要传以便校验）
+        cache:  可选的「块 → id 列表」缓存；传 dict 会被就地填充
     返回：
         token id 列表
     """
     ids: List[int] = []
     for chunk in pretokenize(text):
-        chunk_ids: List[int] = [b + 1 for b in chunk.encode("utf-8")]
-        for i, (a, b) in enumerate(merges):
-            # 快路径：块里根本没有 a 这个 id，这一轮必然无事可做
-            if a not in chunk_ids:
+        if cache is not None:
+            hit = cache.get(chunk)
+            if hit is not None:
+                ids.extend(hit)
                 continue
-            new_id = MERGE_OFFSET + i
-            out: List[int] = []
-            changed = False
-            j = 0
-            n = len(chunk_ids)
-            while j < n:
-                if j + 1 < n and chunk_ids[j] == a and chunk_ids[j + 1] == b:
-                    out.append(new_id)
-                    j += 2
-                    changed = True
-                else:
-                    out.append(chunk_ids[j])
-                    j += 1
-            if not changed:
-                continue
-            chunk_ids = out
-            # 若整个块已合并成一个，提前结束
-            if len(chunk_ids) == 1:
-                break
+        chunk_ids = _encode_chunk(chunk, merges)
+        if cache is not None:
+            cache[chunk] = chunk_ids
         ids.extend(chunk_ids)
     return ids
 
