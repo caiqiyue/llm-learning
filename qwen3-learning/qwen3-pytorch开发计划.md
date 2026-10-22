@@ -5510,9 +5510,12 @@ git commit -m "feat-020: Qwen3 预训练脚本 + smoke（--model dense|moe，超
 - Create: `qwen3-learning/qwen3-pytorch/model/common/lora.py`
 - Create: `qwen3-learning/qwen3-pytorch/train/train_lora.py`
 - Create: `qwen3-learning/qwen3-pytorch/tests/test_lora.py`
+- Modify: `qwen3-learning/qwen3-pytorch/config.py`（`lora_lr` 3e-4 → 1e-3，`lora_max_iters` 300 → 1500，均有实测依据，见 Step 4）
+- Modify: `init.sh`（L4 层加一条 LoRA smoke）
 - Modify: `feature_list.json`
+- Create: `qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`（本任务写 LoRA 半部，DPO 半部待 feat-024）
 
-- [ ] **Step 1: 写 `model/common/lora.py`**
+- [x] **Step 1: 写 `model/common/lora.py`**
 
 ```python
 """
@@ -5532,6 +5535,25 @@ git commit -m "feat-020: Qwen3 预训练脚本 + smoke（--model dense|moe，超
       与预训练权重完全一致，LoRA 是在这个基础上慢慢长出来的
     - base.weight / base.bias 全部 requires_grad=False，只训 A / B
     - (alpha / r) 是缩放因子：alpha 通常取 2r，让有效学习率与全参微调可比
+
+【三件套 + 两个补丁】
+    三个基本动作：
+        inject_lora        按模块名注入
+        set_lora_enabled   一键开关 LoRA 分支（DPO 的 π_θ / π_ref 就靠它）
+        merge_lora         把 ΔW 折回 base 权重（导出成普通 Linear）
+    两个补丁（本仓库实测踩坑后补的，**初稿没有**）：
+    1. `mark_only_lora_trainable`：注入 LoRA **只冻结被包装的那个 Linear**，
+       embedding / RMSNorm / MLP / lm_head 仍然是 requires_grad=True ——
+       那样「LoRA 微调」悄悄变成「大部分参数都在训」，与 LoRA 的前提（基座冻结）
+       不符。本函数把其余参数全部冻结，只留 A / B 可训。
+    2. `merge_lora` 合并完会把分支的 scaling 置 0：ΔW 折进 base 之后，
+       前向再算一次 LoRA 分支就变成 **(base + ΔW)x + ΔWx = 被算两遍**。
+       合并的语义是「把旁路收进主干」，所以合并完必须关掉分支。
+
+【与 DPO 的关系】
+    DPO 需要两个模型：π_θ（当前策略）与 π_ref（参考策略）。
+    本实现**不加载第二份权重**：同一个模型对象，开着 LoRA 分支是 π_θ，
+    关掉（set_lora_enabled(model, False)）就是 π_ref —— 省一份显存与一份 checkpoint。
 """
 
 import math
@@ -5563,7 +5585,8 @@ class LoRALinear(nn.Module):
             dropout: LoRA 分支 dropout 概率
         """
         super().__init__()
-        assert r > 0, "r 必须为正"
+        if r <= 0:
+            raise ValueError(f"r 必须为正，实得 {r}")
         self.base = base
         self.r = r
         self.alpha = alpha
@@ -5575,7 +5598,7 @@ class LoRALinear(nn.Module):
         # A: (r, in_features) —— Kaiming 初始化
         self.lora_A = nn.Parameter(torch.empty(r, in_features))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        # B: (out_features, r) —— **零初始化**
+        # B: (out_features, r) —— **零初始化**（注入即无损的关键）
         self.lora_B = nn.Parameter(torch.zeros(out_features, r))
 
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -5631,6 +5654,7 @@ def inject_lora(
         被替换的模块全名列表（便于打印与写笔记）
     """
     replaced: List[str] = []
+    # 先把 named_modules() 物化成 list —— 边遍历边替换会出问题
     for name, module in list(model.named_modules()):
         for child_name, child in list(module.named_children()):
             if not isinstance(child, nn.Linear):
@@ -5644,7 +5668,10 @@ def inject_lora(
 
 def merge_lora(model: nn.Module) -> int:
     """
-    把 LoRA 分支合并回 base 权重。
+    把 LoRA 分支合并回 base 权重，**并关掉分支**。
+
+    ⚠️ 关分支是必须的：ΔW 折进 base 之后，如果分支还开着，
+    输出就变成 (base + ΔW)x + ΔWx —— 被算两遍。
 
     参数：
         model: 已注入 LoRA 的模型
@@ -5655,6 +5682,7 @@ def merge_lora(model: nn.Module) -> int:
     for module in model.modules():
         if isinstance(module, LoRALinear):
             module.base.weight.data.copy_(module.merged_weight())
+            module.scaling = 0.0        # 合并即收编，分支不再参与前向
             count += 1
     return count
 
@@ -5674,45 +5702,114 @@ def set_lora_enabled(model: nn.Module, enabled: bool) -> None:
     for module in model.modules():
         if isinstance(module, LoRALinear):
             module.scaling = module.alpha / module.r if enabled else 0.0
+
+
+def lora_parameters(model: nn.Module) -> List["torch.nn.Parameter"]:
+    """
+    取出模型里所有 LoRA 的 A / B 参数。
+
+    参数：
+        model: 模型
+    返回：
+        参数列表（顺序稳定：按模块遍历顺序）
+    """
+    params: List["torch.nn.Parameter"] = []
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            params.append(module.lora_A)
+            params.append(module.lora_B)
+    return params
+
+
+def mark_only_lora_trainable(model: nn.Module) -> List["torch.nn.Parameter"]:
+    """
+    冻结模型里**除 LoRA A/B 以外的全部参数**，只留 A / B 可训。
+
+    为什么需要：inject_lora 只冻结了被包装的那个 Linear，
+    embedding / RMSNorm / MLP / lm_head 仍然是可训的 ——
+    那样就不是 LoRA 微调，而是「大部分参数都在训」。
+
+    参数：
+        model: 已注入 LoRA 的模型
+    返回：
+        可训练的 LoRA 参数列表
+    """
+    lora_ids = {id(p) for p in lora_parameters(model)}
+    for p in model.parameters():
+        p.requires_grad = id(p) in lora_ids
+    return [p for p in model.parameters() if p.requires_grad]
 ```
 
-- [ ] **Step 2: 写 `tests/test_lora.py`**
+- [x] **Step 2: 写 `tests/test_lora.py`**
 
 ```python
 """
 LoRA smoke：注入前后输出一致、只有 A/B 有梯度、merge 后等价。
 
+对应 feat-023（开发计划 Task 14）。
+
 运行：python tests/test_lora.py
 """
+
+import os
+import sys
 
 import torch
 import torch.nn as nn
 
+# 直接执行 `python tests/test_x.py` 时 sys.path[0] 是 tests/ 目录，
+# 找不到项目根下的 config.py / model 包 —— 这里把项目根补进 sys.path。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import DENSE_CONFIG
-from model.common.lora import LoRALinear, inject_lora, merge_lora, set_lora_enabled
+from model.common.lora import (
+    LoRALinear,
+    inject_lora,
+    lora_parameters,
+    mark_only_lora_trainable,
+    merge_lora,
+    set_lora_enabled,
+)
 from model.qwen3_dense import Qwen3Dense
 
 torch.manual_seed(DENSE_CONFIG.seed)
 
-# --- 1) 单个 LoRALinear：B 零初始化 → 输出与 base 完全一致 ---
+R = DENSE_CONFIG.lora_r
+ALPHA = DENSE_CONFIG.lora_alpha
+
+# =====================================================================
+# 1) 单个 LoRALinear：B 零初始化 → 输出与 base 完全一致
+# =====================================================================
 base = nn.Linear(16, 32, bias=False)
 x = torch.randn(4, 16)
 y0 = base(x)
-lora = LoRALinear(base, r=4, alpha=8)
+lora = LoRALinear(base, r=R, alpha=ALPHA)
 y1 = lora(x)
 assert torch.allclose(y0, y1, atol=1e-6), "B 零初始化时 LoRA 分支应无输出"
+assert lora.scaling == ALPHA / R, f"scaling 应为 alpha/r={ALPHA/R}，实得 {lora.scaling}"
 
-# --- 2) base 被冻结 ---
+# =====================================================================
+# 2) base 被冻结
+# =====================================================================
 assert base.weight.requires_grad is False, "base.weight 应被冻结"
 assert lora.lora_A.requires_grad and lora.lora_B.requires_grad, "A/B 应可训练"
 
-# --- 3) 只有 A/B 收到梯度 ---
+# =====================================================================
+# 3) 只有 A/B 收到梯度
+# =====================================================================
 loss = lora(x).sum()
 loss.backward()
 assert lora.lora_A.grad is not None and lora.lora_B.grad is not None, "A/B 应有梯度"
 assert base.weight.grad is None, "base 不应有梯度"
 
-# --- 4) 注入整模型后输出逐元素相等 ---
+# 带 bias 的 Linear：bias 也要被冻结
+base_b = nn.Linear(16, 32, bias=True)
+lora_b = LoRALinear(base_b, r=R, alpha=ALPHA)
+assert base_b.bias.requires_grad is False, "base.bias 也应被冻结"
+
+# =====================================================================
+# 4) 注入整模型后输出逐元素相等（B 零初始化 ⇒ 注入即无损）
+# =====================================================================
 V = 256
 model = Qwen3Dense(vocab_size=V, cfg=DENSE_CONFIG, dropout=0.0)
 model.eval()
@@ -5720,21 +5817,34 @@ idx = torch.randint(0, V, (2, 8))
 with torch.no_grad():
     logits_before = model(idx)[0]
 
-replaced = inject_lora(model, DENSE_CONFIG.lora_target_modules,
-                       r=DENSE_CONFIG.lora_r, alpha=DENSE_CONFIG.lora_alpha)
+replaced = inject_lora(model, DENSE_CONFIG.lora_target_modules, r=R, alpha=ALPHA)
 assert len(replaced) > 0, "没有注入任何 LoRA 模块"
+# 每个 block 的 q_proj / v_proj 各一个 → n_layer * 2
+assert len(replaced) == DENSE_CONFIG.n_layer * len(DENSE_CONFIG.lora_target_modules), \
+    f"应注入 {DENSE_CONFIG.n_layer * len(DENSE_CONFIG.lora_target_modules)} 个模块，实得 {len(replaced)}"
 with torch.no_grad():
     logits_after = model(idx)[0]
 assert torch.allclose(logits_before, logits_after, atol=1e-6), \
     f"注入前后输出应逐元素相等，最大差异 {float((logits_before - logits_after).abs().max())}"
 
-# --- 5) set_lora_enabled(False) 等价于关掉 LoRA 分支 ---
+# =====================================================================
+# 5) set_lora_enabled(False) 等价于关掉 LoRA 分支（= 注入前的 base 行为）
+# =====================================================================
 set_lora_enabled(model, False)
 with torch.no_grad():
     logits_off = model(idx)[0]
 assert torch.allclose(logits_before, logits_off, atol=1e-6), "关闭 LoRA 分支后应回到注入前"
 
-# --- 6) merge_lora 后与「开着 LoRA」等价 ---
+# =====================================================================
+# 6) merge_lora 后与「开着 LoRA」等价
+#    ⚠️ 回归点：merge 把 ΔW 折进 base 之后，必须把分支关掉，
+#    否则输出 = (base + ΔW)x + ΔWx = 被算两遍。
+# =====================================================================
+# 先把 B 训练成非零（否则 ΔW = 0，测不出双算）
+with torch.no_grad():
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            m.lora_B.normal_(0, 0.02)
 set_lora_enabled(model, True)
 with torch.no_grad():
     logits_on = model(idx)[0]
@@ -5745,11 +5855,57 @@ with torch.no_grad():
 assert torch.allclose(logits_on, logits_merged, atol=1e-4), \
     f"merge 后应与未 merge 等价，最大差异 {float((logits_on - logits_merged).abs().max())}"
 
-print(f"test_lora OK  replaced={len(replaced)} r={DENSE_CONFIG.lora_r} "
-      f"alpha={DENSE_CONFIG.lora_alpha}")
+# =====================================================================
+# 7) ΔW 的秩 ≤ r（这才是 LoRA 的「低秩」约束）
+# =====================================================================
+sub = LoRALinear(nn.Linear(16, 32, bias=False), r=R, alpha=ALPHA).double()
+with torch.no_grad():
+    sub.lora_B.normal_(0, 0.5)
+delta = sub.scaling * (sub.lora_B @ sub.lora_A)
+rank = int(torch.linalg.matrix_rank(delta).item())
+assert rank <= R, f"ΔW 的秩应 ≤ r={R}，实得 {rank}"
+assert sub.merged_weight().shape == (32, 16), "合并权重形状应与 base 一致"
+
+# =====================================================================
+# 8) mark_only_lora_trainable：注入后其余参数必须全部冻结
+#    （否则「LoRA 微调」悄悄变成了「大部分参数都在训」）
+# =====================================================================
+model2 = Qwen3Dense(vocab_size=V, cfg=DENSE_CONFIG, dropout=0.0)
+inject_lora(model2, DENSE_CONFIG.lora_target_modules, r=R, alpha=ALPHA)
+trainable = mark_only_lora_trainable(model2)
+assert len(trainable) > 0, "应至少有一组可训练参数"
+for p in model2.parameters():
+    is_lora = any(p is q for q in trainable)
+    assert p.requires_grad == is_lora, \
+        "非 LoRA 参数必须冻结，LoRA 参数必须可训"
+# 可训练参数量 = 每个注入模块的 (r*in + out*r)
+expected = 0
+for m in model2.modules():
+    if isinstance(m, LoRALinear):
+        expected += m.lora_A.numel() + m.lora_B.numel()
+assert sum(p.numel() for p in trainable) == expected, "可训练参数量与 LoRA 参数量不符"
+assert sum(p.numel() for p in model2.parameters() if p.requires_grad) < \
+    sum(p.numel() for p in model2.parameters()) * 0.2, "可训练参数占比应远小于 20%"
+print(f"[可训练参数] {sum(p.numel() for p in trainable):,} / "
+      f"{sum(p.numel() for p in model2.parameters()):,} "
+      f"({sum(p.numel() for p in trainable)/sum(p.numel() for p in model2.parameters()):.2%})")
+
+# lora_parameters 与 mark_only_lora_trainable 应给同一批参数
+assert len(lora_parameters(model2)) == len(trainable), "两个 helper 应返回同一批参数"
+
+# =====================================================================
+# 9) 边界情况：没有可注入的模块 / 没有 LoRA 的模型
+# =====================================================================
+assert inject_lora(model2, ("no_such_module",), r=R, alpha=ALPHA) == [], \
+    "不存在的目标模块应返回空列表"
+set_lora_enabled(model2, False)   # 没有 LoRA 时不应报错
+assert merge_lora(nn.Linear(4, 4)) == 0, "没有 LoRA 时 merge 应返回 0"
+
+print(f"test_lora OK  replaced={len(replaced)} r={R} alpha={ALPHA} "
+      f"scaling={ALPHA/R}")
 ```
 
-- [ ] **Step 3: 写 `train/train_lora.py`**
+- [x] **Step 3: 写 `train/train_lora.py`**
 
 ```python
 """
@@ -5765,64 +5921,233 @@ Qwen3 LoRA 微调。
 【流程】
     1. 加载 checkpoints/pretrain_dense.pt
     2. inject_lora(model, ["q_proj", "v_proj"], r=4, alpha=8)
-    3. 冻结 base，只训 A / B
+    3. 冻结 base（含 embedding / Norm / MLP / lm_head），只训 A / B
     4. 评估：偏好胜率（chosen 的 logprob 高于 rejected 的样本比例）
+
+【★ 为什么回复部分要单独编码、单独计分】
+    LoRA 与 DPO 都需要「只对回复部分算 logprob」：
+        logπ(y|x) = Σ_{t ∈ 回复位置} log p(y_t | x, y_<t)
+    所以 prompt 段与 response 段**分别编码再拼接**，
+    这样「回复从哪个 token 开始」是精确已知的，不用在拼接后的字符串里再切一次。
+    拼接用的是 data/preference_data.py::format_prompt_response 的同一套分隔符
+    （`### Question:\\n...\\n\\n### Answer:\\n`），但**分开编码**，
+    避免边界处 BPE 把分隔符和回复第一个字符合并掉。
+
+【★ 关于「注入即无损」】
+    LoRA 的 B 矩阵零初始化 ⇒ 刚注入时模型输出与预训练权重**逐元素相等**，
+    所以训练起点就是预训练模型本身，不会因为注入而突然变差。
+    这一点由 tests/test_lora.py 第 4 条守住。
+
+【★ 评估口径（别过度解读）】
+    合成偏好数据只有 5 个 prompt × 5 个 chosen，**训练集与评估集同分布**，
+    所以打印出来的胜率是「训练内指标」，**不能当成泛化能力**。
+    它的用途是：证明「LoRA 确实让模型更偏向 chosen」。
 """
 
 import argparse
 import os
+import sys
+from typing import List, Optional, Tuple
+
+# 把项目根补进 sys.path（脚本在 train/ 子目录里，sys.path[0] 不是项目根）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn.functional as F
 
 from config import DENSE_CONFIG
-from data.preference_data import format_prompt_response, generate_preference_dataset
+from data.preference_data import generate_preference_dataset
 from data.tokenizer import BPETokenizer
-from model.common.lora import inject_lora, set_lora_enabled
+from model.common.lora import inject_lora, mark_only_lora_trainable, set_lora_enabled
 from model.qwen3_dense import Qwen3Dense
-from utils import get_device, set_seed
+from utils import get_device, save_checkpoint, set_seed
+
+# prompt 与 response 的分隔模板（与 data/preference_data.py::format_prompt_response 一致）
+PROMPT_TEMPLATE = "### Question:\n{prompt}\n\n### Answer:\n"
+
+
+def encode_prompt_response(
+    tk: "BPETokenizer",
+    prompt: str,
+    response: str,
+) -> Tuple[List[int], int]:
+    """
+    把 prompt 与 response 分别编码后拼接，返回 (token 序列, 回复起始下标)。
+
+    分别编码而不是编码拼接后的字符串：边界处 BPE 可能把分隔符和回复第一个字符合并，
+    那时「回复从哪开始」就不再精确了。
+
+    参数：
+        tk:       tokenizer
+        prompt:   问题
+        response: 回答
+    返回：
+        (ids, n_prompt)：完整 token 列表、回复部分的起始下标
+    """
+    prefix_ids = tk.encode(PROMPT_TEMPLATE.format(prompt=prompt))
+    resp_ids = tk.encode(response)
+    return prefix_ids + resp_ids, len(prefix_ids)
+
+
+def build_training_example(
+    tk: "BPETokenizer",
+    prompt: str,
+    response: str,
+    block_size: int,
+) -> Optional[Tuple["torch.Tensor", "torch.Tensor", int]]:
+    """
+    构造一条「只对回复部分计分」的训练样本。
+
+    模型内部的 loss 是 `cross_entropy(logits, targets)`（**不做内部 shift**），
+    所以 targets[i] 必须是「位置 i 预测出来的 token」，即 ids[i+1]。
+    prompt 段与最后一个位置都用 -100 忽略。
+
+    参数：
+        tk:         tokenizer
+        prompt:     问题
+        response:   回答
+        block_size: 最大上下文长度
+    返回：
+        (inputs, targets, n_prompt)；样本无效（太短）时返回 None
+    """
+    ids, n_prompt = encode_prompt_response(tk, prompt, response)
+    ids = ids[:block_size]
+    n_prompt = min(n_prompt, len(ids) - 1)      # 至少留 1 个回复 token
+    if len(ids) < 2 or n_prompt >= len(ids) - 1:
+        return None
+    inputs = torch.tensor(ids, dtype=torch.long).unsqueeze(0)      # (1, L)
+    targets = torch.full_like(inputs, -100)
+    # 位置 n_prompt-1 .. L-2 的 target 是 ids[n_prompt] .. ids[L-1]
+    targets[0, n_prompt - 1: len(ids) - 1] = inputs[0, n_prompt:]
+    return inputs, targets, n_prompt
 
 
 def encode_pair(
-    model: torch.nn.Module,
+    model: "torch.nn.Module",
     tk: "BPETokenizer",
     pair: dict,
     device: torch.device,
-) -> tuple:
+    block_size: int = DENSE_CONFIG.block_size,
+) -> Tuple[Tuple["torch.Tensor", int], Tuple["torch.Tensor", int]]:
     """
-    算一对 (chosen, rejected) 在给定模型下的序列 logprob。
+    算一对 (chosen, rejected) 在给定模型下的序列 logprob（**只对回复部分**）。
 
     参数：
-        model:  模型
-        tk:     tokenizer
-        pair:   {"prompt", "chosen", "rejected"}
-        device: 设备
+        model:      模型
+        tk:         tokenizer
+        pair:       {"prompt", "chosen", "rejected"}
+        device:     设备
+        block_size: 最大上下文长度
     返回：
-        (lp_chosen, lp_rejected)，各为 (1,) tensor
+        ((lp_chosen, n_chosen), (lp_rejected, n_rejected))
+        lp 是 (1,) tensor（总 logprob），n 是被计分的 token 数
     """
-    prompt_ids = tk.encode(pair["prompt"])
     out = []
     for key in ("chosen", "rejected"):
-        resp_ids = tk.encode(pair[key])
-        ids = (prompt_ids + resp_ids)[: DENSE_CONFIG.block_size]
-        if len(ids) < 2:
-            out.append(torch.zeros(1, device=device))
+        ids, n_prompt = encode_prompt_response(tk, pair["prompt"], pair[key])
+        ids = ids[:block_size]
+        n_prompt = min(n_prompt, len(ids) - 1)
+        if len(ids) < 2 or n_prompt >= len(ids) - 1:
+            out.append((torch.zeros(1, device=device), 0))
             continue
         idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-        logits, _, _, _ = model(idx)
+        logits = model(idx)[0]                                    # (1, L, V)
         logp = F.log_softmax(logits.float(), dim=-1)
-        # 第 0..len(prompt)-1 个位置预测的是 prompt 自身，只对 response 位置计分
-        n_prompt = min(len(prompt_ids), len(ids) - 1)
-        picked = logp[0, n_prompt - 1: -1, :].gather(
-            -1, idx[0, n_prompt:].unsqueeze(-1)).squeeze(-1)
-        out.append(picked.sum().unsqueeze(0))
+        # 位置 p 的 logits 预测 ids[p+1] → 回复 token ids[n_prompt:] 由位置 n_prompt-1..L-2 预测
+        positions = torch.arange(n_prompt - 1, len(ids) - 1, device=device)
+        targets = idx[0, n_prompt:]
+        picked = logp[0, positions, :].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        out.append((picked.sum().unsqueeze(0), int(picked.numel())))
     return out[0], out[1]
+
+
+@torch.no_grad()
+def evaluate_pairs(
+    model: "torch.nn.Module",
+    tk: "BPETokenizer",
+    pairs: List[dict],
+    device: torch.device,
+    max_samples: int,
+) -> dict:
+    """
+    评估「偏好胜率」并拆开看。
+
+    指标：
+        win_rate          chosen 的**总** logprob 高于 rejected 的比例（DPO 的口径）
+        win_rate_per_token 每 token 平均 logprob 的胜率（**长度归一**后的口径）
+        mean_logp_chosen  chosen 的平均总 logprob
+        by_strategy       按「变差策略」分组的胜率（长短不同的回复会让两种口径打架）
+
+    【为什么要两种口径】
+        总 logprob 与回复长度正相关 —— 回复越短，总 logprob 越接近 0（越大），
+        所以「总 logprob 胜率」会**系统性偏袒短回复**（too_short 策略必输）；
+        长度归一后又反过来偏袒「可预测」的文本（重复、常见词）。
+        **DPO 用 π_ref 相减正好抵消这两种静态偏差** —— 这正是 DPO 减参考模型的原因。
+
+    参数：
+        model:       模型
+        tk:          tokenizer
+        pairs:       偏好对列表
+        device:      设备
+        max_samples: 最多评估多少对
+    返回：
+        指标字典
+    """
+    was_training = model.training
+    model.eval()
+    rows = []
+    for pair in pairs[:max_samples]:
+        (lp_w, n_w), (lp_l, n_l) = encode_pair(model, tk, pair, device)
+        rows.append((float(lp_w.item()), n_w, float(lp_l.item()), n_l, pair.get("strategy", "?")))
+
+    n = max(1, len(rows))
+    wins = sum(1 for lw, _, ll, _, _ in rows if lw > ll)
+    wins_norm = sum(1 for lw, nw, ll, nl, _ in rows
+                    if lw / max(1, nw) > ll / max(1, nl))
+    by_strategy = {}
+    for s in sorted({r[4] for r in rows}):
+        sub = [r for r in rows if r[4] == s]
+        by_strategy[s] = {
+            "n": len(sub),
+            "win_rate": sum(1 for lw, _, ll, _, _ in sub if lw > ll) / max(1, len(sub)),
+            "win_rate_per_token": sum(1 for lw, nw, ll, nl, _ in sub
+                                      if lw / max(1, nw) > ll / max(1, nl)) / max(1, len(sub)),
+            "len_chosen": sum(r[1] for r in sub) / max(1, len(sub)),
+            "len_rejected": sum(r[3] for r in sub) / max(1, len(sub)),
+        }
+    out = {
+        "win_rate": wins / n,
+        "win_rate_per_token": wins_norm / n,
+        "mean_logp_chosen": sum(r[0] for r in rows) / n,
+        "by_strategy": by_strategy,
+    }
+    if was_training:
+        model.train()
+    return out
+
+
+def print_eval(tag: str, m: dict) -> None:
+    """
+    打印一组评估指标。
+
+    参数：
+        tag: 标签（如 BEFORE / AFTER）
+        m:   evaluate_pairs 的返回值
+    """
+    print(f"[lora] {tag:<7} win_rate={m['win_rate']:.3f}  "
+          f"win_rate_per_token={m['win_rate_per_token']:.3f}  "
+          f"mean_logp(chosen)={m['mean_logp_chosen']:.2f}")
+    for s, v in sorted(m["by_strategy"].items()):
+        print(f"[lora]   {s:<14} n={v['n']:<4} 总logprob胜率={v['win_rate']:.3f}  "
+              f"长度归一胜率={v['win_rate_per_token']:.3f}  "
+              f"len(chosen)={v['len_chosen']:.1f} len(rejected)={v['len_rejected']:.1f}")
 
 
 def main() -> None:
     """LoRA 微调主流程。"""
     parser = argparse.ArgumentParser(description="Qwen3 LoRA 微调")
-    parser.add_argument("--max-iters", type=int, default=None, help="覆盖 config 的 lora_max_iters")
+    parser.add_argument("--max-iters", type=int, default=None,
+                        help="覆盖 config 的 lora_max_iters")
     args = parser.parse_args()
 
     cfg = DENSE_CONFIG
@@ -5834,77 +6159,92 @@ def main() -> None:
 
     tk = BPETokenizer(os.path.join("data", "vocab.json"), os.path.join("data", "merges.txt"))
 
-    # --- 加载预训练权重 ---
-    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0).to(device)
+    # --- 加载预训练权重（必须在注入 LoRA 之前加载：注入后模块名会变）---
     ckpt_path = os.path.join("checkpoints", "pretrain_dense.pt")
+    if not os.path.exists(ckpt_path):
+        print(f"[lora] 找不到 {ckpt_path}，请先跑：python train/train_pretrain.py --model dense")
+        return
+    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0).to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state"], strict=False)
-    print(f"[lora] loaded {ckpt_path}")
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    print(f"[lora] loaded {ckpt_path} (vocab_size={tk.vocab_size})")
 
-    # --- 注入 LoRA ---
+    # --- 注入 LoRA + 只留 A/B 可训 ---
     replaced = inject_lora(model, cfg.lora_target_modules, r=cfg.lora_r,
                            alpha=cfg.lora_alpha, dropout=cfg.lora_dropout)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    print(f"[lora] injected {len(replaced)} modules, trainable params = "
-          f"{sum(p.numel() for p in trainable):,}")
+    trainable = mark_only_lora_trainable(model)
+    n_trainable = sum(p.numel() for p in trainable)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"[lora] injected {len(replaced)} modules: {replaced}")
+    print(f"[lora] trainable params = {n_trainable:,} / {n_total:,} ({n_trainable/n_total:.2%})")
 
     # --- 偏好数据 ---
     pairs = generate_preference_dataset(n_samples=cfg.dpo_n_pairs, seed=cfg.seed)
     print(f"[lora] preference pairs = {len(pairs)}")
 
+    # --- 微调前的基线（注入后 B=0，模型行为 == 预训练模型）---
+    before = evaluate_pairs(model, tk, pairs, device, cfg.eval_max_samples)
+    print_eval("BEFORE", before)
+
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lora_lr, weight_decay=cfg.weight_decay)
 
+    # --- 训练：给定 prompt，补全 chosen（loss 只算回复部分）---
     model.train()
     step = 0
-    for _epoch in range(max_iters // max(1, len(pairs)) + 1):
+    first_loss = None
+    while step < max_iters:
         for pair in pairs:
             if step >= max_iters:
                 break
-            text = format_prompt_response(pair["prompt"], pair["chosen"])
-            ids = tk.encode(text)[: cfg.block_size]
-            if len(ids) < 2:
+            example = build_training_example(tk, pair["prompt"], pair["chosen"], cfg.block_size)
+            if example is None:
                 continue
-            idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-            targets = torch.cat([idx[:, 1:], torch.full_like(idx[:, :1], -100)], dim=1)
+            inputs, targets, _ = example
+            inputs, targets = inputs.to(device), targets.to(device)
 
-            _, loss, _, _ = model(idx, targets=targets)
+            _, loss, _, _ = model(inputs, targets=targets)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
             optimizer.step()
 
-            if step % 50 == 0:
-                print(f"[lora] step {step:>4}/{max_iters} loss {loss.item():.4f}")
+            if first_loss is None:
+                first_loss = float(loss.item())
+            if step % cfg.log_every == 0:
+                print(f"[lora] step {step:>4}/{max_iters} loss {loss.item():.4f} "
+                      f"lr {optimizer.param_groups[0]['lr']:.2e}")
             step += 1
-        if step >= max_iters:
-            break
 
     # --- 评估：偏好胜率 ---
-    model.eval()
-    wins = 0
-    n_eval = 0
-    with torch.no_grad():
-        for pair in pairs[: cfg.eval_max_samples]:
-            lp_w, lp_l = encode_pair(model, tk, pair, device)
-            wins += int(lp_w.item() > lp_l.item())
-            n_eval += 1
-    win_rate = wins / max(1, n_eval)
-    print(f"[lora] preference win rate = {win_rate:.3f} (random baseline = 0.5)")
+    after = evaluate_pairs(model, tk, pairs, device, cfg.eval_max_samples)
+    print_eval("AFTER", after)
+    print(f"[lora] initial_loss={first_loss:.4f}")
+    print(f"[lora] 胜率 {before['win_rate']:.3f} -> {after['win_rate']:.3f} "
+          f"(随机基线 0.5)，长度归一口径 "
+          f"{before['win_rate_per_token']:.3f} -> {after['win_rate_per_token']:.3f}")
 
-    os.makedirs("checkpoints", exist_ok=True)
-    out = os.path.join("checkpoints", "lora.pt")
-    torch.save({"model_state": model.state_dict(), "win_rate": win_rate}, out)
-    print(f"[lora] saved -> {out}")
+    # --- 落盘 ---
+    path = save_checkpoint(
+        {"model_state": model.state_dict(),
+         "vocab_size": tk.vocab_size,
+         "lora": {"r": cfg.lora_r, "alpha": cfg.lora_alpha,
+                  "target_modules": list(cfg.lora_target_modules)},
+         "metrics": {"before": before, "after": after},
+         "win_rate": after["win_rate"], "base_win_rate": before["win_rate"],
+         "config": cfg.to_dict()},
+        os.path.join("checkpoints", "lora.pt"),
+    )
+    print(f"[lora] saved -> {path}")
 
 
 if __name__ == "__main__":
     main()
 ```
 
-> 实现注：`encode_pair` 是 LoRA / DPO / 评估三处共用的 helper，
+> 实现注：`encode_pair` / `encode_prompt_response` / `evaluate_pairs` 是 LoRA / DPO / 评估三处共用的 helper，
 > 放在 `train/train_lora.py` 里，DPO 与 evaluate.py 都从这里 import，**不要各写一份**。
 
-- [ ] **Step 4: 运行**
+- [x] **Step 4: 运行 + 消融**
 
 ```bash
 cd qwen3-learning/qwen3-pytorch
@@ -5912,17 +6252,182 @@ python tests/test_lora.py
 python train/train_lora.py
 ```
 
-Expected: `test_lora OK  replaced=... r=4 alpha=8`；训练 loss 下降；
-`preference win rate` 明显高于 0.5。
+实测输出（2026-10-22，CPU）：
 
-- [ ] **Step 5: Commit**
+```
+$ python tests/test_lora.py
+[可训练参数] 8,704 / 927,744 (0.94%)
+test_lora OK  replaced=8 r=4 alpha=8 scaling=2.0
+
+$ python train/train_lora.py
+[lora] injected 8 modules: ['blocks.0.attn.q_proj', 'blocks.0.attn.v_proj', 'blocks.1.attn.q_proj', 'blocks.1.attn.v_proj', 'blocks.2.attn.q_proj', 'blocks.2.attn.v_proj', 'blocks.3.attn.q_proj', 'blocks.3.attn.v_proj']
+[lora] trainable params = 8,704 / 994,560 (0.88%)
+[lora] preference pairs = 2000
+[lora] BEFORE  win_rate=0.515  win_rate_per_token=0.400  mean_logp(chosen)=-603.26
+[lora]   noisy          n=43   总logprob胜率=0.767  长度归一胜率=0.163  len(chosen)=71.4 len(rejected)=86.9
+[lora]   too_short      n=47   总logprob胜率=0.000  长度归一胜率=0.404  len(chosen)=72.0 len(rejected)=6.3
+[lora]   unrelated      n=66   总logprob胜率=0.576  长度归一胜率=0.545  len(chosen)=67.4 len(rejected)=69.3
+[lora]   wrong_entity   n=44   总logprob胜率=0.727  长度归一胜率=0.409  len(chosen)=69.5 len(rejected)=70.1
+[lora] step  400/1500 loss 6.0329 lr 1.00e-03
+[lora] step  850/1500 loss 5.7365 lr 1.00e-03
+[lora] step 1450/1500 loss 5.7798 lr 1.00e-03
+[lora] AFTER   win_rate=0.595  win_rate_per_token=0.745  mean_logp(chosen)=-389.48
+[lora]   noisy          n=43   总logprob胜率=0.767  长度归一胜率=0.767  len(chosen)=71.4 len(rejected)=86.9
+[lora]   too_short      n=47   总logprob胜率=0.000  长度归一胜率=0.128  len(chosen)=72.0 len(rejected)=6.3
+[lora]   unrelated      n=66   总logprob胜率=0.667  长度归一胜率=1.000  len(chosen)=67.4 len(rejected)=69.3
+[lora]   wrong_entity   n=44   总logprob胜率=0.955  长度归一胜率=1.000  len(chosen)=69.5 len(rejected)=70.1
+[lora] initial_loss=8.4630
+[lora] 胜率 0.515 -> 0.595 (随机基线 0.5)，长度归一口径 0.400 -> 0.745
+[lora] saved -> checkpoints\lora.pt
+```
+
+**★ 三条可迁移的实测结论**
+
+1. **「注入即无损」是真的**：注入前后 logits 逐元素相等（`torch.allclose(atol=1e-6)`），
+   所以 LoRA 训练的起点严格等于预训练模型，不会因为注入而突然变差。
+2. **只训了 0.88% 的参数**：8,704 / 994,560（8 个模块 × (r·in + out·r)），
+   其余全部 `requires_grad=False`。
+3. **评估口径决定结论**（见下面的消融表）：用「回复总 logprob」比，LoRA 像是只从 0.515 走到 0.595；
+   用「每 token 平均 logprob」比，是 0.400 → 0.745。差别来自**长度偏置**：
+   `too_short` 策略的 rejected 只有 6 个 token、chosen 有 72 个，
+   总 logprob 天然被短文本占便宜（该策略胜率恒为 0.000，与模型好坏无关）。
+
+**★ 消融表（同一份数据、同一份预训练权重、同一份评估集，只改配方）**
+
+| 配方 | loss | 总 logprob 胜率 | 长度归一胜率 | 可训练参数 |
+|---|---|---|---|---|
+| r=4 attn lr=0.001 steps=300 | 8.463 → 6.121 | 0.515 → 0.570 | 0.400 → 0.820 | 8,704 |
+| r=4 attn lr=0.0003 steps=1500 | 8.463 → 5.926 | 0.515 → 0.590 | 0.400 → 0.810 | 8,704 |
+| r=4 attn lr=0.001 steps=1500 | 8.463 → 5.701 | 0.515 → 0.595 | 0.400 → 0.745 | 8,704 |
+| r=16 attn+mlp lr=0.001 steps=300 | 8.415 → 5.319 | 0.515 → 0.605 | 0.400 → 0.730 | 133,120 |
+| r=16 attn+mlp lr=0.001 steps=1500 | 8.415 → 4.153 | 0.515 → 0.640 | 0.400 → 0.865 | 133,120 |
+| r=64 attn+mlp lr=0.001 steps=300 | 8.348 → 4.460 | 0.515 → 0.575 | 0.400 → 0.800 | 532,480 |
+| r=64 attn+mlp lr=0.003 steps=300 | 8.348 → 6.258 | 0.515 → 0.520 | 0.400 → 0.655 | 532,480 |
+| 全参 lr=0.001 steps=300 | 8.450 → 1.217 | 0.515 → 0.715 | 0.400 → 0.835 | 985,856 |
+
+结论（写进笔记）：
+- **低秩约束 + 注入点决定「能学到什么」**：这个任务是「要模型说出特定文本」的**内容型**任务，
+  全参微调 300 步就能把 loss 压到 **1.217**，而最好的 LoRA 配方（r=16 + MLP，1500 步）只能到 **4.153**
+  —— **LoRA 是风格/格式型任务的主场，内容型任务上明显吃力**（差 3 倍多）。
+- **步数不够是主要瓶颈**：r=4 从 300 步到 1500 步，loss 6.121 → 5.701、胜率 0.570 → 0.595
+  （步数翻 5 倍，loss 只降 0.42 —— 瓶颈在「能表达的信息量」）。
+- **lr 1e-3 优于 3e-4**（1500 步时 loss 5.701 vs 5.926，胜率 0.595 vs 0.590）；
+  **r=64 时 lr 3e-3 直接发散**（loss 6.258、胜率 0.520，等于没训）——
+  **秩越大，允许的学习率上限越低**。
+- 据此把 `config.py` 的 `lora_lr` 定为 **1e-3**、`lora_max_iters` 定为 **1500**
+  （**只改这两个数，r=4 / alpha=8 / 注入 q_proj,v_proj 保持计划原样**）。
+- **★ 两个口径对配方的排序不一样**：r=4 训 300 步 vs 1500 步，
+  loss 与总 logprob 口径都是 1500 步更好（6.121→5.701 / 0.570→0.595），
+  **长度归一口径却反过来**（0.820 → 0.745）——
+  因为训得久 → 输出更稳更可预测 → 长度归一口径偏爱它。
+  **「长度归一胜率更高」≠「模型更好」**。这也是 DPO 要减 π_ref 的核心理由。
+
+- [x] **Step 5: 挂进 `init.sh` 的 L4 层**
+
+L4 增加一条 LoRA smoke：注入无损 + 可训练参数占比 < 10%。
 
 ```bash
-git add qwen3-learning/
+  # --- LoRA smoke（feat-023）：注入无损（B 零初始化）+ 只有 A/B 可训 ---
+  if [ -f "$QWEN_DIR/model/common/lora.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_lora.log 2>&1
+import torch
+from config import DENSE_CONFIG
+from model.common.lora import inject_lora, mark_only_lora_trainable
+from model.qwen3_dense import Qwen3Dense
+
+model = Qwen3Dense(vocab_size=256, cfg=DENSE_CONFIG, dropout=0.0)
+model.eval()
+idx = torch.randint(0, 256, (2, 8))
+with torch.no_grad():
+    before = model(idx)[0]
+
+replaced = inject_lora(model, DENSE_CONFIG.lora_target_modules, r=DENSE_CONFIG.lora_r,
+                       alpha=DENSE_CONFIG.lora_alpha)
+with torch.no_grad():
+    after = model(idx)[0]
+# B 零初始化 ⇒ 注入 LoRA 后模型输出必须逐元素不变
+assert torch.allclose(before, after, atol=1e-6), "B 零初始化时注入 LoRA 应无损"
+
+trainable = mark_only_lora_trainable(model)
+n_train = sum(p.numel() for p in trainable)
+n_all = sum(p.numel() for p in model.parameters())
+assert n_train > 0, "应有可训练的 LoRA 参数"
+assert n_train < n_all * 0.1, f"可训练参数应远小于总参数：{n_train}/{n_all}"
+print(f"[lora] 注入 {len(replaced)} 个模块，输出无损；可训练 {n_train:,}/{n_all:,} "
+      f"({n_train/n_all:.2%})")
+PY
+    )
+    ...
+  fi
+```
+
+实测输出：
+
+```
+  [PASS] Qwen3 LoRA smoke（注入无损 + 只训 A/B）[lora] 注入 8 个模块，输出无损；可训练 8,704/927,744 (0.94%)
+  PASS=24  SKIP=0  FAIL=0
+```
+
+- [x] **Step 5.5: 写 LoRA 笔记（`qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`）**
+
+笔记不等到 feat-008 才写 —— CLAUDE.md 的第一优先级是「**笔记和代码必须对得上**」，
+LoRA 代码已经落地，笔记就应当立刻跟上。已写 §1–§9：
+
+| 节 | 内容 |
+|---|---|
+| §1 | LoRA 解决什么问题（显存账 + 低秩假设 + 参数量推导） |
+| §2 | 核心公式 `y = Wx + (α/r)BAx`；三个设计点：B 零初始化（注入即无损）、α/r 缩放、注入点 |
+| §3 | 实现：三个基本动作 + **两个补丁**（mark_only_lora_trainable / merge_lora 关分支） |
+| §4 | 训练流程 + 「只对回复部分计分」（分别编码再拼接 + 掩码） |
+| §5 | **评估口径的长度偏置**（总 logprob vs 长度归一 + 按策略实测表） |
+| §6 | 实测结果（单测 9 组 / BEFORE / 训练 / AFTER 原始输出） |
+| §7 | 消融表 |
+| §8 | 与 DPO 的接口（`set_lora_enabled` 开关即 π_θ / π_ref）—— **DPO 半部待 feat-024** |
+| §9 | 三条可迁移教训 |
+
+- [x] **Step 6: 实测修正记录（初稿的 8 个真 bug）**
+
+1. **`train/train_lora.py` 缺 sys.path 引导** → `ModuleNotFoundError: No module named 'config'`
+   （脚本在 `train/` 子目录里）。修法同 Task 13：`sys.path.insert(0, <项目根>)`。
+2. **`tests/test_lora.py` 缺 sys.path 引导** → 直接跑会 `ModuleNotFoundError`（`sys.path[0]` 是 `tests/`）。
+3. **★ `merge_lora` 合并后分支还开着 → 输出被算两遍**：初稿的 `merge_lora` 只把 ΔW 折进 base，
+   没关分支，于是输出变成 `(base + ΔW)x + ΔWx`。
+   **初稿自带的第 6 条测试（merge 后应与未 merge 等价）本来就会红** —— 这是初稿自带的 bug。
+   修法：`merge_lora` 合并完把 `scaling` 置 0（「合并 = 把旁路收编进主干」）。
+4. **★ 注入 LoRA 后只有被包装的那个 Linear 被冻结**：`inject_lora` 只把 `base.weight/bias` 设成
+   `requires_grad=False`，**embedding / RMSNorm / MLP / lm_head 仍然可训**，
+   于是初稿的 `trainable = [p for p in model.parameters() if p.requires_grad]`
+   会把 embedding 一起训 —— 「LoRA 微调」悄悄变成「大部分参数都在训」。
+   修法：新增 `mark_only_lora_trainable(model)`，冻结其余全部参数，只留 A / B。
+5. **★ 初稿的 loss 把 prompt 也算进去了**：`targets = cat([idx[:,1:], -100])` 只在最后一个位置忽略，
+   于是 prompt 的 token 也进了 loss，与它自己 docstring 写的「给定 prompt 补全 chosen」矛盾。
+   修法：按回复起始位置掩码（`targets[0, n_prompt-1:L-1] = ids[n_prompt:]`，其余 -100）。
+6. **`load_state_dict(..., strict=False)` 会静默吞错**：初稿用它加载预训练权重，
+   万一加载的是 MoE 的 checkpoint，权重对不上也不会报错。
+   修法：改 `strict=True`（注入 LoRA **之前**加载，此时模块名还没变）。
+7. **`step % 50` 硬编码** → 违反「超参一律从 config.py 读」，改用 `cfg.log_every`。
+8. **★ 评估只有一个口径，且被长度偏置主导**：初稿只算「总 logprob 胜率」，
+   而 `too_short` 策略的 rejected 只有 6 个 token，总 logprob 天然占便宜 →
+   该策略胜率恒为 0，把整体胜率按 0.75 封顶，看不出模型到底变好没有。
+   修法：同时算「每 token 平均 logprob」口径 + 按策略分组打印。
+
+**附带**：`config.py` 改了 `lora_lr`（3e-4 → 1e-3）与 `lora_max_iters`（300 → 1500），
+依据是上面那张消融表；**r=4 / alpha=8 / 注入点 (q_proj, v_proj) 未改**。
+受影响的笔记：`Qwen3_LoRA与DPO_学习笔记.md`（待 feat-008 补写）里的超参表要用这两个新值。
+
+**教训**：LoRA 这类「旁路注入」的框架里，**「哪些参数被冻结」「旁路合并后是否关掉」
+「loss 算在哪一段」三件事都是结构性的** —— 初稿三条全错，而且其中两条
+（合并双算、只冻一个 Linear）**不会报错，只会静默地给出错误结论**。
+
+- [x] **Step 7: Commit**
+
+```bash
+git add qwen3-learning/ init.sh
 git commit -m "feat-023: 从零手写 LoRA（B 零初始化 + base 冻结 + inject/merge/enable 三件套）"
 ```
 
 ---
+
 
 ### Task 15: feat-024 手写 DPO
 

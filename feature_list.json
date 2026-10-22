@@ -311,7 +311,7 @@
       "area": "qwen3-lora",
       "title": "从零手写 LoRA 微调",
       "user_visible_behavior": "在预训练好的 dense Qwen3 上注入 LoRA，只训练 A/B 两个小矩阵，base 权重全程冻结。",
-      "status": "not_started",
+      "status": "passing",
       "verification": [
         "model/common/lora.py 实现 LoRALinear(base, r, alpha, dropout)：out = base(x) + (alpha/r) × dropout(x) @ A.T @ B.T",
         "A 形状 (r, in_features) 用 Kaiming 初始化，B 形状 (out_features, r) 零初始化（保证初始输出与 base 完全一致）",
@@ -321,8 +321,21 @@
         "train/train_lora.py 加载 pretrain_dense.pt → inject_lora(model, ['q_proj','v_proj'], r=4, alpha=8) → 冻结 base 只训 A/B",
         "评估：偏好数据上的 chosen 补全胜率 > 随机基线"
       ],
-      "evidence": [],
-      "notes": "【路线已定：LoRA 取代全参 SFT】依据 设计.md §2 / §7.2。明确不做全参 SFT；全参 SFT 的覆盖在 GPT-2 线已有。LoRA 微调目标为「给定 prompt 补全 chosen」的自监督式目标。不引入 peft。"
+      "evidence": [
+        "2026-10-22 新增 qwen3-learning/qwen3-pytorch/model/common/lora.py（LoRALinear + inject_lora / merge_lora / set_lora_enabled / lora_parameters / mark_only_lora_trainable，**不引入 peft**，依赖上限仍是 torch/numpy/nltk）、train/train_lora.py（注入 → 冻结 → 训练 → 评估 → 落盘）、tests/test_lora.py（9 组断言）。",
+        "2026-10-22 验证项逐条对上：①**公式** out = base(x) + (alpha/r)·dropout(x) @ A.T @ B.T，alpha/r = 8/4 = 2.0（测试打印 `scaling=2.0`）②**A (r,in) Kaiming 初始化、B (out,r) 零初始化** —— 注入前后 logits `torch.allclose(atol=1e-6)` 逐元素相等 ③base.weight / base.bias 全部 requires_grad=False ④**inject_lora** 按模块名后缀递归替换（返回被替换模块全名列表）、**merge_lora** 把 (alpha/r)·B@A 加回 base ⑤smoke 见下条 ⑥train/train_lora.py 加载 pretrain_dense.pt → inject_lora(['q_proj','v_proj'], r=4, alpha=8) → 冻结 base 只训 A/B ⑦偏好胜率 0.515 → 0.595（随机基线 0.5）已超基线。",
+        "2026-10-22 `python tests/test_lora.py` → `[可训练参数] 8,704 / 927,744 (0.94%)` + `test_lora OK  replaced=8 r=4 alpha=8 scaling=2.0`（exit 0）。9 组断言：①B 零初始化 ⇒ 注入无损 ②base weight/bias 都被冻结 ③只有 A/B 拿到梯度 ④注入模块数 = n_layer × len(target_modules) = 8 ⑤set_lora_enabled(False) 回到注入前输出 ⑥**merge 前后输出必须一致**（防 §3.3 双算）⑦ΔW 秩 ≤ r（先 .double() 再 matrix_rank，否则 float32 舍入噪声会判错）⑧mark_only_lora_trainable 后可训练占比 < 20%（单测）/ < 10%（init.sh smoke 更严） ⑨边界：无匹配模块返回 []、无 LoRA 时 merge_lora 返回 0。",
+        "2026-10-22 `python train/train_lora.py`（r=4 / alpha=8 / 注入 q_proj,v_proj / lr=1e-3 / 1500 步）→ `[lora] trainable params = 8,704 / 994,560 (0.88%)` / `BEFORE win_rate=0.515 win_rate_per_token=0.400 mean_logp(chosen)=-603.26` / `step 850/1500 loss 5.7365` / `AFTER win_rate=0.595 win_rate_per_token=0.745 mean_logp(chosen)=-389.48` / `initial_loss=8.4630` / `saved -> checkpoints\\lora.pt`。",
+        "2026-10-22 `bash init.sh` → **PASS=24 SKIP=0 FAIL=0**，其中新增 `[PASS] Qwen3 LoRA smoke（注入无损 + 只训 A/B）[lora] 注入 8 个模块，输出无损；可训练 8,704/927,744 (0.94%)`。",
+        "2026-10-22 **★ 消融表（同一份数据、同一份预训练权重，只改配方）**：",
+        "| 配方 | loss | 总 logprob 胜率 | 长度归一胜率 | 可训练参数 |\n|---|---|---|---|---|\n| r=4 attn lr=0.001 steps=300 | 8.463 → 6.121 | 0.515 → 0.570 | 0.400 → 0.820 | 8,704 |\n| r=4 attn lr=0.0003 steps=1500 | 8.463 → 5.926 | 0.515 → 0.590 | 0.400 → 0.810 | 8,704 |\n| r=4 attn lr=0.001 steps=1500 | 8.463 → 5.701 | 0.515 → 0.595 | 0.400 → 0.745 | 8,704 |\n| r=16 attn+mlp lr=0.001 steps=300 | 8.415 → 5.319 | 0.515 → 0.605 | 0.400 → 0.730 | 133,120 |\n| r=16 attn+mlp lr=0.001 steps=1500 | 8.415 → 4.153 | 0.515 → 0.640 | 0.400 → 0.865 | 133,120 |\n| r=64 attn+mlp lr=0.001 steps=300 | 8.348 → 4.460 | 0.515 → 0.575 | 0.400 → 0.800 | 532,480 |\n| r=64 attn+mlp lr=0.003 steps=300 | 8.348 → 6.258 | 0.515 → 0.520 | 0.400 → 0.655 | 532,480 |\n| 全参 lr=0.001 steps=300 | 8.450 → 1.217 | 0.515 → 0.715 | 0.400 → 0.835 | 985,856 |",
+        "2026-10-22 **消融结论（写进笔记的核心）**：①**低秩约束 + 注入点决定「能学到什么」** —— 本任务是内容型（要模型说出特定文本），全参微调 300 步 loss **1.217** vs 最好的 LoRA 配方（r=16+MLP，1500 步）loss **4.153**，差 3 倍多 ⇒ **LoRA 是风格/格式型任务的主场，内容型任务上明显吃力**。②**步数不够是主要瓶颈**：r=4 从 300 步到 1500 步 loss 6.121 → 5.701、胜率 0.570 → 0.595（步数翻 5 倍，loss 只降 0.42 —— 瓶颈在「能表达的信息量」）。③**lr 1e-3 优于 3e-4**（1500 步 loss 5.701 vs 5.926，胜率 0.595 vs 0.590）；**r=64 时 lr 3e-3 直接发散**（loss 6.258、胜率 0.520）—— 秩越大允许的 lr 上限越低。据此把 config.py 的 `lora_lr` 定为 1e-3、`lora_max_iters` 定为 1500（**r=4 / alpha=8 / 注入点 (q_proj,v_proj) 保持计划原样**）。",
+        "2026-10-22 **★ 发现「偏好指标的长度偏置」并量化**：总 logprob 胜率与回复长度强相关（短回复总 logprob 天然大），长度归一口径又反过来偏袒「可预测」的文本。按策略分组实测：`too_short`（rejected 只有 6.3 token vs chosen 72 token）的**总 logprob 胜率恒为 0.000**，把整体胜率的天花板压到 ~0.75，只看整体数字会误判「模型没进步」。**这正是 DPO 要减去参考模型 π_ref 的原因** —— π_ref 把「长度」「可预测性」这类静态偏置同时减掉。",
+        "2026-10-22 **修正初稿的 8 个真 bug**（详见 开发计划.md Task 14 Step 6「实测修正记录」）：①train/train_lora.py 缺 sys.path 引导 ②tests/test_lora.py 缺 sys.path 引导 ③★**merge_lora 合并后分支还开着 → ΔW 被算两遍**（初稿自带的第 6 条测试本来就红） ④★**注入 LoRA 只冻结了被包装的那一个 Linear**，embedding/RMSNorm/MLP/lm_head 仍可训 ⇒「LoRA 微调」悄悄变成「大部分参数都在训」（补 mark_only_lora_trainable） ⑤★**初稿的 loss 把 prompt 也算进去了**（与自己的 docstring 矛盾） ⑥load_state_dict(strict=False) 会静默吞错（改 strict=True，且必须在注入前加载） ⑦`step % 50` 硬编码违反「超参从 config.py 读」（改 cfg.log_every） ⑧★**评估只有一个口径且被长度偏置主导**（补长度归一口径 + 按策略分组）。",
+        "2026-10-22 配套笔记已写：`qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`（§1–§9，含公式推导、两个结构性补丁的复盘、长度偏置的按策略实测表、9 组断言清单、训练 BEFORE/AFTER 原始输出）。**DPO 部分（§8）待 feat-024 补齐。**",
+        "2026-10-22 **★ 两个口径对配方的排序不一样（本次最扎人的发现）**：r=4 训 300 步 vs 1500 步，loss（6.121→5.701）与总 logprob 胜率（0.570→0.595）都是 1500 步更好，**长度归一口径却反过来**（0.820 → 0.745）—— 训得久 → 输出更稳更可预测 → 长度归一口径偏爱它。**「长度归一胜率更高」≠「模型更好」** ⇒ 评估口径本身是需要交代的事，也正因如此 DPO 不用「谁的 logprob 大」当奖励，而用**相对 π_ref 的 logprob 差值**（差值把「长度」「风格稳不稳」这类静态偏置同时减掉）。本仓库默认口径：`win_rate`（总 logprob，DPO 用的正是这个）为主，`win_rate_per_token` 作辅助观测，**并始终按策略分组打印**。"
+      ],
+      "notes": "【路线已定：LoRA 取代全参 SFT】依据 设计.md §2 / §7.2。不做全参 SFT；全参 SFT 的覆盖在 GPT-2 线已有。不引入 peft。LoRA 微调目标为「给定 prompt 补全 chosen」的自监督式目标。config.py 本次改动两个超参值：`lora_lr` 3e-4 → 1e-3、`lora_max_iters` 300 → 1500，**依据是上表的消融实测**（不是拍脑袋）；r / alpha / 注入点未改。受影响的笔记：新建 `Qwen3_LoRA与DPO_学习笔记.md`（已写 LoRA 半部，DPO 半部待 feat-024）。**「合并即收编，合并后必须关分支」「注入只冻一个 Linear ⇒ 补 mark_only_lora_trainable」这两条是结构性坑，不报错、只静默给错结论，已用等价性断言守住。** 额外结论：**本仓库的胜率排序在两个口径下不一致**，所以笔记里同时给两个口径 + 按策略分组，并在 §7.4 专门用 r=4 的 300 步 vs 1500 步做例子说明为什么。"
     },
     {
       "id": "feat-024",

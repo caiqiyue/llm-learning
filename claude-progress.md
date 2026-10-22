@@ -364,3 +364,93 @@ $ bash init.sh
 `qwen3-learning/qwen3-pytorch开发计划.md`（Task 10 纠错 + Task 13 就地换成真代码）、
 `qwen3-learning/Qwen3_MoE_学习笔记.md`（§19.1 重写）、
 仓库根 `init.sh`（L4 +训练步 smoke）、`feature_list.json`、`claude-progress.md`、`session-handoff.md`
+
+### Session 006 — Qwen3 LoRA 微调（feat-023）
+
+**本次做完的事**
+
+1. 手写 LoRA（`model/common/lora.py`）：`LoRALinear` + `inject_lora` / `merge_lora` /
+   `set_lora_enabled` / `lora_parameters` / `mark_only_lora_trainable`，**不引入 peft**。
+2. 手写 LoRA 训练脚本（`train/train_lora.py`）：加载预训练权重 → 注入 → 冻结 base 只训 A/B →
+   给定 prompt 补全 chosen → 评估偏好胜率 → 落盘 `checkpoints/lora.pt`。
+3. 写 `tests/test_lora.py`（9 组断言），挂进 `init.sh` 的 L4 层。
+4. 跑消融，据此把 `config.py` 的 `lora_lr` 3e-4 → 1e-3、`lora_max_iters` 300 → 1500。
+5. 写 `qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md` 的 LoRA 半部（§1–§9）。
+
+**★ 三个结构性坑（都不报错，只静默给错结论）**
+
+- **`merge_lora` 合并后分支还开着** → ΔW 被算两遍。合并的语义是「把旁路收编进主干」，
+  所以合并完必须把 `scaling` 置 0。**初稿自带的第 6 条测试（merge 前后等价）本来就红。**
+- **注入 LoRA 只冻结了被包装的那一个 Linear** → embedding / RMSNorm / MLP / lm_head 仍可训，
+  「LoRA 微调」悄悄变成「大部分参数都在训」。补 `mark_only_lora_trainable`。
+- **loss 把 prompt 也算进去了** → 与「给定 prompt 补全 chosen」的目标矛盾。
+  改成按回复起始位置掩码（prompt 段与末位 -100）。
+
+**★ 最重要的一条：偏好指标的长度偏置**
+
+总 logprob 胜率系统性偏袒**短回复**（`too_short` 策略的 rejected 只有 6.3 token，
+该策略胜率**恒为 0.000**），把整体胜率天花板压到 ~0.75；长度归一口径又反过来偏袒
+「可预测」的文本。**只看整体胜率会误判「模型没进步」。**
+这正是 DPO 减去参考模型 π_ref 的原因 —— π_ref 把「长度」「可预测性」这类静态偏置同时减掉。
+
+**消融表**
+
+| 配方 | loss | 总 logprob 胜率 | 长度归一胜率 | 可训练参数 |
+|---|---|---|---|---|
+| r=4 attn lr=0.001 steps=300 | 8.463 → 6.121 | 0.515 → 0.570 | 0.400 → <_io.TextIOWrapper name='C:/Users/ADMINI~1/AppData/Local/Temp/claude/E--ai-learning-05-llm-fundamentals-llm-learning/4091d65f-ec7e-4a9a-9393-f9eb3fa38550/tasks/bwfl72rnk.output' mode='r' encoding='utf-8'> | 8,704 |
+| r=4 attn lr=0.0003 steps=1500 | 8.463 → 5.926 | 0.515 → 0.590 | 0.400 → <_io.TextIOWrapper name='C:/Users/ADMINI~1/AppData/Local/Temp/claude/E--ai-learning-05-llm-fundamentals-llm-learning/4091d65f-ec7e-4a9a-9393-f9eb3fa38550/tasks/bwfl72rnk.output' mode='r' encoding='utf-8'> | 8,704 |
+| r=4 attn lr=0.001 steps=1500 | 8.463 → 5.701 | 0.515 → 0.595 | 0.400 → <_io.TextIOWrapper name='C:/Users/ADMINI~1/AppData/Local/Temp/claude/E--ai-learning-05-llm-fundamentals-llm-learning/4091d65f-ec7e-4a9a-9393-f9eb3fa38550/tasks/bwfl72rnk.output' mode='r' encoding='utf-8'> | 8,704 |
+| r=16 attn+mlp lr=0.001 steps=300 | 8.415 → 5.319 | 0.515 → 0.605 | 0.400 → <_io.TextIOWrapper name='C:/Users/ADMINI~1/AppData/Local/Temp/claude/E--ai-learning-05-llm-fundamentals-llm-learning/4091d65f-ec7e-4a9a-9393-f9eb3fa38550/tasks/bwfl72rnk.output' mode='r' encoding='utf-8'> | 133,120 |
+| r=16 attn+mlp lr=0.001 steps=1500 | 8.415 → 4.153 | 0.515 → 0.640 | 0.400 → <_io.TextIOWrapper name='C:/Users/ADMINI~1/AppData/Local/Temp/claude/E--ai-learning-05-llm-fundamentals-llm-learning/4091d65f-ec7e-4a9a-9393-f9eb3fa38550/tasks/bwfl72rnk.output' mode='r' encoding='utf-8'> | 133,120 |
+| r=64 attn+mlp lr=0.001 steps=300 | 8.348 → 4.460 | 0.515 → 0.575 | 0.400 → <_io.TextIOWrapper name='C:/Users/ADMINI~1/AppData/Local/Temp/claude/E--ai-learning-05-llm-fundamentals-llm-learning/4091d65f-ec7e-4a9a-9393-f9eb3fa38550/tasks/bwfl72rnk.output' mode='r' encoding='utf-8'> | 532,480 |
+| r=64 attn+mlp lr=0.003 steps=300 | 8.348 → 6.258 | 0.515 → 0.520 | 0.400 → <_io.TextIOWrapper name='C:/Users/ADMINI~1/AppData/Local/Temp/claude/E--ai-learning-05-llm-fundamentals-llm-learning/4091d65f-ec7e-4a9a-9393-f9eb3fa38550/tasks/bwfl72rnk.output' mode='r' encoding='utf-8'> | 532,480 |
+| 全参 lr=0.001 steps=300 | 8.450 → 1.217 | 0.515 → 0.715 | 0.400 → <_io.TextIOWrapper name='C:/Users/ADMINI~1/AppData/Local/Temp/claude/E--ai-learning-05-llm-fundamentals-llm-learning/4091d65f-ec7e-4a9a-9393-f9eb3fa38550/tasks/bwfl72rnk.output' mode='r' encoding='utf-8'> | 985,856 |
+
+**验证**
+
+```
+$ python tests/test_lora.py
+[可训练参数] 8,704 / 927,744 (0.94%)
+test_lora OK  replaced=8 r=4 alpha=8 scaling=2.0
+
+$ python train/train_lora.py
+[lora] injected 8 modules: ['blocks.0.attn.q_proj', ..., 'blocks.3.attn.v_proj']
+[lora] trainable params = 8,704 / 994,560 (0.88%)
+[lora] BEFORE  win_rate=0.515  win_rate_per_token=0.400  mean_logp(chosen)=-603.26
+[lora]   too_short      n=47   总logprob胜率=0.000  长度归一胜率=0.404  len(chosen)=72.0 len(rejected)=6.3
+[lora] step  850/1500 loss 5.7365 lr 1.00e-03
+[lora] AFTER   win_rate=0.595  win_rate_per_token=0.745  mean_logp(chosen)=-389.48
+[lora] 胜率 0.515 -> 0.595 (随机基线 0.5)，长度归一口径 0.400 -> 0.745
+[lora] saved -> checkpoints\lora.pt
+
+$ python tests/run_all.py
+[run_all] PASS=11  FAIL=0  TOTAL=11
+
+$ bash init.sh
+  [PASS] Qwen3 LoRA smoke（注入无损 + 只训 A/B）[lora] 注入 8 个模块，输出无损；可训练 8,704/927,744 (0.94%)
+  PASS=24  SKIP=0  FAIL=0
+```
+
+**未解决 / 风险**
+
+- **LoRA 在本任务上打不过全参微调**：这是内容型任务（要模型说出特定文本），
+  全参能压到 loss ~1.06，r=4 的 LoRA 只能到 ~5.7。**结论要写进笔记**：
+  LoRA 是风格/格式型任务的主场，内容型任务上明显吃力。
+- **胜率是训练内指标**：合成偏好数据只有 5 个 prompt × 5 个 chosen，训练集与评估集同分布，
+  证明的是「LoRA 确实让模型更偏向 chosen」，**不能当泛化能力**。
+- 笔记缺口：`Qwen3_LoRA与DPO_学习笔记.md` 的 **DPO 半部（§8）** 待 feat-024 补；
+  `Qwen3_BPE_学习笔记.md` 待 feat-008 补。
+
+**下一步**
+
+1. `feat-024` 手写 DPO（π_θ = LoRA 开着 / π_ref = LoRA 关着，无 Reward Model 无 PPO）
+2. `feat-025` 精简评估脚本 → `feat-018` KV Cache 推理与采样 → `feat-017` 与 GPT-2 的退化对照
+3. `feat-008` 笔记↔源码交叉引用（含补 BPE 笔记 + LoRA-DPO 笔记的 DPO 半部）→ `feat-009` 数字全量核对 → 收班
+
+**本次改动涉及的文件**
+
+`qwen3-learning/qwen3-pytorch/`：`model/common/lora.py`、`train/train_lora.py`、`tests/test_lora.py`、
+`config.py`（lora_lr / lora_max_iters 两个值）、
+`qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`（新建，LoRA 半部）、
+`qwen3-learning/qwen3-pytorch开发计划.md`（Task 14 就地换成真代码 + 实测修正记录）、
+仓库根 `init.sh`（L4 +LoRA smoke）、`feature_list.json`、`claude-progress.md`、`session-handoff.md`

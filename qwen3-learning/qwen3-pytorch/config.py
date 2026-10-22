@@ -91,8 +91,15 @@ class Qwen3Config:
     # 注入 LoRA 的模块名后缀
     lora_target_modules: tuple = ("q_proj", "v_proj")
     # LoRA 微调学习率
-    lora_lr: float = 3e-4
-    lora_max_iters: int = 300
+    # （实测 r=4/attn/1500 步：lr 3e-4 → loss 5.926 / 总 logprob 胜率 0.590；
+    #   lr 1e-3 → loss 5.701 / 胜率 0.595。取 1e-3。
+    #   注：长度归一口径上 3e-4 反而略高（0.810 vs 0.745）—— 两个口径排序不同，
+    #   见 Qwen3_LoRA与DPO_学习笔记.md §5）
+    lora_lr: float = 1e-3
+    # LoRA 微调步数
+    # （实测 r=4/attn/lr=1e-3：300 步 loss 6.121 / 胜率 0.570（还在平台期），
+    #   1500 步 loss 5.701 / 胜率 0.595；基线 0.515）
+    lora_max_iters: int = 1500
 
     # ---------------- DPO ----------------
     # DPO 的 KL 惩罚系数 β

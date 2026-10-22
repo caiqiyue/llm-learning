@@ -326,6 +326,45 @@ PY
   else
     skip "Qwen3 训练步 smoke" "train/train_pretrain.py 尚未就绪（feat-020），或 torch 不可用"
   fi
+
+  # --- LoRA smoke（feat-023）：注入无损（B 零初始化）+ 只有 A/B 可训 ---
+  if [ -f "$QWEN_DIR/model/common/lora.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_lora.log 2>&1
+import torch
+from config import DENSE_CONFIG
+from model.common.lora import inject_lora, mark_only_lora_trainable
+from model.qwen3_dense import Qwen3Dense
+
+model = Qwen3Dense(vocab_size=256, cfg=DENSE_CONFIG, dropout=0.0)
+model.eval()
+idx = torch.randint(0, 256, (2, 8))
+with torch.no_grad():
+    before = model(idx)[0]
+
+replaced = inject_lora(model, DENSE_CONFIG.lora_target_modules, r=DENSE_CONFIG.lora_r,
+                       alpha=DENSE_CONFIG.lora_alpha)
+with torch.no_grad():
+    after = model(idx)[0]
+# B 零初始化 ⇒ 注入 LoRA 后模型输出必须逐元素不变
+assert torch.allclose(before, after, atol=1e-6), "B 零初始化时注入 LoRA 应无损"
+
+trainable = mark_only_lora_trainable(model)
+n_train = sum(p.numel() for p in trainable)
+n_all = sum(p.numel() for p in model.parameters())
+assert n_train > 0, "应有可训练的 LoRA 参数"
+assert n_train < n_all * 0.1, f"可训练参数应远小于总参数：{n_train}/{n_all}"
+print(f"[lora] 注入 {len(replaced)} 个模块，输出无损；可训练 {n_train:,}/{n_all:,} "
+      f"({n_train/n_all:.2%})")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 LoRA smoke（注入无损 + 只训 A/B）$(tail -1 /tmp/llm_init_l4_lora.log)"
+    else
+      fail "Qwen3 LoRA smoke" "$(tail -3 /tmp/llm_init_l4_lora.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 LoRA smoke" "model/common/lora.py 尚未就绪（feat-023），或 torch 不可用"
+  fi
 fi
 
 # -----------------------------------------------------------------------------
