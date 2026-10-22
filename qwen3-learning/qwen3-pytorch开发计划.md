@@ -7226,6 +7226,11 @@ git commit -m "feat-024: 从零手写 DPO（π_ref = SFT 模型，merge → stri
 
 ### Task 16: feat-025 精简评估脚本
 
+> **⚠️ 执行顺序：本 Task 实际在 Task 17（feat-018）之后执行。**
+> 原因：本 Task 的 `speedup` 段直接用 `from inference import benchmark_speed, generate_naive, generate_with_cache`，
+> 而 `inference.py` 是 Task 17 才创建的 ⇒ 按原顺序做会直接 ImportError。
+> **计划 bug，已就地纠正**（Task 17 的 `inference.py` 已先行完成）。
+
 **Files:**
 - Create: `qwen3-learning/qwen3-pytorch/evaluate.py`
 - Modify: `feature_list.json`
@@ -7436,9 +7441,12 @@ git commit -m "feat-025: Qwen3 精简评估脚本（pretrain/lora/dpo/speedup �
 
 **Files:**
 - Create: `qwen3-learning/qwen3-pytorch/inference.py`
+- Create: `qwen3-learning/qwen3-pytorch/tests/test_inference.py`（12 组断言）
+- Modify: `init.sh`（L4 层加一条推理 smoke）
+- Modify: `qwen3-learning/Qwen3_训练推理完整学习笔记.md`（补 §10：实现与采样差异）
 - Modify: `feature_list.json`
 
-- [ ] **Step 1: 写 `inference.py`**
+- [x] **Step 1: 写 `inference.py`**
 
 复用 GPT-2 线 `generate.py` 的 prefill / decode 组织方式（**独立重写，不跨目录 import**）：
 
@@ -7446,22 +7454,46 @@ git commit -m "feat-025: Qwen3 精简评估脚本（pretrain/lora/dpo/speedup �
 """
 Qwen3 推理：prefill / decode 两阶段 + temperature / top-k / top-p 采样。
 
-【与 GPT-2 线的组织方式一致】
-    prefill：整段 prompt 一次 forward，建立 KV Cache
-    decode ：每步只喂 1 个新 token，KV 沿序列维追加
+对应笔记：qwen3-learning/Qwen3_GQA与KV_Cache_完整学习笔记.md
+对照主线：gpt-learning/gpt-learning-pytorch/generate.py（GPT-2 线）
+
+【与 GPT-2 线的关系】
+    **组织方式一致，代码独立重写**（AGENTS.md 硬约束：Qwen3 线不跨目录 import）。
+    接口刻意保持同名同义，好让两条线横向对比：
+        generate_naive / generate_with_cache / benchmark_speed
+    benchmark_speed 返回的列名与 GPT-2 线完全一致：
+        naive_avg_ms / kv_avg_ms / speedup / naive_tokens / kv_tokens
 
 【Qwen3 特有的两点】
-    1. decode 阶段 T_q = 1、T_kv 随步数增长 —— **不需要因果 mask**
-       （cache 天然只含历史 token）
-    2. KV Cache 按 n_head_kv 分配，GQA 下占用是同尺寸 MHA 的 n_head_kv/n_head
+    1. **decode 阶段不施加因果 mask**：T_q = 1、T_kv 随步数增长，
+       cache 天然只含历史 token（见 model/common/attention.py 第 5 步）。
+    2. **KV Cache 按 n_head_kv 分配**：GQA 下占用是同尺寸 MHA 的 n_head_kv/n_head。
+
+【GPT-2 线笔记（gpt-learning/12.采样方式.md）指出的 4 个问题，本线的处理】
+    ① 左 padding 没有 attention mask → **本线只做 batch=1 的单条生成**，
+       不引入 padding，问题自然不存在（要批处理需另加 mask）。
+    ② finished 样本没有真的冻结输出 → 本线在 eos 出现时**直接 break**，
+       不再采样后续 token（batch=1 下等价且更干净）。
+    ③ KVCache 的 device/dtype 可能不匹配 → 本线**显式传 model 的 dtype**，
+       并在 append 时做 `.to(dtype)` 转换。
+    ④ cache.get() 每次 clone 整段缓存 → 本线 `KVCache.get` 直接返回**切片 view**
+       （见 model/common/kv_cache.py），不复制。
+
+【采样链（与 GPT-2 线一致的执行顺序）】
+    logits → temperature → top-k → top-p → softmax → multinomial
 """
 
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
+from model.common.kv_cache import KVCache
 
+
+# ---------------------------------------------------------------------------
+# 采样
+# ---------------------------------------------------------------------------
 def sample_from_logits(
     logits: "torch.Tensor",
     temperature: float = 1.0,
@@ -7471,142 +7503,664 @@ def sample_from_logits(
     """
     从 logits 采样一个 token。
 
+    【执行顺序（与 GPT-2 线一致）】
+        1. temperature <= 0 → 直接 greedy（argmax），**不再执行 top-k / top-p**
+        2. temperature：logits / T（T<1 更尖锐，T>1 更平坦）
+        3. top-k：把第 k 名之后的 logits 置 -inf（**固定候选数量**）
+        4. top-p：把累计概率越界之后的 logits 置 -inf（**候选数量动态**）
+        5. softmax → multinomial
+
+    【top-p 的 mask 写法】
+        `mask = cumsum - probs > top_p`
+        「cumsum - probs」= 加入当前 token **之前**的累计概率。
+        这样保证「让累计概率第一次超过 top_p 的那个 token 仍然被保留」。
+
     参数：
         logits:     (B, V)
         temperature: 温度；<= 0 走 greedy
-        top_k:      保留概率最高的 k 个
-        top_p:      nucleus 采样阈值
+        top_k:      保留概率最高的 k 个；None / <=0 表示不启用
+        top_p:      nucleus 阈值；None 或不在 (0,1) 表示不启用
     返回：
         (B, 1) 采样出的 token id
     """
+    if logits.dim() != 2:
+        raise ValueError(f"logits 应为 (B, V)，实得 {tuple(logits.shape)}")
+
+    # --- 1. greedy ---
     if temperature <= 0.0:
         return logits.argmax(dim=-1, keepdim=True)
 
+    # --- 2. temperature ---
     logits = logits / temperature
+
+    # --- 3. top-k ---
     if top_k is not None and top_k > 0:
-        kth = logits.topk(top_k, dim=-1).values[:, -1:]
-        logits = torch.where(logits < kth, torch.full_like(logits, float("-inf")), logits)
+        k = min(int(top_k), logits.size(-1))
+        kth = logits.topk(k, dim=-1).values[:, -1:]          # (B, 1)
+        logits = torch.where(
+            logits < kth,
+            torch.full_like(logits, float("-inf")),
+            logits,
+        )
+
+    # --- 4. top-p ---
     if top_p is not None and 0.0 < top_p < 1.0:
-        sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
         sorted_probs = sorted_logits.softmax(dim=-1)
-        cumsum = sorted_probs.cumsum(dim=-1)
-        mask = (cumsum - sorted_probs) > top_p
-        sorted_logits = sorted_logits.masked_fill(mask, float("-inf"))
-        logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+        cum = sorted_probs.cumsum(dim=-1)
+        remove = (cum - sorted_probs) > top_p
+        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+        # 排序 → 原位还原
+        logits = torch.empty_like(logits).scatter(-1, sorted_idx, sorted_logits)
+
+    # --- 5. multinomial ---
     probs = logits.softmax(dim=-1)
     return torch.multinomial(probs, num_samples=1)
 
 
+# ---------------------------------------------------------------------------
+# 缓存构造
+# ---------------------------------------------------------------------------
+def make_kv_cache(
+    model: "torch.nn.Module",
+    batch_size: int,
+    max_len: int,
+    device: Optional["torch.device"] = None,
+) -> KVCache:
+    """
+    按模型配置构造一个 KVCache。
+
+    参数：
+        model:      Qwen3 模型（需带 .cfg）
+        batch_size: batch 大小
+        max_len:    最多缓存多少 token
+        device:     设备；None 时从模型参数推断
+    返回：
+        KVCache 实例
+    """
+    cfg = model.cfg
+    dtype = next(model.parameters()).dtype
+    cache = KVCache(
+        n_layer=cfg.n_layer,
+        batch_size=batch_size,
+        n_head_kv=cfg.n_head_kv,
+        head_dim=cfg.head_dim,
+        max_len=max_len,
+        dtype=dtype,
+    )
+    if device is not None:
+        cache.k_buf = cache.k_buf.to(device)
+        cache.v_buf = cache.v_buf.to(device)
+    return cache
+
+
+# ---------------------------------------------------------------------------
+# 生成：naive（无 cache）
+# ---------------------------------------------------------------------------
+@torch.no_grad()
 def generate_naive(
-    model,
-    prompt: List[int],
-    max_new_tokens: int = 64,
-    **kw,
-) -> List[int]:
+    model: "torch.nn.Module",
+    prompt: "torch.Tensor",
+    max_new_tokens: int = 16,
+    temperature: float = 0.0,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    eos_id: Optional[int] = None,
+    return_logits: bool = False,
+) -> "torch.Tensor":
     """
-    无 KV Cache 的朴素生成（每步重算整段前缀）。作为 KV Cache 版的正确性基准。
+    **不用 KV Cache** 的生成：每一步都把整条序列重新前向一遍。
+
+    【为什么慢】
+        生成第 s 个 token 时要重算前 s+P 个 token 的 Q/K/V/MLP，
+        而这些位置的结果在之前的步骤里已经算过 —— 全部白算。
+        总计算量随生成长度**平方**增长。
 
     参数：
-        model:           模型
-        prompt:          prompt token id 列表
-        max_new_tokens: 最多生成多少个 token
-        **kw:            采样参数，透传给 sample_from_logits
+        model:          模型（必须是 eval 模式）
+        prompt:         (B, P) LongTensor
+        max_new_tokens: 最多生成多少 token
+        temperature:    采样温度（<= 0 = greedy）
+        top_k:          top-k
+        top_p:          top-p
+        eos_id:         遇到这个 token 就停
+        return_logits:  True 时额外返回每步的 logits（(B, V) 的 list）
     返回：
-        完整序列（含 prompt）
+        (B, P + n) LongTensor；return_logits=True 时返回 (tensor, list)
     """
-    idx = torch.tensor(prompt, dtype=torch.long).unsqueeze(0)
-    for _ in range(max_new_tokens):
-        logits, _, _, _ = model(idx)
-        next_id = sample_from_logits(logits[:, -1, :], **kw)
-        idx = torch.cat([idx, next_id], dim=1)
-    return idx[0].tolist()
+    if prompt.dim() != 2:
+        raise ValueError(f"prompt 应为 (B, P)，实得 {tuple(prompt.shape)}")
+    model.eval()
+    device = prompt.device
+    B, P = prompt.shape
+    block_size = model.cfg.block_size
+
+    # 整条序列必须放得进 block_size
+    room = block_size - P
+    if room <= 0:
+        raise ValueError(f"prompt 长度 {P} 已达 block_size={block_size}，无法生成")
+    n_max = min(max_new_tokens, room)
+
+    seq = prompt
+    out_logits: List["torch.Tensor"] = []
+    for _ in range(n_max):
+        logits, _, _, _ = model(seq)                     # (B, L, V)
+        next_logits = logits[:, -1, :]                   # (B, V)
+        if return_logits:
+            out_logits.append(next_logits)
+        nxt = sample_from_logits(next_logits, temperature, top_k, top_p)
+        seq = torch.cat([seq, nxt], dim=1)
+        if eos_id is not None and int(nxt.item()) == eos_id:
+            break
+    if return_logits:
+        return seq, out_logits
+    return seq
 
 
+# ---------------------------------------------------------------------------
+# 生成：with cache（prefill + decode）
+# ---------------------------------------------------------------------------
+@torch.no_grad()
 def generate_with_cache(
-    model,
-    prompt: List[int],
-    max_new_tokens: int = 64,
-    **kw,
-) -> List[int]:
+    model: "torch.nn.Module",
+    prompt: "torch.Tensor",
+    max_new_tokens: int = 16,
+    temperature: float = 0.0,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    eos_id: Optional[int] = None,
+    return_logits: bool = False,
+) -> "torch.Tensor":
     """
-    带 KV Cache 的生成：prefill 一次 + decode 逐步追加。
+    **用 KV Cache** 的生成：prefill 一次 + decode 每步 1 个 token。
+
+    【prefill】
+        整条 prompt 一次前向，K/V 写进 cache（每层各写 P 个 token）。
+        返回的 logits 里只取最后一个位置来采样第一个新 token。
+
+    【decode】
+        每步只喂 **1 个** 新 token：
+            T_q = 1，T_kv = 已缓存的历史长度（随步数增长）
+        **不再施加因果 mask** —— cache 天然只含历史与当前 token，不含未来。
 
     参数：
-        model:           模型
-        prompt:          prompt token id 列表
-        max_new_tokens: 最多生成多少个 token
-        **kw:            采样参数
+        model:          模型（必须是 eval 模式）
+        prompt:         (B, P) LongTensor
+        max_new_tokens: 最多生成多少 token
+        temperature:    采样温度（<= 0 = greedy）
+        top_k:          top-k
+        top_p:          top-p
+        eos_id:         遇到这个 token 就停
+        return_logits:  True 时额外返回每步的 logits（(B, V) 的 list）
     返回：
-        完整序列（含 prompt）
+        (B, P + n) LongTensor；return_logits=True 时返回 (tensor, list)
     """
-    from model.common.kv_cache import KVCache
+    if prompt.dim() != 2:
+        raise ValueError(f"prompt 应为 (B, P)，实得 {tuple(prompt.shape)}")
+    model.eval()
+    device = prompt.device
+    B, P = prompt.shape
+    block_size = model.cfg.block_size
 
-    idx = torch.tensor(prompt, dtype=torch.long).unsqueeze(0)
-    B, T = idx.shape
-    device = idx.device
-    cache = KVCache(n_layer=model.n_layer, n_head=model.n_head_kv, head_dim=model.head_dim,
-                    max_seq_len=model.block_size, batch_size=B, device=device)
+    room = block_size - P
+    if room <= 0:
+        raise ValueError(f"prompt 长度 {P} 已达 block_size={block_size}，无法生成")
+    n_max = min(max_new_tokens, room)
 
-    # --- prefill：整段一次 forward ---
-    position_ids = torch.arange(T, device=device).unsqueeze(0)
-    logits, _, new_cache, _ = model(idx, kv_cache=cache, position_ids=position_ids)
-    cache = new_cache
-    out = list(prompt)
+    cache = make_kv_cache(model, batch_size=B, max_len=P + n_max, device=device)
 
-    for step in range(max_new_tokens):
-        next_id = sample_from_logits(logits[:, -1, :], **kw)
-        out.append(int(next_id.item()))
-        # --- decode：只喂 1 个新 token ---
-        position_ids = torch.tensor([[T + step]], device=device)
-        logits, _, new_cache, _ = model(next_id, kv_cache=cache, position_ids=position_ids)
-        cache = new_cache
-    return out
+    # --- prefill：整条 prompt 一次前向 ---
+    pos = torch.arange(P, dtype=torch.long, device=device).unsqueeze(0).expand(B, P)
+    logits, _, cache, _ = model(prompt, kv_cache=cache, position_ids=pos)
+    next_logits = logits[:, -1, :]                      # (B, V)
+    out_logits: List["torch.Tensor"] = []
+    if return_logits:
+        out_logits.append(next_logits)
+    nxt = sample_from_logits(next_logits, temperature, top_k, top_p)
+    generated = [nxt]
+    if eos_id is not None and int(nxt.item()) == eos_id:
+        # ★ prefill 后采出来的**第一个** token 就是 eos ⇒ 立刻停
+        #   （漏掉这一检查会让 eos 多生成出一串无意义 token）
+        seq = torch.cat([prompt] + generated, dim=1)
+        if return_logits:
+            return seq, out_logits
+        return seq
+
+    # --- decode：每步 1 个 token ---
+    for step in range(n_max - 1):
+        pos = torch.full((B, 1), P + step, dtype=torch.long, device=device)
+        logits, _, cache, _ = model(nxt, kv_cache=cache, position_ids=pos)
+        next_logits = logits[:, -1, :]                  # (B, 1, V) → (B, V)
+        if return_logits:
+            out_logits.append(next_logits)
+        nxt = sample_from_logits(next_logits, temperature, top_k, top_p)
+        generated.append(nxt)
+        if eos_id is not None and int(nxt.item()) == eos_id:
+            break
+
+    seq = torch.cat([prompt] + generated, dim=1)
+    if return_logits:
+        return seq, out_logits
+    return seq
 
 
-def benchmark_speed(model, prompt_len: int = 32, max_new_tokens: int = 64) -> dict:
+# ---------------------------------------------------------------------------
+# 加速比 benchmark
+# ---------------------------------------------------------------------------
+def benchmark_speed(
+    model: "torch.nn.Module",
+    prompt: "torch.Tensor",
+    n_runs: int = 3,
+    max_new_tokens: int = 32,
+    temperature: float = 0.0,
+    eos_id: Optional[int] = None,
+) -> dict:
     """
-    对比有/无 KV Cache 的耗时。
+    对比 `generate_naive` 与 `generate_with_cache` 的耗时。
+
+    返回 dict（**列名与 GPT-2 线完全一致**，便于横向对比）：
+        {
+            "naive_avg_ms":  float,  # naive 平均耗时（毫秒）
+            "kv_avg_ms":     float,  # kv 平均耗时（毫秒）
+            "speedup":       float,  # 加速比（naive / kv）
+            "naive_tokens":  int,    # naive 实际生成的 token 数
+            "kv_tokens":     int,    # kv 实际生成的 token 数
+        }
 
     参数：
+        model:          模型
+        prompt:         (1, P) LongTensor
+        n_runs:         每个方法跑几次取平均
+        max_new_tokens: 最大生成 token 数
+        temperature:    采样温度（默认 greedy，保证两条路径可比）
+        eos_id:         早停 token id
+    """
+    model.eval()
+
+    # warmup：把第一次的 lazy init 等开销跑掉
+    _ = generate_naive(model, prompt.clone(), max_new_tokens=4, temperature=temperature,
+                       eos_id=eos_id)
+    _ = generate_with_cache(model, prompt.clone(), max_new_tokens=4, temperature=temperature,
+                             eos_id=eos_id)
+
+    naive_times: List[float] = []
+    naive_tokens = 0
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        out = generate_naive(model, prompt.clone(), max_new_tokens=max_new_tokens,
+                             temperature=temperature, eos_id=eos_id)
+        naive_times.append(time.perf_counter() - t0)
+        naive_tokens = out.size(1) - prompt.size(1)
+
+    kv_times: List[float] = []
+    kv_tokens = 0
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        out = generate_with_cache(model, prompt.clone(), max_new_tokens=max_new_tokens,
+                                  temperature=temperature, eos_id=eos_id)
+        kv_times.append(time.perf_counter() - t0)
+        kv_tokens = out.size(1) - prompt.size(1)
+
+    naive_avg = sum(naive_times) / n_runs
+    kv_avg = sum(kv_times) / n_runs
+    speedup = naive_avg / kv_avg if kv_avg > 0 else float("inf")
+    return {
+        "naive_avg_ms": naive_avg * 1000.0,
+        "kv_avg_ms": kv_avg * 1000.0,
+        "speedup": speedup,
+        "naive_tokens": naive_tokens,
+        "kv_tokens": kv_tokens,
+    }
+
+
+# ---------------------------------------------------------------------------
+# KV Cache 占用统计（GQA vs MHA）
+# ---------------------------------------------------------------------------
+def kv_cache_bytes(
+    n_layer: int,
+    batch_size: int,
+    n_head_kv: int,
+    seq_len: int,
+    head_dim: int,
+    dtype_size: int = 4,
+) -> int:
+    """
+    KV Cache 占用字节数。
+
+    公式：`n_layer × B × n_head_kv × T × head_dim × 2(K和V) × dtype_size`
+
+    参数：
+        n_layer:     层数
+        batch_size:  batch 大小
+        n_head_kv:   KV head 数
+        seq_len:     序列长度 T
+        head_dim:    head 特征维度
+        dtype_size:  每个元素的字节数（fp32=4, fp16=2）
+    返回：
+        字节数（int）
+    """
+    return n_layer * batch_size * n_head_kv * seq_len * head_dim * 2 * dtype_size
+
+
+def kv_cache_report(
+    model: "torch.nn.Module",
+    prompt_len: int,
+    max_new_tokens: int,
+    batch_size: int = 1,
+    dtype_size: Optional[int] = None,
+) -> dict:
+    """
+    打印/汇报 GQA 下的 KV Cache 实际占用，并与同尺寸 MHA 对比。
+
+    参数：
+        model:          模型
         prompt_len:     prompt 长度
-        max_new_tokens: 生成步数
+        max_new_tokens: 计划生成的 token 数
+        batch_size:     batch 大小
+        dtype_size:     元素字节数；None 时从模型参数推断
     返回：
-        {"naive_sec": ..., "cached_sec": ..., "speedup": ...}
+        {
+            "seq_len": int,          # 缓存的总长度（prompt + 生成）
+            "gqa_bytes": int,        # GQA 实际占用
+            "mha_bytes": int,        # 同尺寸 MHA（n_head_kv = n_head）会占多少
+            "ratio": float,          # gqa / mha
+            "gqa_mib": float,
+            "mha_mib": float,
+        }
     """
-    prompt = list(range(1, prompt_len + 1))
-    t0 = time.time(); generate_naive(model, prompt, max_new_tokens); t1 = time.time()
-    t2 = time.time(); generate_with_cache(model, prompt, max_new_tokens); t3 = time.time()
-    naive, cached = t1 - t0, t3 - t2
-    return {"naive_sec": naive, "cached_sec": cached, "speedup": naive / max(1e-9, cached)}
+    cfg = model.cfg
+    if dtype_size is None:
+        dtype_size = next(model.parameters()).element_size()
+    T = prompt_len + max_new_tokens
+    gqa = kv_cache_bytes(cfg.n_layer, batch_size, cfg.n_head_kv, T, cfg.head_dim, dtype_size)
+    mha = kv_cache_bytes(cfg.n_layer, batch_size, cfg.n_head, T, cfg.head_dim, dtype_size)
+    return {
+        "seq_len": T,
+        "gqa_bytes": gqa,
+        "mha_bytes": mha,
+        "ratio": gqa / mha if mha else float("inf"),
+        "gqa_mib": gqa / (1024 * 1024),
+        "mha_mib": mha / (1024 * 1024),
+    }
 ```
 
-- [ ] **Step 2: 运行**
+> **★ 本仓库自己的 API 与本计划初稿的差异（初稿有 4 个真 bug，已在实现里修掉）**：
+> ① **top-p 的 scatter 写错了**：初稿 `logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)`
+>    —— 把 `sorted_logits` 散射回**自己**，得到的不是「按原位置还原」的结果。
+>    正确写法是散射进一个**空张量**：`torch.empty_like(logits).scatter(-1, sorted_idx, sorted_logits)`。
+> ② **`KVCache(...)` 的构造参数名对不上**：初稿传 `n_head=` / `max_seq_len=` / `device=`，
+>    而 `model/common/kv_cache.py` 的签名是
+>    `n_layer / batch_size / n_head_kv / head_dim / max_len / dtype`。
+> ③ **模型属性取不到**：初稿用 `model.n_layer` / `model.n_head_kv` / `model.head_dim`，
+>    实际这些都在 `model.cfg` 上。
+> ④ **★ `benchmark_speed` 的列名不满足 feat-025 的验证项**：
+>    「pretrain 与 speedup 两项保留与 GPT-2 线同名的列」——
+>    初稿返回 `{"naive_sec", "cached_sec", "speedup"}`，
+>    而 GPT-2 线返回 `naive_avg_ms / kv_avg_ms / speedup / naive_tokens / kv_tokens`。
+>    实现改成与 GPT-2 线**逐字同名**，两条线的数字才能并排放进一张表。
+>
+> 另：初稿的 `generate_naive` / `generate_with_cache` 收 `List[int]`，
+> 实现改成收 `(B, P)` 的 LongTensor（支持 batch、与模型 forward 契约一致）。
+
+- [x] **Step 2: 写 `tests/test_inference.py`（12 组断言）**
+
+```python
+"""
+Qwen3 推理（prefill / decode / 采样 / KV Cache 占用）smoke（对应 feat-018）。
+
+运行：python tests/test_inference.py
+"""
+
+import os
+import sys
+
+import torch
+
+# 直接执行 `python tests/test_x.py` 时 sys.path[0] 是 tests/ 目录，
+# 找不到项目根下的 config.py / model 包 —— 这里把项目根补进 sys.path。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import DENSE_CONFIG as CFG
+from inference import (
+    benchmark_speed,
+    generate_naive,
+    generate_with_cache,
+    kv_cache_bytes,
+    kv_cache_report,
+    make_kv_cache,
+    sample_from_logits,
+)
+from model.qwen3_dense import Qwen3Dense
+
+torch.manual_seed(CFG.seed)
+
+VOCAB = 64
+model = Qwen3Dense(vocab_size=VOCAB, cfg=CFG, dropout=0.0)
+model.eval()
+
+PROMPT_LEN = 8
+prompt = torch.randint(0, VOCAB, (1, PROMPT_LEN), dtype=torch.long)
+
+# --- 1) greedy（temperature <= 0）就是 argmax ---
+logits = torch.tensor([[1.0, 5.0, 2.0, 0.0]])
+assert int(sample_from_logits(logits, temperature=0.0).item()) == 1, "greedy 应取最大值"
+# greedy 路径**不执行 top-k / top-p**：即使 top_k=1 也应取全局最大而不是第 0 个位置
+assert int(sample_from_logits(logits, temperature=0.0, top_k=1).item()) == 1, \
+    "greedy 不应受 top_k 影响"
+
+# --- 2) temperature 只改变分布形状，不改变排序 ---
+sharp = sample_from_logits(logits, temperature=0.5, top_k=2)
+assert sharp.shape == (1, 1), f"采样结果形状应为 (1,1)，实得 {tuple(sharp.shape)}"
+assert int(sharp.item()) in (0, 1), "top-k=2 后只可能取前 2 名"
+
+# --- 3) top-k 把第 k 名之后的 logits 置 -inf ---
+#    构造一个「只有前 2 个 token 有概率」的分布，top_k=1 时必须只取第 0 个
+skew = torch.tensor([[10.0, 0.0, 0.0, 0.0]])
+for _ in range(20):
+    assert int(sample_from_logits(skew, temperature=1.0, top_k=1).item()) == 0, \
+        "top_k=1 时必须恒取第 0 个"
+
+# --- 4) top-p：概率高度集中时，nucleus 只保留 1 个 token ---
+#    top_p=0.5 且第 0 个概率 > 0.5 ⇒ 只剩它
+for _ in range(20):
+    assert int(sample_from_logits(skew, temperature=1.0, top_p=0.5).item()) == 0, \
+        "top_p=0.5 在高度集中的分布上应只保留第 0 个"
+
+# --- 5) ★ 有/无 KV Cache 的生成本身一致（greedy）---
+seq_naive = generate_naive(model, prompt, max_new_tokens=12, temperature=0.0)
+seq_kv = generate_with_cache(model, prompt, max_new_tokens=12, temperature=0.0)
+assert seq_naive.shape == seq_kv.shape == (1, PROMPT_LEN + 12), \
+    f"两条路径的输出长度应相同，实得 {tuple(seq_naive.shape)} / {tuple(seq_kv.shape)}"
+assert torch.equal(seq_naive, seq_kv), (
+    f"greedy 下有/无 KV Cache 应生成完全相同的 token 序列\n"
+    f"naive={seq_naive.tolist()}\nkv  ={seq_kv.tolist()}"
+)
+
+# --- 6) ★ 更强的一致性断言：逐步 logits 对得上（不依赖 argmax 不平局）---
+_, l_naive = generate_naive(model, prompt, max_new_tokens=12, temperature=0.0,
+                            return_logits=True)
+_, l_kv = generate_with_cache(model, prompt, max_new_tokens=12, temperature=0.0,
+                              return_logits=True)
+assert len(l_naive) == len(l_kv) == 12, "两条路径应各产出 12 步 logits"
+max_diff = 0.0
+for a, b in zip(l_naive, l_kv):
+    max_diff = max(max_diff, float((a - b).abs().max().item()))
+assert max_diff < 1e-4, f"两条路径的逐步 logits 应一致，实得 max|diff| = {max_diff:.3e}"
+
+# --- 7) decode 阶段 cache 的长度逐步增长（prefill 一次写 P，之后每步 +1）---
+cache = make_kv_cache(model, batch_size=1, max_len=PROMPT_LEN + 12)
+pos = torch.arange(PROMPT_LEN, dtype=torch.long).unsqueeze(0)
+with torch.no_grad():
+    logits, _, cache, _ = model(prompt, kv_cache=cache, position_ids=pos)
+for layer_idx in range(CFG.n_layer):
+    assert cache.seq_len(layer_idx) == PROMPT_LEN, \
+        f"prefill 后第 {layer_idx} 层应缓存 {PROMPT_LEN} 个，实得 {cache.seq_len(layer_idx)}"
+nxt = torch.randint(0, VOCAB, (1, 1), dtype=torch.long)
+with torch.no_grad():
+    _, _, cache, _ = model(nxt, kv_cache=cache,
+                           position_ids=torch.full((1, 1), PROMPT_LEN, dtype=torch.long))
+for layer_idx in range(CFG.n_layer):
+    assert cache.seq_len(layer_idx) == PROMPT_LEN + 1, \
+        f"decode 1 步后第 {layer_idx} 层应缓存 {PROMPT_LEN + 1} 个，实得 {cache.seq_len(layer_idx)}"
+
+# --- 8) ★ decode 不施加因果 mask：T_q=1 时应能看到全部历史 ---
+#    可控实验：prefill 之后把 cache 里「除最后一个之外」的历史 K/V 清零，
+#    再各走一步 decode。
+#      · 若 decode 真的读了历史（T_q=1、不 mask）→ 输出**必须改变**
+#      · 若 decode 错误地把历史屏蔽掉 → 输出**不会变**
+def _decode_one(cache_obj):
+    """在给定 cache 上再 decode 一步，返回 (B, V) 的 logits。"""
+    with torch.no_grad():
+        lg, _, _, _ = model(nxt, kv_cache=cache_obj,
+                            position_ids=torch.full((1, 1), PROMPT_LEN, dtype=torch.long))
+    return lg[:, -1, :]
+
+
+clean_cache = make_kv_cache(model, batch_size=1, max_len=PROMPT_LEN + 4)
+with torch.no_grad():
+    _, _, clean_cache, _ = model(prompt, kv_cache=clean_cache, position_ids=pos)
+clean_logits = _decode_one(clean_cache)
+
+dirty_cache = make_kv_cache(model, batch_size=1, max_len=PROMPT_LEN + 4)
+with torch.no_grad():
+    _, _, dirty_cache, _ = model(prompt, kv_cache=dirty_cache, position_ids=pos)
+# 清零「除最后一个 token 外」的历史 K/V（cache 形状：layer, B, n_head_kv, T, head_dim）
+dirty_cache.k_buf[:, :, :, : PROMPT_LEN - 1, :] = 0.0
+dirty_cache.v_buf[:, :, :, : PROMPT_LEN - 1, :] = 0.0
+dirty_logits = _decode_one(dirty_cache)
+
+assert float((dirty_logits - clean_logits).abs().max().item()) > 1e-5, \
+    "污染历史 KV 后 decode 输出应发生变化（说明 decode 确实读了历史、不该有因果 mask）"
+
+# --- 9) eos 早停：先贪心跑一步拿到「模型会生成的那个 token」，把它当 eos ---
+first = int(generate_with_cache(model, prompt, max_new_tokens=1, temperature=0.0)[0, -1].item())
+seq_eos = generate_with_cache(model, prompt, max_new_tokens=10, temperature=0.0,
+                              eos_id=first)
+assert seq_eos.size(1) == PROMPT_LEN + 1, \
+    f"第一个 token 就是 eos，应只生成 1 个，实得 {seq_eos.size(1) - PROMPT_LEN} 个"
+seq_naive_eos = generate_naive(model, prompt, max_new_tokens=10, temperature=0.0,
+                               eos_id=first)
+assert seq_naive_eos.size(1) == PROMPT_LEN + 1, \
+    f"naive 路径的 eos 早停应同样只生成 1 个，实得 {seq_naive_eos.size(1) - PROMPT_LEN} 个"
+
+# --- 10) 采样：temperature > 0 时同一 prompt 多次采样应能产生不同结果 ---
+outs = set()
+for _ in range(20):
+    s = generate_with_cache(model, prompt, max_new_tokens=1, temperature=2.0, top_k=None)
+    outs.add(int(s[0, -1].item()))
+assert len(outs) > 1, f"temperature=2.0 采样 20 次应出现多个不同 token，实得 {outs}"
+
+# --- 11) KV Cache 占用：GQA 是同尺寸 MHA 的 n_head_kv/n_head ---
+report = kv_cache_report(model, prompt_len=16, max_new_tokens=48)
+expect_gqa = CFG.n_layer * 1 * CFG.n_head_kv * 64 * CFG.head_dim * 2 * 4
+assert report["gqa_bytes"] == expect_gqa, \
+    f"KV Cache 占用公式不对：{report['gqa_bytes']} != {expect_gqa}"
+assert report["ratio"] == CFG.n_head_kv / CFG.n_head, \
+    f"GQA/MHA 占用比应为 {CFG.n_head_kv}/{CFG.n_head}，实得 {report['ratio']}"
+assert report["mha_bytes"] == report["gqa_bytes"] * (CFG.n_head // CFG.n_head_kv), \
+    "MHA 占用应为 GQA 的 n_head/n_head_kv 倍"
+assert kv_cache_bytes(1, 1, 1, 1, 1, 1) == 2, "公式自检：n_layer=B=1,T=1,D=1,dtype=1 应为 2 字节"
+
+# --- 12) ★ benchmark_speed 的列名与 GPT-2 线一致，且 speedup > 1 ---
+bench = benchmark_speed(model, prompt, n_runs=2, max_new_tokens=16, temperature=0.0)
+for key in ("naive_avg_ms", "kv_avg_ms", "speedup", "naive_tokens", "kv_tokens"):
+    assert key in bench, f"benchmark_speed 缺少与 GPT-2 线同名的列：{key}"
+assert bench["naive_tokens"] == bench["kv_tokens"] == 16, \
+    f"两边生成的 token 数应相同，实得 {bench['naive_tokens']} / {bench['kv_tokens']}"
+assert bench["speedup"] > 1.0, f"有 KV Cache 应更快，实得 speedup={bench['speedup']:.3f}"
+
+print(f"test_inference OK  greedy一致=逐位相同 logits_max|diff|={max_diff:.2e} "
+      f"speedup={bench['speedup']:.2f}x "
+      f"KV占用(GQA/MHA)={report['gqa_bytes']}/{report['mha_bytes']}B "
+      f"比值=1/{CFG.n_head // CFG.n_head_kv}")
+```
+
+- [x] **Step 3: 运行**
 
 ```bash
 cd qwen3-learning/qwen3-pytorch
-python -c "
-import torch
-from config import DENSE_CONFIG
-from model.qwen3_dense import Qwen3Dense
-from inference import generate_naive, generate_with_cache, benchmark_speed
-m = Qwen3Dense(vocab_size=256, cfg=DENSE_CONFIG, dropout=0.0); m.eval()
-a = generate_naive(m, [1,2,3,4], max_new_tokens=16, temperature=0.0)
-b = generate_with_cache(m, [1,2,3,4], max_new_tokens=16, temperature=0.0)
-print('consistent:', a == b)
-print(benchmark_speed(m))
-"
+python tests/test_inference.py
 ```
 
-Expected: `consistent: True`（greedy 下必须逐 token 相同）；speedup > 1。
+实测输出（2026-10-22，CPU）：
 
-- [ ] **Step 3: Commit**
+```
+$ python tests/test_inference.py
+test_inference OK  greedy一致=逐位相同 logits_max|diff|=5.96e-07 speedup=1.33x
+                    KV占用(GQA/MHA)=196608/393216B 比值=1/2
+```
+
+**★ 关键观察一：有/无 KV Cache 的输出**逐位相同**（不只是「差不多」）。**
+两条断言一起守：
+- token 序列：`torch.equal(seq_naive, seq_kv) == True`（greedy，12 步）
+- 逐步 logits：12 步的 `max|diff| = 5.96e-07`
+
+> 为什么 logits 不是逐位相同而是差 6e-7？
+> naive 每次把整条序列（T_q = P+s）一起前向，cache 路径每步只前向 1 个 token（T_q = 1），
+> **matmul 的规约顺序不同 ⇒ fp32 末位差异**。差在 1e-7 量级，argmax 完全不受影响。
+
+**★ 关键观察二：decode 阶段确实没有因果 mask（反向实验）。**
+做法：prefill 之后把 cache 里**除最后一个之外**的历史 K/V 全部清零，再走一步 decode。
+- 若 decode 真读了历史 → 输出**必须改变**
+- 若 decode 错误地把历史屏蔽了 → 输出**不会变**
+实测输出**变了** ⇒ decode 确实读了历史。
+
+**★ 关键观察三：与 GPT-2 线的 speedup 横向对比**（同 prompt 长度 64、同生成 64、同一台 CPU）：
+
+| | naive_avg_ms | kv_avg_ms | speedup |
+|---|---|---|---|
+| **GPT-2**（MHA） | 207.92 | 118.94 | **1.748** |
+| **Qwen3**（GQA） | 327.31 | 163.74 | **1.999** |
+
+两条结论：
+1. **Qwen3 的绝对速度更慢**（naive 慢 ~57%）：三个独立投影 + QK-Norm 两趟 RMSNorm
+   + RoPE 旋转 + SwiGLU 三矩阵，单层做的事比 GPT-2 多。
+2. **但 Qwen3 的加速比反而更高**（2.00x vs 1.75x）：GQA 让 cache 的**读取量减半**，
+   cache 路径省下来的更多。
+
+> **「模型更复杂」与「推理更快」是两回事。**
+> Qwen3 用结构复杂度换来了 GQA 的内存/带宽优势。
+
+同一 prompt 长度下的 KV Cache 占用（T = 128，fp32）：
+GQA **393,216 B**（`4 × 1 × 2 × 128 × 48 × 2 × 4`）vs 同尺寸 MHA **786,432 B** ⇒ **1/2**。
+
+- [x] **Step 4: 挂进 `init.sh` 的 L4 层**
+
+L4 增加一条推理 smoke：greedy 下有/无 KV Cache 的输出必须**逐位相同**，
+且 GQA/MHA 的占用比必须等于 `n_head_kv / n_head`。
+
+实测输出：
+
+```
+  [PASS] Qwen3 推理 smoke（有/无 KV Cache 输出一致）[infer] greedy 逐位一致（8 token）；KV 占用 GQA=196,608B MHA=393,216B（1/2）
+  PASS=26  SKIP=0  FAIL=0
+```
+
+- [x] **Step 5: 笔记**
+
+`qwen3-learning/Qwen3_训练推理完整学习笔记.md` 补 §10：
+函数对照表 / 采样链执行顺序 / **GPT-2 笔记指出的 4 个问题逐条处理** /
+Qwen3 特有的两点 / 一致性实测 / speedup 横向对比 / 自测题 4 道。
+
+**★ 这一节的重点不是「抄一遍 GPT-2 的实现」，而是把 `gpt-learning/12.采样方式.md`
+第十五节已经指出的 4 个坑，一条条在 Qwen3 这边堵上**：
+
+| # | GPT-2 线的问题 | Qwen3 线的处理 |
+|---|---|---|
+| ① | 左 padding 没有 attention mask | 本线只做 batch=1 单条生成，不引入 padding |
+| ② | finished 样本没冻结输出；且**第一个 token 的 eos 不被拦下** | eos 出现直接 break；**补上 prefill 后第一个 token 的 eos 检查** |
+| ③ | KVCache 的 device/dtype 可能不匹配 | 显式传模型参数的 dtype |
+| ④ | `cache.get()` 每次 clone 整段缓存 | `KVCache.get` 直接返回切片 view |
+
+- [x] **Step 6: Commit**
 
 ```bash
-git add qwen3-learning/
+git add qwen3-learning/ init.sh
 git commit -m "feat-018: Qwen3 KV Cache 推理与采样（prefill/decode + temperature/top-k/top-p）"
 ```
 
 ---
+
 
 ### Task 18: feat-017 与 GPT-2 的退化对照实验
 

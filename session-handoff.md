@@ -9,9 +9,10 @@
 ## 一句话现状
 
 GPT-2 线**全链路已复验通过**（torch 环境已修好，训练 + 9 项评估全绿）；
-Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO 已从零手写完并真跑通**
+Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO + KV Cache 推理已从零手写完并真跑通**
 （RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE /
-语料与偏好数据 / `--model dense|moe` 预训练 / 手写 LoRA 微调 / 手写 DPO），**评估侧尚未开工**。
+语料与偏好数据 / `--model dense|moe` 预训练 / 手写 LoRA 微调 / 手写 DPO / prefill-decode 推理与采样），
+**精简评估脚本尚未开工**。
 
 ---
 
@@ -37,8 +38,8 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 
 ## Verified Now（哪些是已验证的）
 
-- `bash init.sh` → **PASS=25 SKIP=0 FAIL=0**（2026-10-22，L4 已有五条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke**）
-- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=12 FAIL=0 TOTAL=12**
+- `bash init.sh` → **PASS=26 SKIP=0 FAIL=0**（2026-10-22，L4 已有六条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke**）
+- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=13 FAIL=0 TOTAL=13**
 - Qwen3 前向 smoke 已用**真实 BPE 词表**（vocab 778）跑通：`logits (2, 8, 778) loss 6.6897 params 985,856`
 - Qwen3 训练步 smoke：`[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05`
 - **预训练真跑通**（CPU，脚本在 `train/train_pretrain.py`，超参全从 `config.py` 读）：
@@ -75,6 +76,18 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 | sft | 1500 | 0.0003 | 0.1 | +0.0000 → +4.1526 | 0.000 → 0.715 | 0.605 → 0.665 | 12 |
 | sft | 3000 | 0.001 | 0.1 | +0.0000 → +5.0101 | 0.000 → 0.920 | 0.605 → 0.665 | 12 |
 
+- **KV Cache 推理 + 采样真跑通**（`qwen3-learning/qwen3-pytorch/inference.py`）：
+  - `sample_from_logits` / `generate_naive` / `generate_with_cache` / `benchmark_speed` /
+    `kv_cache_bytes` / `kv_cache_report`；`benchmark_speed` 的**列名与 GPT-2 线逐字相同**
+  - **有/无 KV Cache 的 greedy 输出逐位相同**（token 序列 `torch.equal` == True；
+    逐步 logits 12 步 `max|diff| = 5.96e-07`）
+  - **decode 不施加因果 mask 的反向实验**：prefill 后清零「除最后一个之外」的历史 K/V，
+    decode 输出**必须改变**（实测变了）
+  - **与 GPT-2 线的 speedup 横向对比**（同 prompt 长度 64、同生成 64、同一台 CPU）：
+    GPT-2 **1.748x** vs Qwen3 **1.999x** —— Qwen3 绝对更慢（327 vs 208 ms）但加速比更高
+    （GQA 让 cache 读取量减半）
+  - **KV Cache 占用**（T=128，fp32）：GQA **393,216 B** vs 同尺寸 MHA **786,432 B** = **1/2**
+  - `tests/test_inference.py` 12 组断言全过
 - **消融结论**：低秩约束 + 注入点决定「能学到什么」——
   全参微调 loss ~1.06 vs r=4 LoRA loss ~5.7（**内容型任务上 LoRA 明显吃力**，
   LoRA 的主场是风格/格式型任务）
@@ -86,7 +99,7 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 
 ## Broken Or Unverified（坏的 / 没验证的）
 
-- **Qwen3 的评估侧完全没跑过**：`train/` 下已有 `train_pretrain.py` / `train_lora.py` / `train_dpo.py`，但**精简评估脚本还没写**（plan Task 16 / feat-025）
+- **Qwen3 的精简评估侧完全没跑过**：`train/` 下已有 `train_pretrain.py` / `train_lora.py` / `train_dpo.py`，`inference.py` 已有，但**精简评估脚本 `evaluate.py` 还没写**（plan Task 16 / feat-025）
 - **LoRA / DPO 的胜率都是「训练内指标」**：合成偏好数据只有 5 个 prompt × 5 个 chosen，训练集与评估集同分布 ——
   它证明的是「LoRA 确实让模型更偏向 chosen」，**不能当泛化能力**
 - **BPE 词表只有 778 < 目标 1000**：合成语料的可合并对用尽（521 次后没有频次 ≥ 2 的对），属语料多样性问题，非实现 bug
@@ -101,11 +114,10 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 
 | 顺序 | feature | 做什么 | 为什么是它 |
 |------|---------|--------|--------|
-| 1 | `feat-025` | Qwen3 精简评估（pretrain/lora/dpo/speedup 四段） | 验收 |
-| 2 | `feat-018` | KV Cache 推理 + 采样（temperature/top-k/top-p） | 推理侧 |
-| 3 | `feat-017` | 与 GPT-2 的**退化对照**（逐组件消融 + max_abs_diff 记录） | 本线最有价值的产出 |
-| 4 | `feat-008` | 笔记 ↔ 源码交叉引用（补 BPE 笔记） | 收尾 |
-| 5 | `feat-009` | 笔记数字与 `config.py` 全量核对 | 收尾 |
+| 1 | `feat-025` | Qwen3 精简评估（pretrain/lora/dpo/speedup 四段 + MoE 段） | 验收 |
+| 2 | `feat-017` | 与 GPT-2 的**退化对照**（逐组件消融 + max_abs_diff 记录） | 本线最有价值的产出 |
+| 3 | `feat-008` | 笔记 ↔ 源码交叉引用（补 BPE 笔记） | 收尾 |
+| 4 | `feat-009` | 笔记数字与 `config.py` 全量核对 | 收尾 |
 
 **这一步不许动的**：不改 GPT-2 线的任何训练代码或超参；不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值。
 
@@ -128,6 +140,8 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 | **DPO 的 π_ref 是「哪一个」模型** | 标准做法锚 **SFT 模型**。本仓库「关掉 LoRA 分支」得到的是**预训练模型** —— 锚错**不报错、loss 也降、指标照涨**，只是整个实验锚在错的基线上。解法：`merge_lora` → `strip_lora`（新增）→ 重新 `inject_lora`。**必须用「初始 margin 恒为 0 / loss 恒为 log 2」这条可运行断言来钉** |
 | **DPO 目标指标 ≠ 业务指标** | 强配方 margin +4.65 / dpo_acc 0.78 / 绝对胜率 0.605→0.665；**弱配方 dpo_acc 冲到 0.945，绝对胜率却是 0/200 翻转**。**报告时必须同时给 margin（目标口径）与 win_rate（业务口径）**，只给前者是自我欺骗 |
 | **覆盖参数没传到子模块 = 静默的半配置** | `Qwen3Dense(dropout=0.0)` 只关掉了 embedding 的 dropout，注意力/MLP 一直是 `cfg.dropout=0.1`；而 **p>0 的 Dropout 在 train 模式下会推进全局 torch RNG**⇒ 「训练前多做几次评估」就改变训练轨迹（同一配方 margin 差 0.028）。**每个覆盖开关都要配一条等价性断言（结构 + 行为各一条）** |
+| **KV Cache 与 naive 的 logits 不会逐位相同，但 token 会** | 两条路径的 matmul 规约顺序不同（naive 一次前向 T_q = P+s，cache 每步 T_q = 1）⇒ fp32 末位差异 ~1e-7。**验证「KV Cache 改没改结果」要断言 token 序列，而不是断言 logits 逐位相等**；想更强就断言逐步 logits 的 `max|diff| < 1e-4` |
+| **「decode 不 mask」要用反向实验证** | 正向断言（decode 输出对）证明不了「没被 mask」。正确做法：**污染历史 K/V ⇒ 输出必须改变** —— 若历史被屏蔽了，污染不会影响输出 |
 | **LoRA ≠ 弱化版全参** | 低秩约束 + 注入点决定「能学到什么」：内容型任务上全参 loss ~1.06 vs r=4 LoRA ~5.7。**LoRA 是风格/格式型任务的主场** |
 
 ---
@@ -159,7 +173,7 @@ python evaluate.py --stage all
 # Qwen3 线（组件 + 数据 + 预训练已就位）
 cd qwen3-learning/qwen3-pytorch
 python data/build_vocab.py       # 重建 BPE 词表（vocab.json / merges.txt）
-python tests/run_all.py          # 12 个 smoke 汇总
+python tests/run_all.py          # 13 个 smoke 汇总
 python tests/test_pretrain.py    # 单个 smoke
 python tests/test_lora.py        # LoRA 的 9 组断言
 python train/train_pretrain.py --model dense   # 预训练（dense，~47s CPU）
@@ -167,6 +181,7 @@ python train/train_pretrain.py --model moe     # 预训练（MoE，~59s CPU）
 python train/train_lora.py       # LoRA 微调（r=4 q/v, lr=1e-3, 1500 步）
 python train/train_dpo.py        # DPO（π_ref = SFT 模型，merge → strip → 重新 inject）
 python tests/test_dpo.py         # DPO 的 9 组断言
+python tests/test_inference.py   # KV Cache 推理与采样（12 组断言）
 
 # 状态
 cat feature_list.json            # 含 phase 阶段标记 + 每条的 evidence
@@ -180,7 +195,7 @@ git log --oneline -5
 |----------|--------|
 | 开工前必读 | `AGENTS.md` §0 framing / §3 硬约束 / §5 验证路径 |
 | 当前阶段与任务顺序 | `feature_list.json` 的 `phase` + priority 最小的非 passing 项 |
-| Qwen3 设计 / 实施计划 | `qwen3-learning/qwen3-pytorch设计.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–15 已就地纠错，含「实测修正记录」） |
-| Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（8 篇，缺 BPE；LoRA-DPO 篇已补齐 DPO 半部） |
+| Qwen3 设计 / 实施计划 | `qwen3-learning/qwen3-pytorch设计.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–17 已就地纠错，含「实测修正记录」） |
+| Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（8 篇，缺 BPE；LoRA-DPO 篇已补齐 DPO 半部；训练推理篇已补 §10 推理实现与采样） |
 | GPT-2 对照实现 | `gpt-learning/gpt-learning-pytorch/model/gpt2.py` |
 | 收班自查 | `clean-state-checklist.md` |

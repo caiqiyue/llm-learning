@@ -407,6 +407,39 @@ PY
   else
     skip "Qwen3 DPO smoke" "train/train_dpo.py 尚未就绪（feat-024），或 torch 不可用"
   fi
+
+  # --- 推理 smoke（feat-018）：有/无 KV Cache 的 greedy 输出必须逐位相同 ---
+  if [ -f "$QWEN_DIR/inference.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_inference.log 2>&1
+import torch
+from config import DENSE_CONFIG
+from inference import generate_naive, generate_with_cache, kv_cache_report
+from model.qwen3_dense import Qwen3Dense
+
+torch.manual_seed(DENSE_CONFIG.seed)
+model = Qwen3Dense(vocab_size=64, cfg=DENSE_CONFIG, dropout=0.0)
+model.eval()
+prompt = torch.randint(0, 64, (1, 8), dtype=torch.long)
+
+a = generate_naive(model, prompt, max_new_tokens=8, temperature=0.0)
+b = generate_with_cache(model, prompt, max_new_tokens=8, temperature=0.0)
+assert torch.equal(a, b), f"有/无 KV Cache 的 greedy 输出应逐位相同\n{a.tolist()}\n{b.tolist()}"
+
+rep = kv_cache_report(model, prompt_len=8, max_new_tokens=56)
+assert rep["ratio"] == DENSE_CONFIG.n_head_kv / DENSE_CONFIG.n_head, \
+    f"GQA/MHA 占用比不对：{rep['ratio']}"
+print(f"[infer] greedy 逐位一致（8 token）；KV 占用 GQA={rep['gqa_bytes']:,}B "
+      f"MHA={rep['mha_bytes']:,}B（1/{DENSE_CONFIG.n_head // DENSE_CONFIG.n_head_kv}）")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 推理 smoke（有/无 KV Cache 输出一致）$(tail -1 /tmp/llm_init_l4_inference.log)"
+    else
+      fail "Qwen3 推理 smoke" "$(tail -3 /tmp/llm_init_l4_inference.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 推理 smoke" "inference.py 尚未就绪（feat-018），或 torch 不可用"
+  fi
 fi
 
 # -----------------------------------------------------------------------------

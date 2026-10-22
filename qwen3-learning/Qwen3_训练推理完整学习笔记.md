@@ -529,3 +529,144 @@ Decode 把缓存写满时：可以停止生成，或在适合的架构/框架中
 6. 为什么 Chunked Prefill 本身不能解决完整 KV Cache 总容量不足？
 
 **答案：** ① `4`、`[1,16,4,2]`；② `7//4=1`；③ `[1,16,4,4]`，不会；④ `3`；⑤ `[1,2,1,2]`、`[1,2,1,4]`（使用微型模型）；⑥ 它只分块执行计算，仍需保存全部被保留 Token 的最终 K/V。
+
+---
+
+## 10. 推理实现：inference.py 与采样（对照 `gpt-learning/12.采样方式.md`）
+
+代码：`qwen3-learning/qwen3-pytorch/inference.py`
+测试：`qwen3-learning/qwen3-pytorch/tests/test_inference.py`（12 组断言）
+
+### 10.1 与 GPT-2 线的函数对应
+
+**组织方式完全一致，代码独立重写**（AGENTS.md 硬约束：Qwen3 线不跨目录 import）。
+
+| 用途 | GPT-2 线（`gpt-learning/gpt-learning-pytorch/generate.py`） | Qwen3 线（`qwen3-pytorch/inference.py`） |
+|---|---|---|
+| 采样 | `_sample_from_logits` | `sample_from_logits` |
+| 无缓存生成 | `generate_naive` | `generate_naive` |
+| 有缓存生成 | `generate_kv`（包 `GPT2WithKVCache`） | `generate_with_cache`（直接传 `kv_cache`） |
+| 加速比 | `benchmark_speed` | `benchmark_speed` |
+| KV 占用统计 | —— | `kv_cache_bytes` / `kv_cache_report`（新增） |
+
+`benchmark_speed` 返回的**列名与 GPT-2 线逐字相同**：`naive_avg_ms` / `kv_avg_ms` /
+`speedup` / `naive_tokens` / `kv_tokens` ⇒ 两条线的数字可以直接并排放进一张表。
+
+### 10.2 采样链：执行顺序与 GPT-2 线完全一致
+
+```text
+logits
+  ↓ temperature <= 0 ? ── 是 ──▶ greedy（argmax，直接返回，不再走下面三步）
+  ↓ 否
+  ↓ logits / temperature          改尖锐程度
+  ↓ top-k                         固定候选数量（第 k 名之后置 -inf）
+  ↓ top-p                         动态候选集合（累计概率越界之后置 -inf）
+  ↓ softmax
+  ↓ torch.multinomial             随机抽取
+```
+
+`top-p` 的 mask 写法与 GPT-2 线**逐字相同**：
+
+```python
+cum = sorted_probs.cumsum(dim=-1)
+remove = (cum - sorted_probs) > top_p
+```
+
+`cum - sorted_probs` 是「加入当前 token **之前**的累计概率」，
+这样保证**让累计概率第一次超过 `top_p` 的那个 token 仍然被保留**（GPT-2 笔记 §12）。
+
+`temperature <= 0` 时**直接 greedy 并跳过 top-k / top-p** —— 这条也被写成断言
+（`tests/test_inference.py` 第 1 条：greedy 不受 `top_k` 影响）。
+
+### 10.3 ★ GPT-2 笔记指出的 4 个问题，本线的处理
+
+`gpt-learning/12.采样方式.md` 第十五节列了 4 个「这份代码中几个值得注意的问题」。
+本线**逐条对照处理**：
+
+| # | GPT-2 线的问题 | Qwen3 线的处理 |
+|---|---|---|
+| ① | 左 padding 没有 attention mask，短 prompt 会注意到 PAD，position_ids 也错位 | **本线只做 batch=1 的单条生成**，不引入 padding ⇒ 问题不存在（要批处理必须另加 mask） |
+| ② | finished 样本没有真的冻结输出，EOS 后面仍会出随机 token | 本线在 eos 出现时**直接 break**；且**补上了 prefill 后第一个 token 的 eos 检查**（GPT-2 线的循环从第 2 个 token 开始查，第一个 token 若是 eos 不会被拦下） |
+| ③ | `KVCache` 的 device / dtype 可能不匹配（默认 CPU + float32） | `make_kv_cache` **显式传模型参数的 dtype**，`append` 里也做 `.to(dtype)` 转换 |
+| ④ | `cache.get()` 每次 clone 整段缓存 | 本线 `KVCache.get` **直接返回切片 view**，不复制（见 `model/common/kv_cache.py`） |
+
+> 这条对照是 feat-018 的验证项之一：**不是「抄一遍 GPT-2 的实现」，
+> 而是把 GPT-2 笔记里已经指出的坑，一条条在 Qwen3 这边堵上。**
+
+### 10.4 ★ Qwen3 特有的两点
+
+**① decode 阶段不施加因果 mask。**
+`T_q = 1`、`T_kv = 已缓存的历史长度`，cache 天然只含历史与当前 token、不含未来，
+所以**不需要 mask**。代码里体现为 `attention.py` 第 5 步的 `if T_q > 1:` 判断。
+
+**可运行证据**（`tests/test_inference.py` 第 8 条，做的是「反向实验」）：
+prefill 之后把 cache 里**除最后一个之外**的历史 K/V 全部清零，再走一步 decode：
+
+- 若 decode 真的读了历史 → 输出**必须改变**
+- 若 decode 错误地把历史屏蔽了 → 输出**不会变**
+
+实测输出**变了** ⇒ decode 确实读了历史、不该有因果 mask。
+
+**② KV Cache 按 `n_head_kv` 分配。**
+占用公式：`n_layer × B × n_head_kv × T × head_dim × 2(K和V) × dtype_size`。
+本仓库 `n_head=4 / n_head_kv=2` ⇒ **GQA 的占用是同尺寸 MHA 的 1/2**。
+
+### 10.5 ★ 实测一：有/无 KV Cache 的输出**逐位相同**
+
+```
+$ python tests/test_inference.py
+test_inference OK  greedy一致=逐位相同 logits_max|diff|=5.96e-07 speedup=1.33x
+                    KV占用(GQA/MHA)=196608/393216B 比值=1/2
+```
+
+两条断言：
+
+- **token 序列逐位相同**（greedy，12 步）：`torch.equal(seq_naive, seq_kv) == True`
+- **逐步 logits 对得上**（更强，不依赖 argmax 不平局）：12 步的 `max|diff| = 5.96e-07`
+
+> 为什么不是逐位相同而是「差 6e-7」？
+> naive 路径每次把整条序列（T_q = P + s）一起前向，cache 路径每步只前向 1 个 token（T_q = 1）。
+> **matmul 的规约顺序不同 ⇒ 浮点结果有末位差异**。
+> 差异在 1e-7 量级（fp32 的 eps 量级），greedy 的 argmax 完全不受影响。
+
+### 10.6 ★ 实测二：与 GPT-2 线的 speedup 横向对比
+
+同一 prompt 长度（64）、同一生成长度（64）、同一台 CPU、同一份代码逻辑，
+两边都是 greedy、各跑 3 次取平均：
+
+| | naive_avg_ms | kv_avg_ms | speedup |
+|---|---|---|---|
+| **GPT-2**（MHA，n_head=4 / n_head_kv=4） | 207.92 | 118.94 | **1.748** |
+| **Qwen3**（GQA，n_head=4 / n_head_kv=2） | 327.31 | 163.74 | **1.999** |
+
+两条结论：
+
+1. **Qwen3 的绝对速度更慢**（naive 327 ms vs 208 ms，慢了 ~57%）。
+   原因是 Qwen3 单层做的事更多：三个独立投影（Q/K/V 不能合并）、
+   **QK-Norm 两趟 RMSNorm**、**RoPE 旋转**、**SwiGLU 三矩阵**。
+2. **但 Qwen3 的加速比反而更高**（2.00x vs 1.75x）。
+   因为 GQA 让 cache 的**读取量减半** ⇒ cache 路径省下来的更多。
+
+> **「模型更复杂」与「推理更快」是两回事。**
+> Qwen3 用结构复杂度换来了 GQA 的内存/带宽优势 —— 这正是 Qwen3 真实部署里
+> 「同尺寸下比 GPT-2 更快」的来源，而不是它算得更省。
+
+同一个 prompt 长度下的 KV Cache 占用（T = 128，fp32）：
+
+| | 占用 | 公式代入 |
+|---|---|---|
+| **Qwen3（GQA）** | **393,216 B**（384 KiB） | 4 × 1 × 2 × 128 × 48 × 2 × 4 |
+| 同尺寸 MHA | 786,432 B（768 KiB） | 4 × 1 × 4 × 128 × 48 × 2 × 4 |
+
+### 10.7 自测题（本节）
+
+1. naive 路径和 cache 路径，为什么 logits 有 1e-7 量级的差异却能保证 token 逐位相同？
+2. `top_p = 0.8`、概率为 `0.50 / 0.25 / 0.15 / 0.07 / 0.03` 时保留哪几个 token？
+   `mask = cumsum - probs > top_p` 里为什么要减掉 `probs`？
+3. 如果 decode 阶段错误地施加了因果 mask（把历史屏蔽掉），§10.5 的哪条断言会先炸？
+4. GQA 让 Qwen3 的 speedup 比 MHA 高，但绝对速度更慢 —— 这两件事矛盾吗？
+
+**答案：** ① matmul 规约顺序不同导致的 fp32 末位差异（1e-7 量级），远小于 logit 之间的间隔，
+argmax 不受影响；② 保留 A、B、C（D、E 被删）—— 减掉 `probs` 是为了保证「让累计概率
+第一次越过 0.8 的 C」仍被保留；③ 第 8 条（污染历史 K/V 后 decode 输出必须改变）；
+④ 不矛盾 —— 复杂度影响**绝对耗时**，GQA 影响**cache 路径省下来的量**。

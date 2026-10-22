@@ -604,3 +604,111 @@ $ bash init.sh
 `qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`（§6.2 / §6.4 / §7 / §8 / §9）、
 `qwen3-learning/qwen3-pytorch开发计划.md`（Task 15 就地换成真代码 + 实测修正记录）、
 仓库根 `init.sh`（L4 +DPO smoke）、`feature_list.json`、`claude-progress.md`、`session-handoff.md`
+
+### Session 008 — Qwen3 KV Cache 推理与采样（feat-018）
+
+**本次做完的事**
+
+1. 新增 `qwen3-learning/qwen3-pytorch/inference.py`：
+   `sample_from_logits` / `make_kv_cache` / `generate_naive` / `generate_with_cache` /
+   `benchmark_speed` / `kv_cache_bytes` / `kv_cache_report`。
+2. 新增 `tests/test_inference.py`（12 组断言），自动挂进 `tests/run_all.py`。
+3. `init.sh` L4 加一条推理 smoke（greedy 逐位一致 + GQA/MHA 占用比）。
+4. 补 `Qwen3_训练推理完整学习笔记.md` §10：实现与采样差异、实测、自测题。
+5. **修正计划里的一个顺序 bug**：feat-025 的 `speedup` 段依赖 `inference.py`，
+   而原计划把 feat-025 排在 feat-018 前面 ⇒ 实际执行顺序改为 feat-018 → feat-025，
+   开发计划 Task 16 已就地标注。
+
+**★ 最硬的一条结论：有/无 KV Cache 的 greedy 输出逐位相同**
+
+不只是「差不多」—— 两条断言一起守：
+
+- token 序列：`torch.equal(seq_naive, seq_kv) == True`（greedy，12 步）
+- 逐步 logits：12 步的 `max|diff| = 5.96e-07`
+
+> logits 不是逐位相同，差在 6e-7：**naive 每次把整条序列（T_q = P+s）一起前向，
+> cache 路径每步只前向 1 个 token（T_q = 1），matmul 的规约顺序不同 ⇒ fp32 末位差异。**
+> 差在 1e-7 量级，argmax 完全不受影响。
+
+**★ 「decode 不施加因果 mask」的反向实验**
+
+做法：prefill 之后把 cache 里**除最后一个之外**的历史 K/V 全部清零，再走一步 decode。
+
+- 若 decode 真读了历史 → 输出**必须改变**
+- 若 decode 错误地把历史屏蔽了 → 输出**不会变**
+
+实测输出**变了** ⇒ decode 确实读了历史。
+（结构断言也守着：prefill 后每层缓存长度 = prompt 长度，decode 一步后 +1。）
+
+**★ 与 GPT-2 线的 speedup 横向对比**（同 prompt 长度 64、同生成 64、同一台 CPU、greedy、3 次取平均）：
+
+| | naive_avg_ms | kv_avg_ms | speedup |
+|---|---|---|---|
+| **GPT-2**（MHA） | 207.92 | 118.94 | **1.748** |
+| **Qwen3**（GQA） | 327.31 | 163.74 | **1.999** |
+
+- **Qwen3 的绝对速度更慢**（naive 慢 ~57%）：三个独立投影 + QK-Norm 两趟 RMSNorm +
+  RoPE 旋转 + SwiGLU 三矩阵，单层做的事比 GPT-2 多。
+- **但加速比反而更高**（2.00x vs 1.75x）：GQA 让 cache 的**读取量减半**，cache 路径省得更多。
+
+> **「模型更复杂」与「推理更快」是两回事。**
+> Qwen3 用结构复杂度换来了 GQA 的内存/带宽优势。
+
+**KV Cache 占用**（T = 128，fp32）：GQA **393,216 B** vs 同尺寸 MHA **786,432 B** = **1/2**。
+
+**★ 逐条堵上 GPT-2 笔记（`gpt-learning/12.采样方式.md` §15）指出的 4 个坑**
+
+| # | GPT-2 线的问题 | Qwen3 线的处理 |
+|---|---|---|
+| ① | 左 padding 没有 attention mask | 本线只做 batch=1 单条生成，不引入 padding |
+| ② | finished 样本没冻结输出 | eos 直接 break，**并补上 prefill 后第一个 token 的 eos 检查**（GPT-2 线循环从第 2 个 token 才开始查，第一个 token 若是 eos 不会被拦下） |
+| ③ | KVCache 的 device/dtype 可能不匹配 | 显式传模型参数的 dtype |
+| ④ | `cache.get()` 每次 clone 整段缓存 | 直接返回切片 view |
+
+采样链的执行顺序与 top-p 的 mask 写法与 GPT-2 线**逐字一致**
+（`mask = (cumsum - sorted_probs) > top_p`，保证第一次越过 top_p 的 token 仍被保留）。
+
+**★ 修正计划初稿的 4 个真 bug**
+
+① **top-p 的 scatter 写错了** —— 初稿 `logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)`
+把 `sorted_logits` 散射回**自己**，得到的不是「按原位置还原」；
+正确写法是散射进一个空张量 `torch.empty_like(logits).scatter(-1, sorted_idx, sorted_logits)`。
+② **KVCache 构造参数名对不上**（初稿 `n_head=`/`max_seq_len=`/`device=`，
+实际签名是 `n_layer/batch_size/n_head_kv/head_dim/max_len/dtype`）。
+③ **模型属性取不到**（初稿 `model.n_layer`，实际在 `model.cfg` 上）。
+④ **★ benchmark_speed 的列名不满足 feat-025 的验证项** —— 初稿返回
+`naive_sec/cached_sec/speedup`，而要求是「与 GPT-2 线同名的列」
+⇒ 实现改成 `naive_avg_ms / kv_avg_ms / speedup / naive_tokens / kv_tokens`。
+
+**验证**
+
+```
+$ python tests/test_inference.py
+test_inference OK  greedy一致=逐位相同 logits_max|diff|=5.96e-07 speedup=1.33x KV占用(GQA/MHA)=196608/393216B 比值=1/2
+
+$ python tests/run_all.py
+[run_all] PASS=13  FAIL=0  TOTAL=13
+
+$ bash init.sh
+  [PASS] Qwen3 推理 smoke（有/无 KV Cache 输出一致）[infer] greedy 逐位一致（8 token）；KV 占用 GQA=196,608B MHA=393,216B（1/2）
+  PASS=26  SKIP=0  FAIL=0
+```
+
+**未解决 / 风险**
+
+- **speedup 只有 ~2x**：CPU 上模型太小，prefill 的固定开销占比高。
+  真实部署里长 prompt + 长生成才会看到 KV Cache 的收益（本仓库 block_size 只有 128）。
+- **只做了 batch=1**：GPT-2 线笔记指出的「左 padding 无 attention mask」问题在本线**被绕开**
+  而不是被解决。要做批量推理必须先补 attention mask。
+
+**下一步**
+
+1. `feat-025` 精简评估脚本（pretrain / lora / dpo / speedup 四段 + MoE 段）
+2. `feat-017` 与 GPT-2 的退化对照实验 → `feat-008` 笔记↔源码交叉引用 → `feat-009` 数字全量核对 → 收班
+
+**本次改动涉及的文件**
+
+`qwen3-learning/qwen3-pytorch/`：`inference.py`（新）、`tests/test_inference.py`（新）、
+`qwen3-learning/Qwen3_训练推理完整学习笔记.md`（+§10）、
+`qwen3-learning/qwen3-pytorch开发计划.md`（Task 17 就地换成真代码 + Task 16 标注顺序纠正）、
+仓库根 `init.sh`（L4 +推理 smoke）、`feature_list.json`
