@@ -670,3 +670,117 @@ test_inference OK  greedy一致=逐位相同 logits_max|diff|=5.96e-07 speedup=1
 argmax 不受影响；② 保留 A、B、C（D、E 被删）—— 减掉 `probs` 是为了保证「让累计概率
 第一次越过 0.8 的 C」仍被保留；③ 第 8 条（污染历史 K/V 后 decode 输出必须改变）；
 ④ 不矛盾 —— 复杂度影响**绝对耗时**，GQA 影响**cache 路径省下来的量**。
+
+---
+
+## 11. 评估：evaluate.py 与「两条线的评估不是同一套」
+
+对应 feat-025。源码：[qwen3-pytorch/evaluate.py](qwen3-pytorch/evaluate.py)，
+测试：[qwen3-pytorch/tests/test_evaluate.py](qwen3-pytorch/tests/test_evaluate.py)。
+
+### 11.1 五段评估
+
+| stage | 指标 | 对应 checkpoint |
+|---|---|---|
+| `pretrain` | val loss / val perplexity | `checkpoints/pretrain_dense.pt` |
+| `moe` | 同上 **+ 专家负载分布 + aux_loss** | `checkpoints/pretrain_moe.pt` |
+| `lora` | 偏好胜率（前 → 后对比） | `checkpoints/lora.pt` |
+| `dpo` | reward margin 均值/标准差、chosen>rejected 准确率 | `checkpoints/dpo.pt` |
+| `speedup` | 有/无 KV Cache 的输出一致性 + 加速比 | `checkpoints/pretrain_dense.pt` |
+
+```bash
+python evaluate.py --stage all        # 5 段一起跑
+python evaluate.py --stage dpo        # 只跑 DPO 段
+```
+
+### 11.2 ★ 评估脚本的数字必须与训练日志对得上
+
+| 指标 | 训练日志 | 评估脚本 |
+|---|---|---|
+| 预训练 val_loss / val_ppl | 1.3510 / 3.86 | 1.3510（batch 均值口径）/ 3.861 |
+| LoRA 胜率（前 → 后） | 0.515 → 0.605 | 0.5150 → 0.6050 |
+| DPO margin / dpo_acc / 绝对胜率 | +4.6512 / 0.780 / 0.665 | +4.6512 / 0.7800 / 0.6650 |
+
+> **做法**：各段的评估函数**直接复用训练脚本里的实现**
+> （`train.train_pretrain.estimate_loss` / `train.train_lora.evaluate_pairs` /
+> `train.train_dpo.evaluate_dpo`），**不重写**。
+> 重写就会出现「两边口径不同、数字对不上」的老问题 —— 本仓库已经吃过一次亏：
+> 预训练 loss 一开始算成 batch 均值，而 GPT-2 线是 token 加权，两条线的 ppl 没法比。
+
+### 11.3 ★ pretrain 的两种 loss 口径（都打印，是为了能跟训练日志对上）
+
+| 口径 | 字段 | 跟谁对齐 |
+|---|---|---|
+| **token 加权** | `loss` / `perplexity` | GPT-2 线的 `eval_perplexity`（可直接横向比） |
+| **batch 均值** | `loss_batch_mean` / `perplexity_batch_mean` | `train/train_pretrain.py` 打印的 `val_loss` |
+
+实测 1.3485（token 加权）vs 1.3510（batch 均值），差 0.19% ——
+差异只来自最后一个不满的 batch。
+
+> **为什么「同名」还不够，「同口径」才够**：
+> 同一个叫 `perplexity` 的字段，一个是 token 加权、一个是 batch 均值，
+> 数字放在一起比就是在比两件不同的事。
+
+### 11.4 ★ 与 GPT-2 线 9 项评估的差异：为什么不能逐项对标
+
+GPT-2 线的 9 项是围绕 **Reward Model + PPO** 设计的；
+Qwen3 线走 **LoRA + DPO**：没有显式奖励模型、没有 PPO、没有采样。
+
+| GPT-2 线 | Qwen3 线 | 说明 |
+|---|---|---|
+| `pretrain` | ✅ `pretrain` | 同名列 + 同口径 |
+| `speedup` | ✅ `speedup` | 同名列 |
+| `sft` | 🔁 `lora` | 对应物：LoRA 前后胜率对比 |
+| `reward`（RM pairwise acc） | 🔁 `dpo` | 本线没有 RM；对应物是 **margin 判对率** |
+| `ppo`（reward / KL） | 🔁 `dpo` | 本线没有 PPO；对应物是**隐式奖励 margin** |
+| `compare`（SFT vs PPO） | 🔁 `lora` | 本线没有 PPO；对应物是 LoRA 前→后对比 |
+| `benchmark` | ❌ 无 | 语料是合成的，没有 QA benchmark |
+| `diversity` / `response_quality` | ⏳ 未实现 | 属生成质量类，feat-025 范围外 |
+| — | ➕ `moe` | **Qwen3 独有**：专家负载分布 + aux_loss |
+
+完整映射表在 [`qwen3-pytorch/README.md`](qwen3-pytorch/README.md)。
+
+### 11.5 ★ 「不删 / 不改弱门槛」必须有可运行证据
+
+`evaluate.py` 只设**可自证的门槛**，达不到就**报错退出**（不是打一个好看的数）：
+
+| 段 | 门槛 |
+|---|---|
+| `pretrain` / `moe` | `perplexity == exp(loss)`；`n_tokens > 0`；`aux_loss` 有限；**专家负载之和 == B*T** |
+| `lora` | 胜率 ∈ [0, 1] |
+| `dpo` | **checkpoint 的 LoRA `B` 必须非零**（B 全零 ⇒ π_θ ≡ π_ref ⇒ DPO 压根没训过）；`margin_std >= 0`；准确率 ∈ [0, 1] |
+| `speedup` | **有/无 KV Cache 的 greedy 输出必须逐位相同**，不一致直接报错退出 |
+
+checkpoint 缺失 → **跳过该段并打印原因**（那是「还没跑到那一步」，不是「指标不合格」）。
+
+> **门槛不是写在注释里的摆设**：`tests/test_evaluate.py` 第 5 组把
+> `inference.generate_naive` 换成返回错误结果，断言 `eval_speedup` **必须抛 AssertionError**
+> —— 这才是「门槛没被删」的证据。
+
+### 11.6 MoE 段的两个新指标
+
+- **`aux_loss`**：负载均衡辅助损失。本实现除以 `N·K`，
+  所以**完全均衡时 = 1**（HF Mixtral 是 `K`，Switch 论文 top-1 版是 1）。
+  实测 **0.9978** —— 已经很接近均衡值 1，说明 router 没塌。
+- **专家负载分布**：实测 `[0.2439, 0.2395, 0.2437, 0.2729]`，
+  **max/min = 1.140** —— 4 个专家的负载差 14%，没有出现「一个专家吃掉全部 token」的塌缩。
+
+> 判读负载分布时要看 **max/min 比值**，不要只看单个值。
+> 单个专家占 27% 看着不多，但如果另一个专家占 0%，max/min 就是 ∞ —— 那才是塌缩。
+
+### 11.7 自测题（本节）
+
+1. 为什么 pretrain 段要同时打印两种 loss 口径？
+2. DPO 段的 `margin` 和 `win_rate` 为什么会打架（`too_short` 那一组）？
+3. `dpo` 段为什么要检查 checkpoint 里 LoRA 的 `B` 是否全零？
+4. `speedup` 段的「输出一致性」门槛，为什么不能改成「logits 逐位相同」？
+
+**答案：** ① 两种口径分别对齐 GPT-2 线和本线训练日志，缺一个就没法横向比 / 纵向对；
+② `margin` 是**相对 π_ref** 的间隔（长度偏置被抵消掉了），
+`win_rate` 是**绝对** logprob 比较（长度偏置还在）⇒ `too_short` 的 rejected 极短、
+总 logprob 天然接近 0，所以绝对胜率恒为 0，而 margin 能看出「模型确实更偏爱 chosen」；
+③ B 全零 ⇒ π_θ ≡ π_ref ⇒ margin 恒为 0、loss 恒为 log 2 ——
+那是「压根没训过」的 checkpoint，不该被评估脚本当成「训了但没效果」；
+④ naive 每次前向整条序列（T_q = P+s），cache 路径每步只前向 1 个 token（T_q = 1），
+**matmul 的规约顺序不同 ⇒ fp32 末位差异 ~1e-7**（实测 `max|diff| = 5.96e-07`）。
+正确的门槛是「**token 序列逐位相同**」（§10.5 的实测），断言 logits 逐位相等会误报。

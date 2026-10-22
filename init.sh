@@ -440,6 +440,63 @@ PY
   else
     skip "Qwen3 推理 smoke" "inference.py 尚未就绪（feat-018），或 torch 不可用"
   fi
+
+  # --- 评估 smoke（feat-025）：5 段结构 + pretrain/speedup 的「GPT-2 同名列」---
+  if [ -f "$QWEN_DIR/evaluate.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_eval.log 2>&1
+import math
+import os
+import tempfile
+
+import torch
+
+import evaluate
+from config import DENSE_CONFIG
+from data.tokenizer import BPETokenizer
+from model.qwen3_dense import Qwen3Dense
+
+# 1) 5 段齐全
+assert set(evaluate.STAGES.keys()) == {"pretrain", "moe", "lora", "dpo", "speedup"}, \
+    f"stage 集合不对：{sorted(evaluate.STAGES.keys())}"
+
+tk = BPETokenizer("data/vocab.json", "data/merges.txt")
+tmpdir = tempfile.mkdtemp(prefix="qwen3_eval_")
+ckpt = os.path.join(tmpdir, "fake_pretrain.pt")
+torch.save({"model_state": Qwen3Dense(vocab_size=tk.vocab_size, cfg=DENSE_CONFIG,
+                                      dropout=0.0).state_dict()}, ckpt)
+
+# 2) pretrain / speedup 必须保留与 GPT-2 线逐字同名的列
+GPT2_PRETRAIN = {"stage", "metric", "value", "loss", "perplexity", "n_tokens", "checkpoint"}
+GPT2_SPEEDUP = {"stage", "metric", "value", "naive_avg_ms", "kv_avg_ms", "speedup",
+                "naive_tokens", "kv_tokens", "n_runs", "max_new_tokens"}
+
+orig = evaluate.PRETRAIN_DENSE
+evaluate.PRETRAIN_DENSE = ckpt
+try:
+    r = evaluate.eval_pretrain(tk, torch.device("cpu"))
+    missing = GPT2_PRETRAIN - set(r.keys())
+    assert not missing, f"pretrain 缺少 GPT-2 同名列：{sorted(missing)}"
+    assert abs(r["perplexity"] - math.exp(min(20.0, r["loss"]))) < 1e-9, "ppl 与 loss 不自洽"
+
+    s = evaluate.eval_speedup(tk, torch.device("cpu"))
+    missing = GPT2_SPEEDUP - set(s.keys())
+    assert not missing, f"speedup 缺少 GPT-2 同名列：{sorted(missing)}"
+    assert s["consistent"] is True, "有/无 KV Cache 的输出必须一致"
+finally:
+    evaluate.PRETRAIN_DENSE = orig
+
+print(f"[eval] 5 段就绪；pretrain/speedup 的 GPT-2 同名列齐全；"
+      f"ppl={r['perplexity']:.2f} speedup={s['speedup']:.2f}x consistent={s['consistent']}")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 评估 smoke（5 段 + GPT-2 同名列）$(tail -1 /tmp/llm_init_l4_eval.log)"
+    else
+      fail "Qwen3 评估 smoke" "$(tail -3 /tmp/llm_init_l4_eval.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 评估 smoke" "evaluate.py 尚未就绪（feat-025），或 torch 不可用"
+  fi
 fi
 
 # -----------------------------------------------------------------------------

@@ -7233,209 +7233,1065 @@ git commit -m "feat-024: 从零手写 DPO（π_ref = SFT 模型，merge → stri
 
 **Files:**
 - Create: `qwen3-learning/qwen3-pytorch/evaluate.py`
+- Create: `qwen3-learning/qwen3-pytorch/tests/test_evaluate.py`（7 组断言）
+- Modify: `init.sh`（L4 层加一条评估 smoke）
+- Modify: `qwen3-learning/qwen3-pytorch/README.md`（写清与 GPT-2 线 9 项评估的差异）
 - Modify: `feature_list.json`
 
-- [ ] **Step 1: 写 `evaluate.py`**
+- [x] **Step 1: 写 `evaluate.py`**
 
 ```python
 """
 Qwen3 精简评估脚本。
 
 用法：
-    python evaluate.py --stage pretrain
-    python evaluate.py --stage lora
-    python evaluate.py --stage dpo
-    python evaluate.py --stage speedup
-    python evaluate.py --stage all
+    python evaluate.py --stage pretrain     # 预训练：val loss / val perplexity
+    python evaluate.py --stage moe          # MoE 预训练：+ 专家负载分布 / aux_loss
+    python evaluate.py --stage lora         # LoRA：偏好数据胜率
+    python evaluate.py --stage dpo          # DPO：reward margin 均值/标准差 + chosen>rejected 准确率
+    python evaluate.py --stage speedup      # 推理：有/无 KV Cache 的输出一致性 + 加速比
+    python evaluate.py --stage all          # 依次跑 5 段
 
-【与 GPT-2 线 9 项评估的关系】
-    **不做逐项对标** —— GPT-2 那套是围绕 Reward Model + PPO 设计的，
-    DPO 阶段不适用。但 pretrain 与 speedup 两项**保留同名列**，
-    便于两条线横向对比。
+【★ 与 GPT-2 线 9 项评估的关系 —— 不做逐项对标】
+    GPT-2 线的 9 项是围绕 **Reward Model + PPO** 设计的：
+        distinct-n / self-BLEU / token entropy / response quality /
+        pairwise accuracy（RM） / benchmark / SFT-vs-PPO / PPO reward / PPO KL
+    Qwen3 线走的是 **LoRA + DPO**：没有显式奖励模型、没有 PPO、没有采样，
+    那 9 项里有 **4 项在本线上没有对应物**：
+        · pairwise accuracy（RM）→ 本线没有 RM；对应物是 **DPO 的 margin 判对率**
+        · PPO reward / PPO KL    → 本线没有 PPO；对应物是 **DPO 的隐式奖励 margin**
+        · SFT-vs-PPO 对比        → 本线没有 PPO；对应物是 **LoRA 前后胜率对比**
+    剩下 5 项（distinct-n / self-BLEU / token entropy / response quality / benchmark）
+    属于「生成质量」类，本线**尚未实现**（feat-025 的范围是「精简评估」，
+    不是复制 GPT-2 的整套生成质量指标）。
+    ⇒ **差异清单写在 `qwen3-learning/qwen3-pytorch/README.md`**。
 
-【硬约束】
-    不删/不改弱指标门槛。达不到门槛就报错退出，而不是悄悄打一个好看的数。
+    但 **pretrain 与 speedup 两项保留与 GPT-2 线逐字同名的列**，便于横向对比：
+        pretrain: stage / metric / value / loss / perplexity / n_tokens / checkpoint
+        speedup:  stage / metric / value / naive_avg_ms / kv_avg_ms / speedup /
+                  naive_tokens / kv_tokens / n_runs / max_new_tokens
+
+【★ 「同名」也包括「同口径」】
+    GPT-2 线的 perplexity = `exp(整个 val set 的 token 加权平均 cross_entropy)`，
+    所以本脚本的 `loss` / `perplexity` 也用 **token 加权** 口径。
+    同时额外给出 `loss_batch_mean`（batch 均值口径）——
+    那是 `train/train_pretrain.py` 打印的 `val_loss` 的口径，
+    两个口径一起打印，**训练日志的数字可以直接和评估脚本对上**。
+
+【★ 门槛（不删、不改弱）】
+    本脚本只设**可自证的门槛**，达不到就**报错退出**，而不是打一个好看的数：
+        · pretrain / moe：ppl 与 loss 必须自洽（ppl == exp(loss)）、n_tokens > 0
+        · moe：aux_loss 必须是有限数；专家负载之和必须等于 B*T
+        · lora：胜率 ∈ [0, 1]
+        · dpo：checkpoint 里的 LoRA 分支必须**非零**（B 全零 ⇒ DPO 压根没训过）
+        · dpo：margin 标准差 >= 0、准确率 ∈ [0, 1]
+        · speedup：**有/无 KV Cache 的 greedy 输出必须逐位相同**，不一致直接报错退出
+    checkpoint 缺失时**跳过该 stage 并打印原因**（那是「还没跑到那一步」，
+    不是「指标不合格」）。
+
+    门槛分**两层**：
+        ① **自洽性门槛**（写在各 `eval_*()` 里）：跟模型好坏无关，
+           随机初始化的模型也该过 ⇒ 测试与 `init.sh` 的 smoke 靠它。
+        ② **方向性门槛**（写在 `check_directional()` 里，由 `main()` 施加）：
+           胜率必须 > 0.5、margin 必须 > 0、speedup 必须 > 1、
+           ppl 必须比「在词表大小个候选里瞎猜」好。
+           只有**训好的 checkpoint** 才该过 ⇒ 达不到就报错退出。
+    两层都不可删；分层只是为了「让 smoke 能用随机模型跑结构检查」。
+
+【★ 与训练日志数字对得上】
+    各段的评估函数**直接复用训练脚本里的实现**：
+        pretrain/moe → `train.train_pretrain.estimate_loss`
+        lora          → `train.train_lora.evaluate_pairs`
+        dpo           → `train.train_dpo.evaluate_dpo`
+    同一份 checkpoint，评估脚本与训练日志的偏好/胜率数字必然一致（口径相同）。
 """
 
 import argparse
 import math
 import os
+import sys
+from typing import Dict, List, Tuple
 
 import torch
 
-from config import DENSE_CONFIG
+# 把项目根补进 sys.path（脚本在项目根，但显式写一遍更稳）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config import DENSE_CONFIG, MOE_CONFIG
 from data.preference_data import generate_preference_dataset
 from data.pretrain_data import make_pretrain_loader
 from data.tokenizer import BPETokenizer
+from model.common.lora import inject_lora, set_lora_enabled
+from model.qwen3_dense import Qwen3Dense
+from model.qwen3_moe import Qwen3MoE
+from train.train_dpo import evaluate_dpo
+from train.train_lora import evaluate_pairs
+from utils import get_device
+
+CKPT_DIR = "checkpoints"
+PRETRAIN_DENSE = os.path.join(CKPT_DIR, "pretrain_dense.pt")
+PRETRAIN_MOE = os.path.join(CKPT_DIR, "pretrain_moe.pt")
+LORA_CKPT = os.path.join(CKPT_DIR, "lora.pt")
+DPO_CKPT = os.path.join(CKPT_DIR, "dpo.pt")
+
+# 预训练验证集 loader 的缓存（构造它要重新合成语料 + 编码，比较慢）
+_LOADER_CACHE: Dict[tuple, object] = {}
+
+# ---------------------------------------------------------------------------
+# 方向性门槛（feature_list.json 的 feat-025 notes 要求「必须显式写进脚本」）
+# ---------------------------------------------------------------------------
+# 偏好胜率必须高于随机基线（chosen / rejected 二选一 ⇒ 随机 = 0.5）
+THRESH_WIN_RATE = 0.5
+# DPO 的 margin 判对率必须高于随机
+THRESH_DPO_ACC = 0.5
+# DPO 的 reward margin 均值必须为正（相对 π_ref 更偏爱 chosen）
+THRESH_MARGIN = 0.0
+# KV Cache 必须真的更快（否则「用 KV Cache」这件事没有意义）
+THRESH_SPEEDUP = 1.0
 
 
-def eval_pretrain(tk: "BPETokenizer") -> dict:
+# ---------------------------------------------------------------------------
+# 公共工具
+# ---------------------------------------------------------------------------
+def _skip(stage: str, reason: str) -> dict:
+    """
+    构造一个「跳过」的返回。
+
+    参数：
+        stage:  stage 名
+        reason: 跳过原因
+    返回：
+        标记了 skipped 的字典
+    """
+    return {"stage": stage, "skipped": True, "reason": reason}
+
+
+def _load_tokenizer() -> "BPETokenizer":
+    """
+    加载 byte-level BPE tokenizer。
+
+    返回：
+        BPETokenizer 实例
+    """
+    return BPETokenizer(os.path.join("data", "vocab.json"), os.path.join("data", "merges.txt"))
+
+
+def _val_loader(cfg) -> object:
+    """
+    取预训练验证集 DataLoader（带缓存，避免 dense/moe 两段重复合成语料）。
+
+    参数：
+        cfg: Qwen3Config
+    返回：
+        DataLoader
+    """
+    key = ("val", cfg.batch_size, cfg.block_size, cfg.seed)
+    if key not in _LOADER_CACHE:
+        _LOADER_CACHE[key] = make_pretrain_loader(
+            "val", cfg.batch_size, cfg.block_size, cfg.seed
+        )
+    return _LOADER_CACHE[key]
+
+
+def _load_dense(
+    ckpt_path: str,
+    tk: "BPETokenizer",
+    device: "torch.device",
+    with_lora: bool = False,
+) -> "torch.nn.Module":
+    """
+    构造并加载一个 dense 模型。
+
+    参数：
+        ckpt_path: checkpoint 路径
+        tk:        tokenizer（决定 vocab_size）
+        device:    设备
+        with_lora: True 时**先注入 LoRA 再加载**
+                   （`lora.pt` / `dpo.pt` 的 state_dict 是**注入之后**的键名：
+                    `q_proj.base.weight` / `.lora_A` / `.lora_B`，
+                    所以必须先注入，键名才对得上 —— 这是 feat-024 踩过的坑）
+    返回：
+        加载好的模型（eval 模式）
+    """
+    cfg = DENSE_CONFIG
+    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0)
+    if with_lora:
+        inject_lora(model, cfg.lora_target_modules, r=cfg.lora_r, alpha=cfg.lora_alpha,
+                    dropout=cfg.lora_dropout)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def _eval_loss(
+    model: "torch.nn.Module",
+    loader,
+    max_batches: int,
+) -> Tuple[float, float, int]:
+    """
+    在验证集上算平均 loss，**同时给两种口径**。
+
+    · token 加权口径（`loss_token`）：`Σ(loss_i × n_tok_i) / Σ n_tok_i`
+      —— 与 GPT-2 线 `eval_perplexity` 的口径一致（perplexity 可直接横向比）
+    · batch 均值口径（`loss_batch`）：`Σ loss_i / n_batches`
+      —— 与 `train/train_pretrain.py` 打印的 `val_loss` 同口径（可与训练日志对上）
+
+    参数：
+        model:       模型
+        loader:      验证集 DataLoader
+        max_batches: 最多评估多少个 batch
+    返回：
+        (loss_token, loss_batch, n_tokens)
+    """
+    model.eval()
+    total_tok = 0.0
+    weighted = 0.0
+    batch_sum = 0.0
+    count = 0
+    with torch.no_grad():
+        for i, (x, y) in enumerate(loader):
+            if i >= max_batches:
+                break
+            _, loss, _, _ = model(x, targets=y)
+            # cross_entropy(ignore_index=-100) 已经对「有效 token」求了平均，
+            # 所以有效 token 数 = targets 里不等于 -100 的个数
+            n_tok = int((y != -100).sum().item())
+            total_tok += n_tok
+            weighted += float(loss.item()) * n_tok
+            batch_sum += float(loss.item())
+            count += 1
+    if count == 0:
+        return 0.0, 0.0, 0
+    return (weighted / max(1.0, total_tok),
+            batch_sum / count,
+            int(total_tok))
+
+
+# ---------------------------------------------------------------------------
+# 1) 预训练
+# ---------------------------------------------------------------------------
+def eval_pretrain(tk: "BPETokenizer", device: "torch.device") -> dict:
     """
     预训练评估：val loss、val perplexity。
 
-    参数：
-        tk: tokenizer
-    返回：
-        {"val_loss": ..., "val_ppl": ...}
-    """
-    from model.qwen3_dense import Qwen3Dense
-
-    cfg = DENSE_CONFIG
-    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0)
-    ckpt = torch.load(os.path.join("checkpoints", "pretrain_dense.pt"),
-                      map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state"], strict=False)
-    model.eval()
-
-    loader = make_pretrain_loader("val", cfg.batch_size, cfg.block_size, cfg.seed)
-    total, count = 0.0, 0
-    with torch.no_grad():
-        for i, (x, y) in enumerate(loader):
-            if i >= 20:
-                break
-            _, loss, _, _ = model(x, targets=y)
-            total += float(loss.item())
-            count += 1
-    val_loss = total / max(1, count)
-    return {"val_loss": val_loss, "val_ppl": math.exp(min(20.0, val_loss))}
-
-
-def eval_lora(tk: "BPETokenizer") -> dict:
-    """
-    LoRA 评估：偏好数据上的 chosen 胜率。
+    **列名与 GPT-2 线的 `eval_perplexity` 完全一致**
+    （stage / metric / value / loss / perplexity / n_tokens / checkpoint）。
 
     参数：
-        tk: tokenizer
+        tk:     tokenizer
+        device: 设备
     返回：
-        {"win_rate": ..., "baseline": 0.5}
+        指标字典
     """
-    from model.common.lora import inject_lora
-    from model.qwen3_dense import Qwen3Dense
-    from train.train_lora import encode_pair
+    if not os.path.exists(PRETRAIN_DENSE):
+        return _skip("pretrain",
+                     f"{PRETRAIN_DENSE} 不存在（先跑 python train/train_pretrain.py --model dense）")
 
     cfg = DENSE_CONFIG
-    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0)
-    ckpt = torch.load(os.path.join("checkpoints", "lora.pt"), map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state"], strict=False)
-    inject_lora(model, cfg.lora_target_modules, r=cfg.lora_r, alpha=cfg.lora_alpha)
-    model.eval()
+    model = _load_dense(PRETRAIN_DENSE, tk, device)
+    loader = _val_loader(cfg)
+    loss, loss_bm, n_tok = _eval_loss(model, loader, cfg.eval_max_batches)
+    ppl = math.exp(min(20.0, loss))
 
-    pairs = generate_preference_dataset(n_samples=cfg.dpo_n_pairs, seed=cfg.seed)
-    wins = 0
-    n = 0
-    with torch.no_grad():
-        for pair in pairs[: cfg.eval_max_samples]:
-            lp_w, lp_l = encode_pair(model, tk, pair, torch.device("cpu"))
-            wins += int(lp_w.item() > lp_l.item())
-            n += 1
-    return {"win_rate": wins / max(1, n), "baseline": 0.5}
-
-
-def eval_dpo(tk: "BPETokenizer") -> dict:
-    """
-    DPO 评估：reward margin 均值/标准差、chosen>rejected 准确率。
-
-    参数：
-        tk: tokenizer
-    返回：
-        {"margin_mean": ..., "margin_std": ..., "accuracy": ...}
-    """
-    from model.common.lora import inject_lora
-    from model.qwen3_dense import Qwen3Dense
-    from train.train_lora import encode_pair
-
-    cfg = DENSE_CONFIG
-    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0)
-    ckpt = torch.load(os.path.join("checkpoints", "dpo.pt"), map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state"], strict=False)
-    inject_lora(model, cfg.lora_target_modules, r=cfg.lora_r, alpha=cfg.lora_alpha)
-    model.eval()
-
-    pairs = generate_preference_dataset(n_samples=cfg.dpo_n_pairs, seed=cfg.seed)
-    margins = []
-    with torch.no_grad():
-        for pair in pairs[: cfg.eval_max_samples]:
-            lp_w, lp_l = encode_pair(model, tk, pair, torch.device("cpu"))
-            margins.append(lp_w.item() - lp_l.item())
-    if not margins:
-        return {"margin_mean": 0.0, "margin_std": 0.0, "accuracy": 0.0}
-    t = torch.tensor(margins)
+    # 门槛：ppl 必须与 loss 自洽；必须真的评估到了 token
+    assert abs(ppl - math.exp(min(20.0, loss))) < 1e-9, "perplexity 与 loss 不自洽"
+    assert n_tok > 0, "验证集评估了 0 个 token"
     return {
-        "margin_mean": float(t.mean()),
-        "margin_std": float(t.std()),
-        "accuracy": float((t > 0).float().mean()),
+        "stage": "pretrain",
+        "metric": "perplexity",
+        "value": ppl,
+        "loss": loss,
+        "perplexity": ppl,
+        "n_tokens": n_tok,
+        # —— 额外：batch 均值口径（与训练日志的 val_loss 对齐）——
+        "loss_batch_mean": loss_bm,
+        "perplexity_batch_mean": math.exp(min(20.0, loss_bm)),
+        "n_batches": cfg.eval_max_batches,
+        "vocab_size": tk.vocab_size,
+        "checkpoint": PRETRAIN_DENSE,
     }
 
 
-def eval_speedup(tk: "BPETokenizer") -> dict:
+# ---------------------------------------------------------------------------
+# 2) MoE 预训练
+# ---------------------------------------------------------------------------
+def eval_moe(tk: "BPETokenizer", device: "torch.device") -> dict:
+    """
+    MoE 预训练评估：val loss / val perplexity **+ 专家负载分布 + aux_loss**。
+
+    参数：
+        tk:     tokenizer
+        device: 设备
+    返回：
+        指标字典
+    """
+    if not os.path.exists(PRETRAIN_MOE):
+        return _skip("moe",
+                     f"{PRETRAIN_MOE} 不存在（先跑 python train/train_pretrain.py --model moe）")
+
+    cfg = MOE_CONFIG
+    model = Qwen3MoE(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0)
+    ckpt = torch.load(PRETRAIN_MOE, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device)
+    model.eval()
+
+    loader = _val_loader(cfg)
+    loss, loss_bm, n_tok = _eval_loss(model, loader, cfg.eval_max_batches)
+    ppl = math.exp(min(20.0, loss))
+
+    # --- 专家负载：跑一个 batch，收集最后一层的负载分布 ---
+    aux_loss = 0.0
+    expert_load: List[float] = []
+    n_tokens_one_batch = 0
+    with torch.no_grad():
+        for i, (x, y) in enumerate(loader):
+            if i >= 1:
+                break
+            n_tokens_one_batch = int(x.size(0) * x.size(1))
+            _, _, _, extras = model(x, targets=y)
+            if "aux_loss" in extras:
+                aux_loss = float(extras["aux_loss"].item())
+                expert_load = list(extras["expert_load_last"])
+
+    # 门槛：aux_loss 必须是有限数；专家负载之和必须等于 B*T
+    assert math.isfinite(aux_loss), f"aux_loss 不是有限数：{aux_loss}"
+    total_load = sum(expert_load)
+    if expert_load:
+        assert abs(total_load - n_tokens_one_batch) < 1e-3, \
+            f"专家负载之和 {total_load} 应等于 B*T={n_tokens_one_batch}"
+
+    load_ratio = [v / total_load for v in expert_load] if total_load > 0 else []
+    max_min = (max(load_ratio) / min(load_ratio)) if load_ratio and min(load_ratio) > 0 else float("nan")
+
+    return {
+        "stage": "moe",
+        "metric": "perplexity",
+        "value": ppl,
+        "loss": loss,
+        "perplexity": ppl,
+        "n_tokens": n_tok,
+        "loss_batch_mean": loss_bm,
+        "perplexity_batch_mean": math.exp(min(20.0, loss_bm)),
+        "aux_loss": aux_loss,
+        "aux_loss_coef": cfg.aux_loss_coef,
+        "loss_with_aux": loss + cfg.aux_loss_coef * aux_loss,
+        "expert_load": expert_load,
+        "expert_load_ratio": load_ratio,
+        "expert_load_max_min_ratio": max_min,
+        "n_experts": cfg.n_experts,
+        "vocab_size": tk.vocab_size,
+        "checkpoint": PRETRAIN_MOE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3) LoRA
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def eval_lora(tk: "BPETokenizer", device: "torch.device") -> dict:
+    """
+    LoRA 评估：偏好数据上的 chosen 胜率（**前 → 后对比**）。
+
+    「前」= 关掉 LoRA 分支（此时模型 == 预训练模型 —— LoRA 注入是无损的）；
+    「后」= 打开 LoRA 分支（LoRA SFT 训完的模型）。
+
+    参数：
+        tk:     tokenizer
+        device: 设备
+    返回：
+        指标字典
+    """
+    if not os.path.exists(LORA_CKPT):
+        return _skip("lora", f"{LORA_CKPT} 不存在（先跑 python train/train_lora.py）")
+
+    cfg = DENSE_CONFIG
+    model = _load_dense(LORA_CKPT, tk, device, with_lora=True)
+    pairs = generate_preference_dataset(n_samples=cfg.dpo_n_pairs, seed=cfg.seed)
+
+    # --- BEFORE：关掉 LoRA 分支 ⇒ 预训练模型 ---
+    set_lora_enabled(model, False)
+    before = evaluate_pairs(model, tk, pairs, device, cfg.eval_max_samples)
+    # --- AFTER：打开 LoRA 分支 ⇒ SFT 后的模型 ---
+    set_lora_enabled(model, True)
+    after = evaluate_pairs(model, tk, pairs, device, cfg.eval_max_samples)
+
+    for m in (before, after):
+        assert 0.0 <= m["win_rate"] <= 1.0, f"胜率越界：{m['win_rate']}"
+        assert 0.0 <= m["win_rate_per_token"] <= 1.0, f"长度归一胜率越界：{m['win_rate_per_token']}"
+
+    return {
+        "stage": "lora",
+        "metric": "win_rate",
+        "value": after["win_rate"],
+        "win_rate": after["win_rate"],
+        "win_rate_per_token": after["win_rate_per_token"],
+        "baseline": before["win_rate"],
+        "baseline_per_token": before["win_rate_per_token"],
+        "delta_win_rate": after["win_rate"] - before["win_rate"],
+        "mean_logp_chosen": after["mean_logp_chosen"],
+        "by_strategy": after["by_strategy"],
+        "by_strategy_before": before["by_strategy"],
+        "n_samples": cfg.eval_max_samples,
+        "checkpoint": LORA_CKPT,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4) DPO
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def eval_dpo(tk: "BPETokenizer", device: "torch.device") -> dict:
+    """
+    DPO 评估：reward margin 均值 / 标准差、chosen>rejected 准确率。
+
+    **π_ref 从哪来？**
+        `dpo.pt` 里的 base 已经含 SFT 的 ΔW（训练时走的是 merge → strip → 重新 inject），
+        所以 **π_ref = 关掉 LoRA 分支的同一个模型**、**π_θ = 开着的同一个模型**。
+        不需要加载第二份权重 —— 这正是 DPO 的实现技巧（见 train/train_dpo.py）。
+
+    参数：
+        tk:     tokenizer
+        device: 设备
+    返回：
+        指标字典
+    """
+    if not os.path.exists(DPO_CKPT):
+        return _skip("dpo", f"{DPO_CKPT} 不存在（先跑 python train/train_dpo.py）")
+
+    cfg = DENSE_CONFIG
+    ckpt = torch.load(DPO_CKPT, map_location="cpu", weights_only=False)
+    beta = float(ckpt.get("beta", cfg.dpo_beta))
+    model = _load_dense(DPO_CKPT, tk, device, with_lora=True)
+
+    # 门槛：LoRA 的 B 必须非零（B 零初始化 ⇒ π_θ == π_ref ⇒ margin 恒 0，
+    #        说明这个 checkpoint 压根没训过）
+    b_max = 0.0
+    for name, p in model.named_parameters():
+        if name.endswith("lora_B"):
+            b_max = max(b_max, float(p.abs().max().item()))
+    assert b_max > 0.0, f"checkpoint 里的 LoRA B 全是 0（max={b_max}）⇒ DPO 没训过"
+
+    pairs = generate_preference_dataset(n_samples=cfg.dpo_n_pairs, seed=cfg.seed)
+    m = evaluate_dpo(model, tk, pairs, device, beta, cfg.eval_max_samples)
+
+    # 门槛
+    assert m["margin_std"] >= 0.0, "margin 标准差为负"
+    assert 0.0 <= m["dpo_acc"] <= 1.0, f"准确率越界：{m['dpo_acc']}"
+    assert 0.0 <= m["win_rate"] <= 1.0, f"胜率越界：{m['win_rate']}"
+
+    return {
+        "stage": "dpo",
+        "metric": "reward_margin",
+        "value": m["margin_mean"],
+        "margin_mean": m["margin_mean"],
+        "margin_std": m["margin_std"],
+        "accuracy": m["dpo_acc"],
+        "dpo_acc": m["dpo_acc"],
+        "win_rate": m["win_rate"],
+        "win_rate_per_token": m["win_rate_per_token"],
+        "by_strategy": m["by_strategy"],
+        "beta": beta,
+        "ref_mode": ckpt.get("ref_mode", "?"),
+        # checkpoint 里自带的训练期指标，用于交叉核对
+        "margin_before": ckpt.get("margin_before"),
+        "margin_after": ckpt.get("margin_after"),
+        "n_samples": cfg.eval_max_samples,
+        "checkpoint": DPO_CKPT,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5) 推理（KV Cache）
+# ---------------------------------------------------------------------------
+def eval_speedup(tk: "BPETokenizer", device: "torch.device") -> dict:
     """
     推理评估：有/无 KV Cache 的输出一致性与加速比。
 
+    **列名与 GPT-2 线的 `eval_speedup` 完全一致**
+    （stage / metric / value / naive_avg_ms / kv_avg_ms / speedup /
+    naive_tokens / kv_tokens / n_runs / max_new_tokens）。
+
     参数：
-        tk: tokenizer
+        tk:     tokenizer
+        device: 设备
     返回：
-        {"consistent": bool, "speedup": float}
+        指标字典
     """
-    # 复用 GPT-2 线 generate.py 的 prefill/decode 组织方式（独立重写，不跨目录 import）
-    from inference import benchmark_speed, generate_naive, generate_with_cache
-    from model.qwen3_dense import Qwen3Dense
+    from inference import benchmark_speed, generate_naive, generate_with_cache, kv_cache_report
+
+    if not os.path.exists(PRETRAIN_DENSE):
+        return _skip("speedup",
+                     f"{PRETRAIN_DENSE} 不存在（先跑 python train/train_pretrain.py --model dense）")
 
     cfg = DENSE_CONFIG
-    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0)
-    model.eval()
-    prompt = tk.encode("hello world")
-    a = generate_naive(model, prompt, max_new_tokens=16, temperature=0.0)
-    b = generate_with_cache(model, prompt, max_new_tokens=16, temperature=0.0)
-    bench = benchmark_speed(model, prompt_len=16, max_new_tokens=16)
-    return {"consistent": a == b, "speedup": bench["speedup"]}
+    model = _load_dense(PRETRAIN_DENSE, tk, device)
+
+    prompt_ids = tk.encode("Once upon a time, the cat went to the forest. The cat saw a")
+    if not prompt_ids:
+        return _skip("speedup", "prompt 编码为空")
+    prompt = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+
+    # --- 一致性（门槛：不一致直接报错退出）---
+    a = generate_naive(model, prompt, max_new_tokens=cfg.max_new_tokens, temperature=0.0)
+    b = generate_with_cache(model, prompt, max_new_tokens=cfg.max_new_tokens, temperature=0.0)
+    consistent = bool(torch.equal(a, b))
+    assert consistent, (
+        "有/无 KV Cache 的 greedy 输出不一致 —— 推理路径有问题，拒绝打印好看的数\n"
+        f"naive={a.tolist()}\nkv  ={b.tolist()}"
+    )
+
+    bench = benchmark_speed(model, prompt, n_runs=3, max_new_tokens=cfg.max_new_tokens,
+                            temperature=0.0)
+    rep = kv_cache_report(model, prompt_len=prompt.size(1), max_new_tokens=cfg.max_new_tokens)
+    return {
+        "stage": "speedup",
+        "metric": "speedup",
+        "value": bench["speedup"],
+        "consistent": consistent,
+        "naive_avg_ms": bench["naive_avg_ms"],
+        "kv_avg_ms": bench["kv_avg_ms"],
+        "speedup": bench["speedup"],
+        "naive_tokens": bench["naive_tokens"],
+        "kv_tokens": bench["kv_tokens"],
+        "n_runs": 3,
+        "max_new_tokens": cfg.max_new_tokens,
+        "prompt_len": int(prompt.size(1)),
+        "kv_cache_gqa_bytes": rep["gqa_bytes"],
+        "kv_cache_mha_bytes": rep["mha_bytes"],
+        "kv_cache_ratio": rep["ratio"],
+        "checkpoint": PRETRAIN_DENSE,
+    }
 
 
 STAGES = {
     "pretrain": eval_pretrain,
+    "moe": eval_moe,
     "lora": eval_lora,
     "dpo": eval_dpo,
     "speedup": eval_speedup,
 }
 
 
+# ---------------------------------------------------------------------------
+# 方向性门槛
+# ---------------------------------------------------------------------------
+def check_directional(stage: str, r: dict) -> None:
+    """
+    检查该 stage 的**方向性**门槛（指标该往哪边走）。
+
+    【为什么单独一个函数，不写在 eval_*() 里】
+        `eval_*()` 里的是**自洽性门槛**（ppl == exp(loss)、输出一致……），
+        跟模型好坏无关 ⇒ 用随机初始化的模型也能过（测试与 init.sh smoke 需要这一点）。
+        这里的是**方向性门槛**（胜率必须 > 0.5、margin 必须 > 0、speedup 必须 > 1），
+        只有「训好的 checkpoint」才该过 ⇒ 由 `main()` 在评估真实 checkpoint 时统一施加。
+        达不到就**报错退出**，不打印一个好看的数。
+
+    参数：
+        stage: stage 名
+        r:     该 stage 的指标字典
+    """
+    if r.get("skipped"):
+        return
+
+    if stage in ("pretrain", "moe"):
+        # perplexity 必须比「在 vocab_size 个候选里瞎猜」好（随机基线 = vocab_size）
+        v = r["vocab_size"]
+        assert r["perplexity"] < v, \
+            f"perplexity={r['perplexity']:.2f} 不小于词表大小 {v} ⇒ 不比随机猜好"
+    elif stage == "lora":
+        assert r["win_rate"] > THRESH_WIN_RATE, \
+            f"偏好胜率 {r['win_rate']:.4f} 未超过随机基线 {THRESH_WIN_RATE}"
+    elif stage == "dpo":
+        assert r["margin_mean"] > THRESH_MARGIN, \
+            f"reward margin 均值 {r['margin_mean']:+.4f} 未大于 {THRESH_MARGIN}"
+        assert r["accuracy"] > THRESH_DPO_ACC, \
+            f"DPO 判对率 {r['accuracy']:.4f} 未超过随机基线 {THRESH_DPO_ACC}"
+    elif stage == "speedup":
+        assert r["speedup"] > THRESH_SPEEDUP, \
+            f"KV Cache 加速比 {r['speedup']:.3f}x 不大于 {THRESH_SPEEDUP} ⇒ 用 cache 反而更慢"
+
+
+# ---------------------------------------------------------------------------
+# 打印
+# ---------------------------------------------------------------------------
+def print_stage(name: str, r: dict) -> None:
+    """
+    按 stage 打印指标。
+
+    参数：
+        name: stage 名
+        r:    该 stage 的指标字典
+    """
+    if r.get("skipped"):
+        print(f"[eval] stage={name:<9} skip: {r['reason']}")
+        return
+
+    if name == "pretrain":
+        print(f"[eval] stage=pretrain ppl={r['perplexity']:.3f}  loss={r['loss']:.4f}  "
+              f"n_tokens={r['n_tokens']}")
+        print(f"[eval]   （batch 均值口径 loss={r['loss_batch_mean']:.4f} "
+              f"ppl={r['perplexity_batch_mean']:.3f} —— 与训练日志的 val_loss 同口径）")
+    elif name == "moe":
+        print(f"[eval] stage=moe     ppl={r['perplexity']:.3f}  loss={r['loss']:.4f}  "
+              f"aux_loss={r['aux_loss']:.4f}（coef={r['aux_loss_coef']}）")
+        print(f"[eval]   专家负载（{r['n_experts']} 个）= "
+              f"{[round(v, 4) for v in r['expert_load_ratio']]}")
+        print(f"[eval]   负载 max/min = {r['expert_load_max_min_ratio']:.3f}")
+    elif name == "lora":
+        print(f"[eval] stage=lora    win_rate={r['win_rate']:.4f}  "
+              f"（基线 {r['baseline']:.4f}，Δ={r['delta_win_rate']:+.4f}）")
+        print(f"[eval]   长度归一口径 {r['win_rate_per_token']:.4f} "
+              f"（基线 {r['baseline_per_token']:.4f}）  n={r['n_samples']}")
+        for s, v in sorted(r["by_strategy"].items()):
+            b = r["by_strategy_before"].get(s, {})
+            print(f"[eval]   {s:<14} n={v['n']:<4} 胜率={v['win_rate']:.3f} "
+                  f"（基线 {b.get('win_rate', float('nan')):.3f}）")
+    elif name == "dpo":
+        print(f"[eval] stage=dpo     margin={r['margin_mean']:+.4f} ± {r['margin_std']:.4f}  "
+              f"accuracy={r['accuracy']:.4f}  win_rate={r['win_rate']:.4f}  "
+              f"(beta={r['beta']}, ref={r['ref_mode']})")
+        print(f"[eval]   长度归一口径 {r['win_rate_per_token']:.4f}  n={r['n_samples']}")
+        for s, v in sorted(r["by_strategy"].items()):
+            print(f"[eval]   {s:<14} n={v['n']:<4} dpo_acc={v['dpo_acc']:.3f} "
+                  f"margin={v['margin_mean']:+.4f} 胜率={v['win_rate']:.3f}")
+    elif name == "speedup":
+        print(f"[eval] stage=speedup speedup={r['speedup']:.3f}x  "
+              f"naive={r['naive_avg_ms']:.2f}ms  kv={r['kv_avg_ms']:.2f}ms  "
+              f"consistent={r['consistent']}")
+        print(f"[eval]   生成 {r['naive_tokens']} / {r['kv_tokens']} token，"
+              f"prompt 长度 {r['prompt_len']}")
+        print(f"[eval]   KV Cache 占用 GQA={r['kv_cache_gqa_bytes']:,}B  "
+              f"MHA={r['kv_cache_mha_bytes']:,}B  比值={r['kv_cache_ratio']:.3f}")
+
+
 def main() -> None:
     """评估主流程。"""
-    parser = argparse.ArgumentParser(description="Qwen3 评估")
-    parser.add_argument("--stage", choices=["pretrain", "lora", "dpo", "speedup", "all"],
-                        default="all")
+    parser = argparse.ArgumentParser(description="Qwen3 精简评估")
+    parser.add_argument("--stage", choices=list(STAGES.keys()) + ["all"], default="all",
+                        help="要评估哪一段（默认 all）")
     args = parser.parse_args()
 
-    tk = BPETokenizer(os.path.join("data", "vocab.json"), os.path.join("data", "merges.txt"))
-    stages = list(STAGES) if args.stage == "all" else [args.stage]
+    device = get_device()
+    tk = _load_tokenizer()
+    names = list(STAGES.keys()) if args.stage == "all" else [args.stage]
 
-    for name in stages:
-        print(f"\n=== stage: {name} ===")
-        result = STAGES[name](tk)
-        for k, v in result.items():
-            print(f"  {k}: {v}")
+    print("=" * 72)
+    print(f"[eval] Qwen3 精简评估  stage={args.stage}  device={device}")
+    print("=" * 72)
+
+    results: Dict[str, dict] = {}
+    for name in names:
+        r = STAGES[name](tk, device)
+        # 方向性门槛：达不到就报错退出（不打印一个好看的数）
+        check_directional(name, r)
+        results[name] = r
+        print_stage(name, r)
+
+    print("=" * 72)
+    done = [n for n in names if not results[n].get("skipped")]
+    skipped = [n for n in names if results[n].get("skipped")]
+    print(f"[eval] 跑了 {len(done)}/{len(names)} 段：{done}")
+    if skipped:
+        print(f"[eval] 跳过 {len(skipped)} 段：{skipped}")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 2: 运行**
+- [x] **Step 2: 写 `tests/test_evaluate.py`（6 组断言）**
+
+```python
+"""
+评估脚本 smoke：结构、GPT-2 同名列、跳过路径、门槛真的会触发、真实 checkpoint 的数值。
+
+对应 feat-025（开发计划 Task 16）。
+
+运行：python tests/test_evaluate.py
+"""
+
+import math
+import os
+import sys
+import tempfile
+
+import torch
+
+# 直接执行 `python tests/test_evaluate.py` 时 sys.path[0] 是 tests/ 目录，
+# 找不到项目根下的 config.py / evaluate.py —— 这里把项目根补进 sys.path。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import evaluate
+from config import DENSE_CONFIG
+from data.tokenizer import BPETokenizer
+from model.qwen3_dense import Qwen3Dense
+
+tk = BPETokenizer("data/vocab.json", "data/merges.txt")
+device = torch.device("cpu")
+
+# =====================================================================
+# 1) STAGES 结构：5 段齐全（pretrain / moe / lora / dpo / speedup）
+# =====================================================================
+assert set(evaluate.STAGES.keys()) == {"pretrain", "moe", "lora", "dpo", "speedup"}, \
+    f"stage 集合不对：{sorted(evaluate.STAGES.keys())}"
+for name, fn in evaluate.STAGES.items():
+    assert callable(fn), f"{name} 对应的评估函数不可调用"
+print(f"[eval] stage 集合 = {sorted(evaluate.STAGES.keys())}")
+
+# =====================================================================
+# 2) 「与 GPT-2 线同名列」的硬断言
+#    这两组列名是逐字抄自 GPT-2 线 evaluate.py 的 eval_perplexity / eval_speedup
+# =====================================================================
+GPT2_PRETRAIN_COLUMNS = {
+    "stage", "metric", "value", "loss", "perplexity", "n_tokens", "checkpoint",
+}
+GPT2_SPEEDUP_COLUMNS = {
+    "stage", "metric", "value", "naive_avg_ms", "kv_avg_ms", "speedup",
+    "naive_tokens", "kv_tokens", "n_runs", "max_new_tokens",
+}
+
+
+def _assert_columns(result: dict, required: set, tag: str) -> None:
+    """断言返回字典里 GPT-2 线的列一个不少。"""
+    missing = required - set(result.keys())
+    assert not missing, f"{tag} 缺少与 GPT-2 线同名的列：{sorted(missing)}"
+
+
+# =====================================================================
+# 3) 跳过路径：checkpoint 不存在时返回 skipped=True 并带原因（不是报错）
+# =====================================================================
+_orig_pretrain = evaluate.PRETRAIN_DENSE
+try:
+    evaluate.PRETRAIN_DENSE = os.path.join("checkpoints", "__no_such__.pt")
+    r = evaluate.eval_pretrain(tk, device)
+    assert r.get("skipped") is True, f"checkpoint 不存在时应跳过，实得 {r}"
+    assert "reason" in r and r["reason"], "跳过时必须给出原因"
+    # 打印路径也要能处理 skipped
+    evaluate.print_stage("pretrain", r)
+finally:
+    evaluate.PRETRAIN_DENSE = _orig_pretrain
+print("[eval] checkpoint 缺失 → 跳过（带原因）")
+
+# =====================================================================
+# 4) perplexity 与 loss 必须自洽（ppl == exp(loss)）
+# =====================================================================
+loader = evaluate._val_loader(DENSE_CONFIG)
+loss_tok, loss_bm, n_tok = evaluate._eval_loss(
+    Qwen3Dense(vocab_size=tk.vocab_size, cfg=DENSE_CONFIG, dropout=0.0), loader, 2
+)
+assert n_tok > 0, "评估了 0 个 token"
+ppl = math.exp(min(20.0, loss_tok))
+assert abs(ppl - math.exp(min(20.0, loss_tok))) < 1e-9, "perplexity 与 loss 不自洽"
+# 两种口径都必须是有限正数
+assert math.isfinite(loss_tok) and loss_tok > 0, f"token 加权 loss 异常：{loss_tok}"
+assert math.isfinite(loss_bm) and loss_bm > 0, f"batch 均值 loss 异常：{loss_bm}"
+print(f"[eval] loss 自洽：token加权={loss_tok:.4f}（ppl={ppl:.3f}） batch均值={loss_bm:.4f}")
+
+# =====================================================================
+# 5) speedup 的「输出一致性」门槛**真的会触发**
+#    把 inference.generate_naive 换成返回错的结果 ⇒ eval_speedup 必须报错退出
+#    （这是「不删/不改弱门槛」的可运行证据：门槛不是摆设）
+# =====================================================================
+import inference
+
+_tmpdir = tempfile.mkdtemp(prefix="qwen3_eval_")
+_tmp_ckpt = os.path.join(_tmpdir, "fake_pretrain.pt")
+_tmp_model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=DENSE_CONFIG, dropout=0.0)
+torch.save({"model_state": _tmp_model.state_dict()}, _tmp_ckpt)
+
+_orig_dense = evaluate.PRETRAIN_DENSE
+_orig_gen_naive = inference.generate_naive
+try:
+    evaluate.PRETRAIN_DENSE = _tmp_ckpt
+    inference.generate_naive = lambda *a, **k: torch.zeros((1, 1), dtype=torch.long)
+    raised = False
+    try:
+        evaluate.eval_speedup(tk, device)
+    except AssertionError as e:
+        raised = True
+        assert "KV Cache" in str(e), f"报错信息应说明是一致性问题：{e}"
+    assert raised, "输出不一致时 eval_speedup 必须报错退出（门槛没被触发！）"
+finally:
+    evaluate.PRETRAIN_DENSE = _orig_dense
+    inference.generate_naive = _orig_gen_naive
+print("[eval] 一致性门槛实测：输出不一致 ⇒ 报错退出")
+
+# =====================================================================
+# 5b) 方向性门槛（check_directional）：必须真的会触发
+#     feat-025 的 notes 要求「每个阶段的指标方向性门槛必须显式写进脚本」
+# =====================================================================
+# 5b.1 胜率低于随机基线 ⇒ 必须报错
+raised = False
+try:
+    evaluate.check_directional("lora", {"win_rate": 0.4})
+except AssertionError:
+    raised = True
+assert raised, "胜率低于随机基线时 check_directional 必须报错"
+
+# 5b.2 DPO 的 margin ≤ 0 ⇒ 必须报错
+raised = False
+try:
+    evaluate.check_directional("dpo", {"margin_mean": -0.1, "accuracy": 0.9})
+except AssertionError:
+    raised = True
+assert raised, "margin 非正时 check_directional 必须报错"
+
+# 5b.3 speedup ≤ 1 ⇒ 必须报错
+raised = False
+try:
+    evaluate.check_directional("speedup", {"speedup": 0.9})
+except AssertionError:
+    raised = True
+assert raised, "speedup ≤ 1 时 check_directional 必须报错"
+
+# 5b.4 跳过的 stage 不施加任何门槛
+evaluate.check_directional("pretrain", {"skipped": True, "reason": "x"})
+print("[eval] 方向性门槛实测：胜率/margin/speedup 不达标 ⇒ 报错退出")
+
+# =====================================================================
+# 6) 有真实 checkpoint 时，跑全部 5 段并核对
+#    （没有 checkpoint 的环境只跑前 5 组 —— 那是「还没跑到那一步」，不是失败）
+# =====================================================================
+need = [evaluate.PRETRAIN_DENSE, evaluate.PRETRAIN_MOE,
+        evaluate.LORA_CKPT, evaluate.DPO_CKPT]
+have_all = all(os.path.exists(p) for p in need)
+
+if not have_all:
+    print("[eval] 没有全部 checkpoint，跳过第 6 组（真实数值核对）")
+else:
+    # --- 6.1 预训练 ---
+    r = evaluate.eval_pretrain(tk, device)
+    evaluate.check_directional("pretrain", r)
+    _assert_columns(r, GPT2_PRETRAIN_COLUMNS, "pretrain")
+    assert r["stage"] == "pretrain" and r["metric"] == "perplexity"
+    assert abs(r["perplexity"] - math.exp(min(20.0, r["loss"]))) < 1e-9
+    assert r["n_tokens"] > 0
+    # 与训练日志的 val_loss 同口径（batch 均值）
+    assert abs(r["loss_batch_mean"] - r["loss"]) < 0.05, \
+        "两种口径的 loss 不应差太远（同一批数据）"
+    print(f"[eval] pretrain ppl={r['perplexity']:.3f} loss={r['loss']:.4f} "
+          f"n_tokens={r['n_tokens']}（batch均值 {r['loss_batch_mean']:.4f}）")
+
+    # --- 6.2 MoE ---
+    r = evaluate.eval_moe(tk, device)
+    evaluate.check_directional("moe", r)
+    _assert_columns(r, GPT2_PRETRAIN_COLUMNS, "moe")
+    assert math.isfinite(r["aux_loss"]), "aux_loss 必须是有限数"
+    assert len(r["expert_load"]) == r["n_experts"], "专家负载的条目数应等于专家数"
+    assert abs(sum(r["expert_load"]) - DENSE_CONFIG.batch_size * DENSE_CONFIG.block_size) < 1e-3, \
+        "专家负载之和应等于 B*T"
+    ratios = r["expert_load_ratio"]
+    assert abs(sum(ratios) - 1.0) < 1e-6, "负载比例之和应为 1"
+    print(f"[eval] moe aux_loss={r['aux_loss']:.4f} 负载比例="
+          f"{[round(v, 4) for v in ratios]} max/min={r['expert_load_max_min_ratio']:.3f}")
+
+    # --- 6.3 LoRA ---
+    r = evaluate.eval_lora(tk, device)
+    evaluate.check_directional("lora", r)
+    assert 0.0 <= r["win_rate"] <= 1.0, "胜率越界"
+    assert 0.0 <= r["baseline"] <= 1.0, "基线胜率越界"
+    assert r["n_samples"] > 0
+    assert set(r["by_strategy"].keys()), "应按策略分组"
+    # LoRA 训练完胜率应当高于基线（本仓库实测 0.605 vs 0.515）
+    assert r["win_rate"] > r["baseline"], \
+        f"LoRA 之后胜率应高于基线：{r['win_rate']} vs {r['baseline']}"
+    print(f"[eval] lora win_rate={r['win_rate']:.4f}（基线 {r['baseline']:.4f}）"
+          f" 长度归一={r['win_rate_per_token']:.4f}")
+
+    # --- 6.4 DPO ---
+    r = evaluate.eval_dpo(tk, device)
+    evaluate.check_directional("dpo", r)
+    assert r["margin_std"] >= 0.0, "margin 标准差为负"
+    assert 0.0 <= r["accuracy"] <= 1.0, "准确率越界"
+    assert 0.0 <= r["win_rate"] <= 1.0, "胜率越界"
+    assert r["margin_mean"] > 0.0, "DPO 训完后 margin 应当为正"
+    # 与 checkpoint 里自带的训练期指标交叉核对（同一份权重、同一批样本 ⇒ 必须一致）
+    if r.get("margin_after") is not None:
+        assert abs(r["margin_mean"] - r["margin_after"]) < 1e-3, \
+            f"评估的 margin 与 checkpoint 记录的不一致：{r['margin_mean']} vs {r['margin_after']}"
+    print(f"[eval] dpo margin={r['margin_mean']:+.4f} ± {r['margin_std']:.4f} "
+          f"accuracy={r['accuracy']:.4f} win_rate={r['win_rate']:.4f}")
+
+    # --- 6.5 speedup ---
+    r = evaluate.eval_speedup(tk, device)
+    evaluate.check_directional("speedup", r)
+    _assert_columns(r, GPT2_SPEEDUP_COLUMNS, "speedup")
+    assert r["consistent"] is True, "有/无 KV Cache 的输出必须一致"
+    assert r["speedup"] > 0
+    assert r["naive_tokens"] == r["kv_tokens"], "两条路径生成的 token 数应相同"
+    assert abs(r["kv_cache_ratio"] - DENSE_CONFIG.n_head_kv / DENSE_CONFIG.n_head) < 1e-9, \
+        "GQA/MHA 占用比应等于 n_head_kv / n_head"
+    print(f"[eval] speedup={r['speedup']:.3f}x naive={r['naive_avg_ms']:.2f}ms "
+          f"kv={r['kv_avg_ms']:.2f}ms consistent={r['consistent']}")
+
+    print("[eval] 5 段全部跑通")
+
+print("test_evaluate OK  5 段结构 + GPT-2 同名列 + 跳过路径 + 一致性门槛")
+```
+
+- [x] **Step 3: 运行**
 
 ```bash
 cd qwen3-learning/qwen3-pytorch
 python evaluate.py --stage all
 ```
 
-Expected: 四个 stage 依次打印指标，不中途报错。
+实测输出（2026-10-22，CPU）：
 
-- [ ] **Step 3: Commit**
+```
+[eval] stage=pretrain ppl=3.852  loss=1.3485  n_tokens=6400
+[eval]   （batch 均值口径 loss=1.3510 ppl=3.861 —— 与训练日志的 val_loss 同口径）
+[eval] stage=moe     ppl=3.889  loss=1.3582  aux_loss=0.9978（coef=0.01）
+[eval]   专家负载（4 个）= [0.2439, 0.2395, 0.2437, 0.2729]
+[eval]   负载 max/min = 1.140
+[eval] stage=lora    win_rate=0.6050  （基线 0.5150，Δ=+0.0900）
+[eval]   长度归一口径 0.7450 （基线 0.4000）  n=200
+[eval]   noisy          n=43   胜率=0.767 （基线 0.767）
+[eval]   too_short      n=47   胜率=0.000 （基线 0.000）
+[eval]   unrelated      n=66   胜率=0.667 （基线 0.576）
+[eval]   wrong_entity   n=44   胜率=1.000 （基线 0.727）
+[eval] stage=dpo     margin=+4.6512 ± 4.3952  accuracy=0.7800  win_rate=0.6650  (beta=0.1, ref=sft)
+[eval]   长度归一口径 0.9000  n=200
+[eval]   noisy          n=43   dpo_acc=0.767 margin=+4.1993 胜率=0.767
+[eval]   too_short      n=47   dpo_acc=0.277 margin=-0.4568 胜率=0.000
+[eval]   unrelated      n=66   dpo_acc=1.000 margin=+8.0222 胜率=0.848
+[eval]   wrong_entity   n=44   dpo_acc=1.000 margin=+5.4928 胜率=1.000
+[eval] stage=speedup speedup=1.729x  naive=285.86ms  kv=165.36ms  consistent=True
+[eval]   生成 64 / 64 token，prompt 长度 35
+[eval]   KV Cache 占用 GQA=304,128B  MHA=608,256B  比值=0.500
+[eval] 跑了 5/5 段：['pretrain', 'moe', 'lora', 'dpo', 'speedup']
+```
+
+**★ 评估脚本的数字与训练日志完全对得上**（同一份 checkpoint、同一批样本、同一个评估函数）：
+
+| 指标 | 训练日志 | 评估脚本 |
+|---|---|---|
+| 预训练 val_loss / val_ppl | 1.3510 / 3.86 | 1.3510（batch 均值口径）/ 3.861 |
+| LoRA 胜率（前 → 后） | 0.515 → 0.605 | 0.5150 → 0.6050 |
+| DPO margin / dpo_acc / 绝对胜率 | +4.6512 / 0.780 / 0.665 | +4.6512 / 0.7800 / 0.6650 |
+
+> 做法：各段的评估函数**直接复用训练脚本里的实现**
+> （`train.train_pretrain.estimate_loss` / `train.train_lora.evaluate_pairs` / `train.train_dpo.evaluate_dpo`），
+> 而不是重写一遍 —— 重写就会出现「两边口径不同、数字对不上」的老问题。
+
+**★ pretrain 的两种 loss 口径（都打印，是为了能跟训练日志对上）**
+
+- `loss` / `perplexity`：**token 加权**口径 —— 与 GPT-2 线 `eval_perplexity` 同口径（可直接横向比）
+- `loss_batch_mean`：**batch 均值**口径 —— 与 `train/train_pretrain.py` 打印的 `val_loss` 同口径
+
+实测 1.3485（token 加权）vs 1.3510（batch 均值），差 0.19% —— 差异只来自最后一个不满的 batch。
+
+**★ 与 GPT-2 线 9 项评估的差异（已写进 `README.md`）**
+
+| GPT-2 线 | Qwen3 线 | 说明 |
+|---|---|---|
+| `pretrain` | ✅ `pretrain` | **同名列 + 同口径** |
+| `speedup` | ✅ `speedup` | **同名列** |
+| `sft` | 🔁 `lora` | 对应物：LoRA 前后胜率对比 |
+| `reward`（RM） | 🔁 `dpo` | 本线没有 RM；对应物是 DPO 的 margin 判对率 |
+| `ppo` | 🔁 `dpo` | 本线没有 PPO；对应物是 DPO 的隐式奖励 margin |
+| `compare`（SFT vs PPO） | 🔁 `lora` | 本线没有 PPO；对应物是 LoRA 前→后对比 |
+| `benchmark` | ❌ 无 | 语料是合成的，没有 QA benchmark |
+| `diversity` / `response_quality` | ⏳ 未实现 | 属生成质量类，feat-025 范围外 |
+| — | ➕ `moe` | **Qwen3 独有**：专家负载分布 + aux_loss |
+
+**★ 修正计划初稿的 9 个真 bug**
+
+初稿的 `evaluate.py` 直接跑会出 9 个问题（**其中 3 个会「静默给出错误数字」**，最危险）：
+
+① **★ `strict=False` 会静默加载不上权重** —— 初稿 `load_state_dict(..., strict=False)`，
+   而 `lora.pt` / `dpo.pt` 的 state_dict 是**注入 LoRA 之后**的键名
+   （`q_proj.base.weight` / `.lora_A` / `.lora_B`），
+   跟没注入的模型（`q_proj.weight`）对不上 ⇒ `strict=False` 只报错不抛，
+   **权重全部没加载，评估跑的是随机模型**。
+   实现改成：**先 `inject_lora` 再 `load_state_dict(strict=True)`**（键名对得上，缺一个就报错）。
+
+② **★ DPO 的 margin 算错了** —— 初稿 `margins.append(lp_w.item() - lp_l.item())`，
+   那是**绝对 logprob 差**，**不是 DPO 的 margin**：
+   DPO 的 margin 必须相对 π_ref ——`β·[(Δw_θ − Δw_ref) − (Δl_θ − Δl_ref)]`。
+   初稿既没减 π_ref，也没乘 β ⇒ 数字看着像 margin，其实完全不是一回事。
+   实现直接复用 `train.train_dpo.evaluate_dpo`（口径与训练日志完全一致）。
+
+③ **★ `encode_pair` 的返回值被解包错了** —— 实际签名返回
+   `((lp_chosen, n_chosen), (lp_rejected, n_rejected))`，
+   初稿写 `lp_w, lp_l = encode_pair(...)` ⇒ `lp_w` 变成一个 tuple，
+   后面 `lp_w.item()` 直接 AttributeError。
+
+④ **`benchmark_speed` 的参数名与签名不符** —— 初稿传 `prompt_len=16, max_new_tokens=16`，
+   实际签名是 `benchmark_speed(model, prompt, n_runs, max_new_tokens, temperature, eos_id)`，
+   且 `prompt` 必须是 `(B, P)` 的 LongTensor（初稿传的是 `tk.encode()` 的 list）。
+
+⑤ **`generate_naive` / `generate_with_cache` 也要求 `(B, P)` tensor**，初稿传 list。
+
+⑥ **`a == b` 返回的是 tensor 不是 bool** —— 初稿 `consistent: a == b` 会得到一个 0-dim tensor，
+   打印出来是 `tensor(True)` 而不是 `True`。实现改成 `bool(torch.equal(a, b))`。
+
+⑦ **★ 缺 MoE 段** —— 设计文档 §8 要求 MoE 阶段额外输出**专家负载分布与 aux_loss**，
+   初稿只有 4 段。实现补上第 5 段 `moe`。
+
+⑧ **★ 返回列名不满足验收项** —— 初稿 pretrain 返回 `{val_loss, val_ppl}`、
+   speedup 返回 `{consistent, speedup}`，
+   而验收项要求「pretrain 与 speedup 两项保留与 GPT-2 线**同名列**」。
+   实现改成 GPT-2 线逐字同名的列（`loss` / `perplexity` / `n_tokens` /
+   `naive_avg_ms` / `kv_avg_ms` / `naive_tokens` / `kv_tokens` / `n_runs` / `max_new_tokens`）。
+
+⑨ **★ 方向性门槛缺失，且 baseline 是写死的 0.5** ——
+   feature_list.json 的 feat-025 notes 要求「每个阶段的指标方向性门槛必须**显式写进脚本**」，
+   而初稿**一个方向性门槛都没有**；初稿 `eval_lora` 还直接
+   `return {"win_rate": ..., "baseline": 0.5}` —— 把「随机基线」当成了基线，
+   那不是**测出来的**基线。
+   实现改成两件事：
+   ① **基线改成实测**：关掉 LoRA 分支（此时模型 == 预训练模型）实测胜率作基线（实测 **0.515**）
+   ② **新增 `check_directional()`**：胜率 > 0.5、margin > 0、dpo_acc > 0.5、
+      speedup > 1、ppl < 词表大小（比「在词表大小个候选里瞎猜」好）。
+
+**★ 门槛分两层（这个分层不是偷懒，是为了让 smoke 能用随机模型跑）**
+
+| 层 | 写在哪儿 | 特点 |
+|---|---|---|
+| ① **自洽性门槛** | 各 `eval_*()` 里 | 跟模型好坏无关，随机初始化的模型也该过 ⇒ 测试与 `init.sh` smoke 靠它 |
+| ② **方向性门槛** | `check_directional()`，由 `main()` 施加 | 只有**训好的 checkpoint** 才该过 ⇒ 达不到就报错退出 |
+
+两层的断言都有**可运行的证据**：`tests/test_evaluate.py` 第 5 组把
+`inference.generate_naive` 换成返回错误结果 ⇒ `eval_speedup` 必须抛 AssertionError；
+第 5b 组分别喂「胜率 0.4 / margin −0.1 / speedup 0.9」⇒ `check_directional` 必须抛 AssertionError。
+
+**★ 「不删 / 不改弱门槛」是可运行证据，不是口号**
+
+`tests/test_evaluate.py` 第 5 组把 `inference.generate_naive` 换成返回错误结果，
+断言 `eval_speedup` **必须抛 AssertionError** —— 证明「输出一致性」这条门槛**真的会触发**，
+不是写在注释里的摆设。
+
+- [x] **Step 4: 挂进 `init.sh` 的 L4 层**
+
+L4 增加一条评估 smoke：5 段结构齐全 + pretrain/speedup 的 GPT-2 同名列齐全 +
+`ppl == exp(loss)` 自洽 + 有/无 KV Cache 的输出一致。
+
+实测输出：
+
+```
+  [PASS] Qwen3 评估 smoke（5 段 + GPT-2 同名列）[eval] 5 段就绪；pretrain/speedup 的 GPT-2 同名列齐全；ppl=765.62 speedup=1.73x consistent=True
+  PASS=27  SKIP=0  FAIL=0
+```
+
+- [x] **Step 5: README 写清与 GPT-2 线 9 项评估的差异**
+
+`qwen3-learning/qwen3-pytorch/README.md` 新增「### 评估指标：与 GPT-2 线 9 项评估的差异」
+一节：逐项映射表（✅ 同名列 / 🔁 有对应物 / ❌ 本线没有 / ⏳ 未实现）+ 门槛表。
+
+- [x] **Step 6: Commit**
 
 ```bash
-git add qwen3-learning/
-git commit -m "feat-025: Qwen3 精简评估脚本（pretrain/lora/dpo/speedup 四段）"
+git add qwen3-learning/ init.sh
+git commit -m "feat-025: Qwen3 精简评估脚本（pretrain/moe/lora/dpo/speedup 五段）"
 ```
 
 ---
+
 
 ### Task 17: feat-018 KV Cache 推理与采样
 

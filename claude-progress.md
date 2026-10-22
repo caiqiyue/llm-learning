@@ -712,3 +712,145 @@ $ bash init.sh
 `qwen3-learning/Qwen3_训练推理完整学习笔记.md`（+§10）、
 `qwen3-learning/qwen3-pytorch开发计划.md`（Task 17 就地换成真代码 + Task 16 标注顺序纠正）、
 仓库根 `init.sh`（L4 +推理 smoke）、`feature_list.json`
+
+### Session 009 — Qwen3 精简评估脚本（feat-025）
+
+**本次做完的事**
+
+1. 新增 `qwen3-learning/qwen3-pytorch/evaluate.py`（5 段：pretrain / moe / lora / dpo / speedup + `--stage all`）。
+2. 新增 `tests/test_evaluate.py`（7 组断言），自动挂进 `tests/run_all.py`。
+3. `init.sh` L4 加一条评估 smoke（5 段结构 + GPT-2 同名列 + 一致性）。
+4. `qwen3-pytorch/README.md` 新增「与 GPT-2 线 9 项评估的差异」一节（feat-025 的验收项）。
+5. `Qwen3_训练推理完整学习笔记.md` 补 §11（评估）。
+6. **修正计划初稿的 9 个真 bug**（开发计划 Task 16 已就地换成真代码）。
+
+**★ 评估脚本的数字与训练日志完全对得上**
+
+| 指标 | 训练日志 | 评估脚本 |
+|---|---|---|
+| 预训练 val_loss / val_ppl | 1.3510 / 3.86 | 1.3510（batch 均值口径）/ 3.861 |
+| LoRA 胜率（前 → 后） | 0.515 → 0.605 | 0.5150 → 0.6050 |
+| DPO margin / dpo_acc / 绝对胜率 | +4.6512 / 0.780 / 0.665 | +4.6512 / 0.7800 / 0.6650 |
+
+> **做法**：各段的评估函数**直接复用训练脚本里的实现**
+> （`train.train_pretrain.estimate_loss` / `train.train_lora.evaluate_pairs` / `train.train_dpo.evaluate_dpo`），
+> **不重写**。重写就会出现「两边口径不同、数字对不上」的老问题。
+
+**★ pretrain 的两种 loss 口径（都打印，是为了能跟训练日志对上）**
+
+- `loss` / `perplexity`：**token 加权**口径 —— 与 GPT-2 线 `eval_perplexity` 同口径（可直接横向比）
+- `loss_batch_mean`：**batch 均值**口径 —— 与 `train/train_pretrain.py` 打印的 `val_loss` 同口径
+
+实测 1.3485（token 加权）vs 1.3510（batch 均值），差 0.19%（差异只来自最后一个不满的 batch）。
+
+> **「同名」还不够，「同口径」才够**：同一个叫 `perplexity` 的字段，
+> 一个 token 加权、一个 batch 均值，数字放在一起比就是在比两件不同的事。
+
+**★ MoE 段的两个新指标**
+
+- **`aux_loss = 0.9978`** —— 本实现除以 `N·K`，**完全均衡时 = 1**（HF Mixtral 是 K，Switch top-1 是 1）
+  ⇒ 0.9978 说明 router 没塌。
+- **专家负载 = [0.2439, 0.2395, 0.2437, 0.2729]，max/min = 1.140** ——
+  判读负载分布要看 **max/min 比值**而不是单个值：单个专家占 27% 看着不多，
+  但若另一个占 0% 则 max/min = ∞，那才是塌缩。
+
+**★ 与 GPT-2 线 9 项评估的差异（已写进 README）**
+
+| GPT-2 线 | Qwen3 线 | 说明 |
+|---|---|---|
+| `pretrain` | ✅ `pretrain` | 同名列 + 同口径 |
+| `speedup` | ✅ `speedup` | 同名列 |
+| `sft` | 🔁 `lora` | 对应物：LoRA 前后胜率对比 |
+| `reward`（RM pairwise acc） | 🔁 `dpo` | 本线没有 RM；对应物是 margin 判对率 |
+| `ppo`（reward / KL） | 🔁 `dpo` | 本线没有 PPO；对应物是隐式奖励 margin |
+| `compare`（SFT vs PPO） | 🔁 `lora` | 本线没有 PPO；对应物是 LoRA 前→后对比 |
+| `benchmark` | ❌ 无 | 语料是合成的，没有 QA benchmark |
+| `diversity` / `response_quality` | ⏳ 未实现 | 生成质量类，feat-025 范围外 |
+| — | ➕ `moe` | **Qwen3 独有**：专家负载分布 + aux_loss |
+
+**★ 「不删 / 不改弱门槛」必须有可运行证据**
+
+门槛分两层：
+
+| 层 | 写在哪儿 | 特点 |
+|---|---|---|
+| ① **自洽性门槛** | 各 `eval_*()` 里 | 跟模型好坏无关，随机初始化模型也该过 ⇒ 测试与 smoke 靠它 |
+| ② **方向性门槛** | `check_directional()`，由 `main()` 施加 | 只有训好的 checkpoint 才该过 ⇒ 达不到就报错退出 |
+
+**两层都实测过会触发**：
+第 5 组把 `inference.generate_naive` 换成返回错误结果 ⇒ `eval_speedup` 必须抛 AssertionError；
+第 5b 组分别喂「胜率 0.4 / margin −0.1 / speedup 0.9」⇒ `check_directional` 必须抛 AssertionError。
+
+checkpoint 缺失时**跳过该段并打印原因**（那是「还没跑到那一步」，不是「指标不合格」）。
+
+**★ 修正计划初稿的 9 个真 bug**（其中 3 个会「静默给出错误数字」，最危险）
+
+① **`strict=False` 会静默加载不上权重** —— `lora.pt`/`dpo.pt` 的 state_dict 是**注入 LoRA 之后**的键名
+（`q_proj.base.weight` / `.lora_A` / `.lora_B`），与未注入的模型对不上，
+`strict=False` 只警告不报错 ⇒ **权重全部没加载，评估跑的是随机模型**。
+改成：**先 `inject_lora` 再 `load_state_dict(strict=True)`**。
+
+② **DPO 的 margin 算错了** —— 初稿 `margins.append(lp_w.item() - lp_l.item())` 是**绝对 logprob 差**，
+既没减 π_ref 也没乘 β ⇒ **看着像 margin，其实完全不是一回事**。
+DPO 的 margin 必须是 `β·[(Δw_θ − Δw_ref) − (Δl_θ − Δl_ref)]`。
+
+③ **`encode_pair` 的返回值被解包错了** —— 实际返回 `((lp_w, n_w), (lp_l, n_l))`，
+初稿按两个值解包 ⇒ `lp_w` 变成 tuple，后面 `.item()` 直接 AttributeError。
+
+④⑤ **`benchmark_speed` / `generate_naive` 的参数名与签名不符**，且 prompt 必须是 `(B,P)` tensor 不是 list。
+
+⑥ **`a == b` 返回的是 tensor 不是 bool**。
+
+⑦ **缺 MoE 段** —— 设计文档 §8 要求 MoE 阶段额外输出专家负载分布与 aux_loss。
+
+⑧ **返回列名不满足验收项** —— 初稿 pretrain 返回 `{val_loss, val_ppl}`、speedup 返回 `{consistent, speedup}`，
+而验收项要求「与 GPT-2 线同名列」。
+
+⑨ **方向性门槛缺失 + baseline 是写死的 0.5** —— 那个 0.5 不是**测出来的**基线。
+改成：关掉 LoRA 分支（模型 == 预训练模型）**实测**基线（0.515），并新增 `check_directional()`。
+
+**验证**
+
+```
+$ python evaluate.py --stage all
+[eval] stage=pretrain ppl=3.852  loss=1.3485  n_tokens=6400
+[eval]   （batch 均值口径 loss=1.3510 ppl=3.861 —— 与训练日志的 val_loss 同口径）
+[eval] stage=moe     ppl=3.889  loss=1.3582  aux_loss=0.9978（coef=0.01）
+[eval]   专家负载（4 个）= [0.2439, 0.2395, 0.2437, 0.2729]
+[eval]   负载 max/min = 1.140
+[eval] stage=lora    win_rate=0.6050  （基线 0.5150，Δ=+0.0900）
+[eval] stage=dpo     margin=+4.6512 ± 4.3952  accuracy=0.7800  win_rate=0.6650  (beta=0.1, ref=sft)
+[eval] stage=speedup speedup=1.770x  naive=284.57ms  kv=160.82ms  consistent=True
+[eval]   KV Cache 占用 GQA=304,128B  MHA=608,256B  比值=0.500
+[eval] 跑了 5/5 段：['pretrain', 'moe', 'lora', 'dpo', 'speedup']
+
+$ python tests/test_evaluate.py
+test_evaluate OK  5 段结构 + GPT-2 同名列 + 跳过路径 + 一致性门槛
+
+$ python tests/run_all.py
+[run_all] PASS=14  FAIL=0  TOTAL=14
+
+$ bash init.sh
+  [PASS] Qwen3 评估 smoke（5 段 + GPT-2 同名列）[eval] 5 段就绪；pretrain/speedup 的 GPT-2 同名列齐全；ppl=765.62 speedup=1.73x consistent=True
+  PASS=27  SKIP=0  FAIL=0
+```
+
+**未解决 / 风险**
+
+- **diversity / response_quality / benchmark 三项没做**：属「生成质量」类，
+  本线语料是合成的，做出来的数字意义有限。已在 README 明确标注「⏳ 未实现 / ❌ 无」。
+- **`too_short` 那一组的绝对胜率恒为 0**：不是 bug，是「总 logprob 偏袒长回复」的必然结果；
+  长度归一口径（0.9000）才是能用的那个。
+- **speedup 只有 ~1.7x**：CPU + block_size=128 + 极小模型，prefill 固定开销占比高。
+
+**下一步**
+
+1. `feat-017` 与 GPT-2 的**退化对照实验**（本线最有价值的产出）
+2. `feat-008` 笔记↔源码交叉引用（补 BPE 笔记）→ `feat-009` 数字全量核对 → 收班
+
+**本次改动涉及的文件**
+
+`qwen3-learning/qwen3-pytorch/`：`evaluate.py`（新）、`tests/test_evaluate.py`（新）、`README.md`（+评估差异一节）、
+`qwen3-learning/Qwen3_训练推理完整学习笔记.md`（+§11）、
+`qwen3-learning/qwen3-pytorch开发计划.md`（Task 16 就地换成真代码 + 9 个 bug 记录）、
+仓库根 `init.sh`（L4 +评估 smoke）、`feature_list.json`

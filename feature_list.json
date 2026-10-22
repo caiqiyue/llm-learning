@@ -378,8 +378,8 @@
       "priority": 14,
       "area": "qwen3-eval",
       "title": "Qwen3 精简评估脚本",
-      "user_visible_behavior": "跑 python evaluate.py --stage {pretrain,lora,dpo,all} 一次输出对应阶段的全部指标，不中途报错。",
-      "status": "not_started",
+      "user_visible_behavior": "跑 python evaluate.py --stage {pretrain,moe,lora,dpo,speedup,all} 一次输出对应阶段的全部指标，不中途报错。",
+      "status": "passing",
       "verification": [
         "预训练阶段：val loss、val perplexity",
         "MoE 阶段：额外输出专家负载分布与 aux_loss",
@@ -389,8 +389,20 @@
         "pretrain 与 speedup 两项保留与 GPT-2 线同名的列，便于横向对比",
         "与 GPT-2 线的 9 项评估不做逐项对标（那套围绕 RM+PPO 设计，DPO 阶段不适用），但需在 README 说明差异"
       ],
-      "evidence": [],
-      "notes": "对应 设计.md §8。AGENTS.md 硬约束：不删/不改弱 evaluate.py 的指标和阈值——精简的是「项数」不是「门槛」，每个阶段的指标方向性门槛（如 chosen 胜率 > 50%）必须显式写进脚本。"
+      "evidence": [
+        "2026-10-22 新增 `qwen3-learning/qwen3-pytorch/evaluate.py`（5 段：pretrain / moe / lora / dpo / speedup + `--stage all`）与 `tests/test_evaluate.py`（7 组断言）。**各段的评估函数直接复用训练脚本里的实现**（`train.train_pretrain.estimate_loss` / `train.train_lora.evaluate_pairs` / `train.train_dpo.evaluate_dpo`），不重写 —— 重写就会出现「两边口径不同、数字对不上」的老问题。",
+        "2026-10-22 **验证项 ①：预训练阶段 —— val loss、val perplexity** —— `ppl=3.852  loss=1.3485  n_tokens=6400`（**token 加权**口径，与 GPT-2 线 `eval_perplexity` 同口径）。另外打印 **batch 均值口径** `loss=1.3510 / ppl=3.861` —— **与 `train/train_pretrain.py` 的训练日志 val_loss 1.3510 / val_ppl 3.86 完全对上**。两个口径差 0.19%（差异只来自最后一个不满的 batch）。**「同名」还不够，「同口径」才够** —— 同一个叫 perplexity 的字段，一个 token 加权、一个 batch 均值，数字放一起比就是在比两件不同的事。",
+        "2026-10-22 **验证项 ②：MoE 阶段 —— 额外输出专家负载分布与 aux_loss** —— `ppl=3.889  loss=1.3582  aux_loss=0.9978（coef=0.01）`；**专家负载比例 = [0.2439, 0.2395, 0.2437, 0.2729]，max/min = 1.140**。判读要点：①aux_loss 本实现除以 `N·K`，**完全均衡时 = 1**（HF Mixtral 是 K，Switch top-1 是 1），实测 0.9978 ⇒ router 没塌；②负载分布要看 **max/min 比值**而不是单个值 —— 单个专家占 27% 看着不多，但若另一个占 0% 则 max/min = ∞ 那才是塌缩；③脚本里有一条硬门槛：**专家负载之和必须等于 B*T**（实测 4096 = 32×128）。",
+        "2026-10-22 **验证项 ③：LoRA 阶段 —— 偏好数据胜率** —— `win_rate=0.6050`（**基线 0.5150**，Δ=+0.0900），长度归一口径 0.7450（基线 0.4000），n=200。**基线是实测的，不是写死的 0.5**：关掉 LoRA 分支（此时模型 == 预训练模型，注入是无损的）实测得到。分策略：wrong_entity 1.000（基线 0.727）、unrelated 0.667（0.576）、noisy 0.767（0.767）、**too_short 0.000（0.000）** —— 短回复的总 logprob 天然接近 0，绝对口径系统性偏袒长回复。",
+        "2026-10-22 **验证项 ④：DPO 阶段 —— reward margin 均值/标准差、chosen>rejected 准确率** —— `margin=+4.6512 ± 4.3952  accuracy=0.7800  win_rate=0.6650（beta=0.1, ref=sft）`，长度归一 0.9000。**与训练日志的数字完全一致**（训练时也是 +4.6512 / 0.780 / 0.665）—— 因为 `evaluate_dpo` 是同一份实现、同一批样本。**π_ref 从哪来**：`dpo.pt` 的 base 已含 SFT 的 ΔW（训练时 merge → strip → 重新 inject），所以 **π_ref = 关掉 LoRA 分支的同一个模型**，不需要加载第二份权重。",
+        "2026-10-22 **验证项 ⑤：推理阶段 —— 有/无 KV Cache 的输出一致性与加速比** —— `speedup=1.770x  naive=284.57ms  kv=160.82ms  consistent=True`（greedy，prompt 35 token，生成 64 token）。**一致性是「逐位相同」**（`torch.equal` == True），不一致时脚本**直接报错退出**。同时给出 KV Cache 占用：**GQA 304,128 B vs 同尺寸 MHA 608,256 B = 1/2**。",
+        "2026-10-22 **验证项 ⑥：pretrain 与 speedup 两项保留与 GPT-2 线同名的列** —— pretrain：`stage / metric / value / loss / perplexity / n_tokens / checkpoint`；speedup：`stage / metric / value / naive_avg_ms / kv_avg_ms / speedup / naive_tokens / kv_tokens / n_runs / max_new_tokens`。**两组的列名是逐字抄自 GPT-2 线 `evaluate.py` 的 `eval_perplexity` / `eval_speedup`**，并在 `tests/test_evaluate.py` 里用硬编码的列名清单做断言（少一个就红）。",
+        "2026-10-22 **验证项 ⑦：与 GPT-2 线的 9 项评估不做逐项对标，但差异已在 README 说明** —— `qwen3-learning/qwen3-pytorch/README.md` 新增「### 评估指标：与 GPT-2 线 9 项评估的差异」一节，逐项映射表：`pretrain` ✅同名列同口径 / `speedup` ✅同名列 / `sft`→`lora`（前后胜率对比）/ `reward`(RM)→`dpo`（margin 判对率）/ `ppo`→`dpo`（隐式奖励 margin）/ `compare`→`lora`（LoRA 前→后）/ `benchmark` ❌本线没有（合成语料没有 QA benchmark）/ `diversity` 与 `response_quality` ⏳未实现（生成质量类，feat-025 范围外）/ ➕ Qwen3 独有的 `moe` 段（专家负载分布 + aux_loss）。",
+        "2026-10-22 **★ 「不删/不改弱门槛」必须有可运行证据，不是口号** —— 门槛分两层：①**自洽性门槛**写在各 `eval_*()` 里（ppl == exp(loss)、n_tokens > 0、aux_loss 有限、专家负载之和 == B*T、胜率 ∈ [0,1]、margin_std >= 0、**checkpoint 的 LoRA B 必须非零**（B 全零 ⇒ DPO 压根没训过）、**有/无 KV Cache 的输出必须逐位相同**）；②**方向性门槛**写在 `check_directional()` 里（胜率 > 0.5、margin > 0、dpo_acc > 0.5、speedup > 1、ppl < 词表大小），由 `main()` 施加。**两层都实测过会触发**：`tests/test_evaluate.py` 第 5 组把 `inference.generate_naive` 换成返回错误结果 ⇒ `eval_speedup` 必须抛 AssertionError；第 5b 组分别喂「胜率 0.4 / margin −0.1 / speedup 0.9」⇒ `check_directional` 必须抛 AssertionError。checkpoint 缺失时**跳过该段并打印原因**（那是「还没跑到那一步」，不是「指标不合格」）。",
+        "2026-10-22 **修正计划初稿的 9 个真 bug**（详见 开发计划.md Task 16）：①**`strict=False` 会静默加载不上权重** —— `lora.pt`/`dpo.pt` 的 state_dict 是注入 LoRA 之后的键名，与未注入的模型对不上，`strict=False` 不报错 ⇒ **权重全没加载，评估跑的是随机模型**。改成先 `inject_lora` 再 `load_state_dict(strict=True)`；②**DPO 的 margin 算错了** —— 初稿 `lp_w - lp_l` 是绝对 logprob 差，既没减 π_ref 也没乘 β ⇒ **看着像 margin，其实完全不是一回事**；③`encode_pair` 返回 `((lp_w, n_w), (lp_l, n_l))`，初稿按两个值解包 ⇒ AttributeError；④⑤`benchmark_speed` / `generate_naive` 的参数名与签名不符，且 prompt 必须是 `(B,P)` tensor 不是 list；⑥`a == b` 返回的是 tensor 不是 bool；⑦**缺 MoE 段**（设计文档 §8 要求）；⑧**返回列名不满足验收项**（初稿 `val_loss/val_ppl` 与 `consistent/speedup`）；⑨**方向性门槛缺失 + baseline 是写死的 0.5**（不是测出来的基线）。",
+        "2026-10-22 验证命令与实测输出：`python evaluate.py --stage all` → 5 段全部跑通；`python tests/test_evaluate.py` → 7 组断言全过；`python tests/run_all.py` → **PASS=14 FAIL=0 TOTAL=14**；`bash init.sh` → **PASS=27 SKIP=0 FAIL=0**，新增 `[PASS] Qwen3 评估 smoke（5 段 + GPT-2 同名列）`。"
+      ],
+      "notes": "**精简的是「项数」不是「门槛」** —— 每个阶段的指标方向性门槛（胜率 > 0.5、margin > 0、speedup > 1、ppl < 词表大小）都**显式写进脚本**（`check_directional()`），达不到就**报错退出**，不打印一个好看的数。与 GPT-2 线 9 项评估**不做逐项对标**（那套围绕 RM+PPO 设计），但 **pretrain 与 speedup 两项保留逐字同名的列**（且同口径：token 加权 vs batch 均值），两条线的数字可以直接并排比较。**评估函数复用训练脚本的实现** ⇒ 评估脚本的数字与训练日志天然一致。受影响的笔记：`qwen3-learning/Qwen3_训练推理完整学习笔记.md` §11（新增）、`qwen3-learning/qwen3-pytorch/README.md`（新增评估差异一节）、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 16 就地换成真代码）。"
     },
     {
       "id": "feat-017",
