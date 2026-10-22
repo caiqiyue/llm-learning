@@ -454,3 +454,153 @@ $ bash init.sh
 `qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`（新建，LoRA 半部）、
 `qwen3-learning/qwen3-pytorch开发计划.md`（Task 14 就地换成真代码 + 实测修正记录）、
 仓库根 `init.sh`（L4 +LoRA smoke）、`feature_list.json`、`claude-progress.md`、`session-handoff.md`
+
+### Session 007 — Qwen3 DPO（feat-024）+ 一个模型层的静默 bug
+
+**本次做完的事**
+
+1. 手写 DPO（`train/train_dpo.py`）：目标函数、隐式奖励、reward margin、
+   `evaluate_dpo`（margin 均值/标准差 + dpo_acc + 绝对胜率 + 按策略分组）。
+2. 给 `model/common/lora.py` 加 **`strip_lora`**（把 LoRALinear 换回普通 nn.Linear）。
+3. 写 `tests/test_dpo.py`（9 组断言），挂进 `init.sh` 的 L4 层。
+4. 补 `Qwen3_LoRA与DPO_学习笔记.md` 的 §8（DPO 全节）+ §6.4 + 把 §9 教训扩到 7 条。
+5. **★ 顺带修掉一个模型层的静默 bug：`dropout` 覆盖没传到 Block**（见下）。
+
+**★ 最隐蔽的一个 bug：π_ref 锚错了**
+
+标准 DPO 的 KL 锚点是 **SFT 模型**。初稿加载完 `lora.pt` 后**没有 merge**，
+直接 inject 了一个新 LoRA —— 于是「关掉 LoRA 分支」得到的是**预训练模型**，
+不是 SFT 模型。后果：DPO 的 KL 项会跟刚做完的 LoRA SFT 互相拉扯。
+
+**它不会让代码崩、不会让 loss 变 NaN、指标还会照涨 —— 只是整个实验锚在错的基线上。**
+
+修法是三步：
+
+```text
+inject → load lora.pt  →  merge_lora（ΔW 折进 base ⇒ 模型 == SFT 模型）
+                        →  strip_lora（换回普通 Linear）
+                        →  inject_lora（新的，B 零初始化）
+```
+
+之后「关掉分支」精确等于 SFT 模型，**同一个模型对象**搞定两套策略，不加载第二份权重。
+
+**★ 由此得到一条可运行的不变量**（被守了三次：训练脚本 assert / 单测第 3 组 / init.sh smoke）：
+
+> **初始 margin 恒为 0、loss 恒为 log 2 = 0.6931**（因为 B 零初始化 ⇒ π_θ ≡ π_ref）。
+
+这是「π_ref 锚对了没有」的唯一可运行证据。
+
+**★ 第二个静默 bug：`dropout` 覆盖没传到 Block（模型层）**
+
+做消融时发现「同一份 DPO 配方跑两遍，margin 差 0.028（+0.1859 vs +0.1582）」，
+而 `train/train_dpo.py` 自己重跑两遍完全一致 ⇒ 差异来自消融脚本「训练前多做了一次 win_flags」。
+
+追下去发现根因在模型层：
+
+- `Qwen3Dense.__init__` / `Qwen3MoE.__init__` 算了覆盖值 `d`，
+  却只把它给了 `self.drop`（embedding 的 Dropout），
+  **Block 里写的是 `dropout=cfg.dropout`** ⇒ `dropout=0.0` 只关掉了一半；
+- 注意力/MLP 的 Dropout 一直是 `p=0.1`，而 **p>0 的 Dropout 在 train 模式下会推进全局 torch RNG**
+  （实测：p=0.0 不推进，p=0.1 推进）⇒ 「训练前多做 200 次前向」就会改变训练轨迹。
+
+修法：`Block` / `MoEBlock` 接受并真正传递 `dropout` 覆盖值。
+回归断言写进 `tests/test_dense.py` 第 13 条与 `tests/test_moe.py` 末尾
+（**结构断言 + 行为断言各一条**；已实测退回 bug 版本时断言立刻报错）。
+
+**影响面**：SFT/DPO 阶段真的没有 dropout ⇒ **LoRA 与 DPO 的全部数字都变了**
+⇒ 重跑了 LoRA 主训练 + LoRA 8 行消融 + DPO 主训练 + DPO 8 行消融，并更新了笔记。
+**预训练不受影响**（显式传 `cfg.dropout=0.1`），重跑核对
+`initial_loss=6.7154 → val_loss=1.3510 val_ppl=3.86`，与修复前**逐位一致**。
+
+**★ 最重要的实测发现 ——「margin 和绝对胜率是两回事」**
+
+| 配方 | reward margin | dpo_acc | 绝对 win_rate | 长度归一 | 翻转数 |
+|---|---|---|---|---|---|
+| 300 步 / lr 1e-4 | +0.2831 | **0.945** | 0.605 → 0.605 | 0.745 → 0.780 | **0**/200 |
+| 1500 步 / lr 1e-3 | **+4.6512** | 0.780 | 0.605 → **0.665** | 0.745 → **0.900** | 12/200 |
+
+**弱配方下 dpo_acc 冲到 0.945（看着很美），绝对胜率却 0/200 翻转 —— 一个样本都没动。**
+**DPO 优化的是「相对 π_ref 的间隔」，不是「绝对排序」。**
+
+⇒ **报告 DPO 结果必须同时给 reward margin（目标口径）与绝对 win_rate（业务口径）**，
+只给前者是自我欺骗，只给后者会误判「没训好」。
+
+**★ 顺带实证了 LoRA 笔记 §5.4 的论断，还多了一层**
+
+`too_short` 策略（rejected 只有 6.3 token）的**绝对 win_rate 恒为 0.000**。
+弱配方下它的 dpo_acc 是 **1.000**（DPO 判得很对，静态长度偏置在相减时被减掉了）；
+强配方下掉到 **0.277**、margin 变负 ——
+**DPO 减掉 π_ref 的偏置之后，会按新目标重新造一个偏置。**
+
+**★ π_ref 取法的结论**
+
+标准做法（锚 SFT 模型）与消融（锚预训练模型）**都能把业务指标推上去，终点几乎一样**
+（0.665 vs 0.650）。但两行的 margin 参照系不同、起点基线不同，不可直接比大小；
+**默认仍取 `--ref-mode sft`**。
+
+**消融表**
+
+| π_ref | 步数 | lr | β | reward margin | dpo_acc | 绝对 win_rate | 翻转数 |
+|---|---|---|---|---|---|---|---|
+| sft | 300 | 0.0001 | 0.1 | +0.0000 → +0.2831 | 0.000 → 0.945 | 0.605 → 0.605 | 0 |
+| sft | 1500 | 0.0001 | 0.1 | +0.0000 → +1.6338 | 0.000 → 0.710 | 0.605 → 0.630 | 5 |
+| sft | 1500 | 0.001 | 0.1 | +0.0000 → +4.6512 | 0.000 → 0.780 | 0.605 → 0.665 | 12 |
+| sft | 1500 | 0.001 | 1.0 | +0.0000 → +8.4384 | 0.000 → 0.950 | 0.605 → 0.625 | 4 |
+| sft | 1500 | 0.001 | 0.01 | +0.0000 → +1.0109 | 0.000 → 0.710 | 0.605 → 0.715 | 22 |
+| pretrained | 1500 | 0.001 | 0.1 | +0.0000 → +8.4640 | 0.000 → 0.930 | 0.515 → 0.650 | 27 |
+| sft | 1500 | 0.0003 | 0.1 | +0.0000 → +4.1526 | 0.000 → 0.715 | 0.605 → 0.665 | 12 |
+| sft | 3000 | 0.001 | 0.1 | +0.0000 → +5.0101 | 0.000 → 0.920 | 0.605 → 0.665 | 12 |
+
+**验证**
+
+```
+$ python tests/test_dpo.py
+[strip] inject → strip 往返无损
+[strip] merge → strip 保住 SFT 的 ΔW
+[dpo] 初始 margin=+0.000000 loss=0.6931（= log 2）
+[dpo] 闭式校验通过：margin=-0.0124 loss=0.6994
+[dpo] 梯度只到 16 个 LoRA 张量（16 个有梯度）
+[dpo] 一步优化 margin +0.0158 → +0.2230
+[dpo] evaluate_dpo 自洽：dpo_acc=0.750 margin=+0.0798
+[dpo] β=0 边界通过
+test_dpo OK  beta=0.1 loss=0.6994 margin=-0.0124 dpo_acc=0.750
+
+$ python train/train_dpo.py
+[dpo] π_ref = SFT 模型：merge 8 个模块 / strip 8 个模块，base 已含 SFT 的 ΔW
+[dpo] trainable params = 8,704 / 994,560 (0.88%)
+[dpo] BEFORE  margin=+0.0000 ± 0.0000  dpo_acc=0.000  win_rate=0.605  win_rate_per_token=0.745
+[dpo] step    0/1500 loss 0.6931 margin +0.0000 (avg50 +0.0000)
+[dpo] AFTER   margin=+4.6512 ± 4.3952  dpo_acc=0.780  win_rate=0.665  win_rate_per_token=0.900
+[dpo] margin 首50均 +0.1230 → 末50均 +3.2850
+[dpo] saved -> checkpoints\dpo.pt
+
+$ python tests/run_all.py
+[run_all] PASS=12  FAIL=0  TOTAL=12
+
+$ bash init.sh
+  [PASS] Qwen3 DPO smoke（初始 margin=0 + loss=log2）[dpo] 初始 margin=+0.000000 loss=0.6931(=log2)；可训练 8,704/994,560 (0.88%)
+  PASS=25  SKIP=0  FAIL=0
+```
+
+**未解决 / 风险**
+
+- **dpo_acc 与绝对胜率会背离**：强配方 dpo_acc 只有 0.780（弱配方 0.945），
+  但业务指标涨得更多。**dpo_acc 是训练内指标**，评估集 = 训练集的前 200 对。
+- **单对 margin 极端化**：`margin = +4.6512 ± 4.3952`（标准差 > 均值），
+  lr=1e-3 下 DPO 在逐对硬拟合。
+- **笔记缺口**：`Qwen3_BPE_学习笔记.md`（feat-008 补）。
+
+**下一步**
+
+1. `feat-025` 精简评估脚本 → `feat-018` KV Cache 推理与采样 → `feat-017` 与 GPT-2 的退化对照
+2. `feat-008` 笔记↔源码交叉引用（补 BPE 笔记）→ `feat-009` 数字全量核对 → 收班
+
+**本次改动涉及的文件**
+
+`qwen3-learning/qwen3-pytorch/`：`train/train_dpo.py`、`tests/test_dpo.py`、
+`model/common/lora.py`（+strip_lora）、`model/qwen3_dense.py`（**dropout 覆盖修复**）、
+`model/qwen3_moe.py`（**dropout 覆盖修复**）、`tests/test_dense.py`（+回归断言）、
+`tests/test_moe.py`（+回归断言）、`config.py`（dpo_lr / dpo_max_iters / 注释）、
+`qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`（§6.2 / §6.4 / §7 / §8 / §9）、
+`qwen3-learning/qwen3-pytorch开发计划.md`（Task 15 就地换成真代码 + 实测修正记录）、
+仓库根 `init.sh`（L4 +DPO smoke）、`feature_list.json`、`claude-progress.md`、`session-handoff.md`

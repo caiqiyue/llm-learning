@@ -6434,38 +6434,85 @@ git commit -m "feat-023: 从零手写 LoRA（B 零初始化 + base 冻结 + inje
 **Files:**
 - Create: `qwen3-learning/qwen3-pytorch/train/train_dpo.py`
 - Create: `qwen3-learning/qwen3-pytorch/tests/test_dpo.py`
-- Create: `qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`
+- Modify: `qwen3-learning/qwen3-pytorch/model/common/lora.py`（**新增 `strip_lora`**）
+- Modify: `qwen3-learning/qwen3-pytorch/config.py`（`dpo_lr` / `dpo_max_iters`，依据见 Step 4）
+- Modify: `init.sh`（L4 层加一条 DPO smoke）
 - Modify: `feature_list.json`
+- Modify: `qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`（补 §8 的 DPO 半部 + §6.4 的 dropout bug）
 
-- [ ] **Step 1: 写 `train/train_dpo.py`**
+- [x] **Step 1: 给 `model/common/lora.py` 加 `strip_lora`**
+
+```python
+def strip_lora(model: nn.Module) -> int:
+    '''
+    把 LoRALinear 换回普通 nn.Linear，**保留当前 base 权重**。
+    ...
+    '''
+```
+
+> 为什么需要它：DPO 的 π_ref 必须是**SFT 模型**，而 SFT 的 LoRA 权重就躺在
+> `checkpoints/lora.pt` 里。`merge_lora` 把 ΔW 折进 base（base 就成了 SFT 模型），
+> `strip_lora` 把它换回普通 Linear，再 inject 一个**全新**的 LoRA 给 DPO 用 ——
+> 于是「关掉新 LoRA 分支 = π_ref = SFT 模型」，**同一个模型对象**搞定两套策略。
+
+- [x] **Step 2: 写 `train/train_dpo.py`**
 
 ```python
 """
 Qwen3 DPO（Direct Preference Optimization）训练。
 
 用法：
-    python train/train_dpo.py
+    python train/train_dpo.py                 # 默认：π_ref = SFT 模型（标准 DPO）
+    python train/train_dpo.py --ref-mode pretrained   # 消融：π_ref = 预训练模型
 
 【目标函数】
-    L_DPO = -E[ log σ( β * ( (logπ_θ(y_w|x) - logπ_ref(y_w|x))
-                            - (logπ_θ(y_l|x) - logπ_ref(y_l|x)) ) ) ]
+    L_DPO = -E[ log σ( β · ( (logπ_θ(y_w|x) - logπ_ref(y_w|x))
+                           - (logπ_θ(y_l|x) - logπ_ref(y_l|x)) ) ) ]
 
-    其中 β 是 KL 惩罚系数（config.dpo_beta，默认 0.1）
+    β 是 KL 惩罚系数（config.dpo_beta）。
 
-【reference model 的取法 —— 本 Task 最重要的一个技巧】
-    **不单独加载一份冻结模型**。复用同一个 model 对象：
-        开启 LoRA 分支 → π_θ
-        关闭 LoRA 分支 → π_ref（等价于纯预训练权重）
-    既省一份显存与一份 checkpoint，也把这个技巧变成可读的代码。
-    对应 model/common/lora.py 的 set_lora_enabled()。
+    括号里的量就是**隐式奖励的间隔（reward margin）**：
+        r_θ(y) = β · ( logπ_θ(y|x) - logπ_ref(y|x) )
+        margin = r_θ(y_w) - r_θ(y_l)
+    margin > 0 ⇒ 模型相对参考模型更偏爱 chosen。
 
-【与 GPT-2 线的区别】
-    GPT-2 线：SFT → Reward Model → PPO（要显式训一个标量奖励模型）
-    Qwen3 线：DPO 直接吃偏好对，**不训 Reward Model**，也不用 PPO
+【★ reference model 的取法 —— 本 Task 最重要的一个技巧】
+    **不加载第二份权重**。标准 DPO 里 π_ref 是「SFT 模型」，
+    本仓库用三步在同一个模型对象上把它变出来：
+
+        1. 注入 LoRA → 加载 checkpoints/lora.pt（SFT 训好的 base + A/B）
+        2. merge_lora：把 SFT 的 ΔW 折进 base  ⇒ 此时模型 == SFT 模型
+        3. strip_lora：换回普通 nn.Linear，再 inject 一个**全新的** LoRA
+           （B 零初始化 ⇒ π_θ 此刻严格等于 π_ref，margin = 0，loss = log 2）
+
+    之后：
+        set_lora_enabled(model, True)   → π_θ（正在训练）
+        set_lora_enabled(model, False)  → π_ref（= SFT 模型，base 从没被改过）
+
+    ⚠️ **为什么不能「直接关掉 SFT 的 LoRA」当 π_ref**：
+        那样得到的 π_ref 是**预训练模型**，不是 SFT 模型。
+        DPO 的 KL 锚点是 SFT 模型；锚到预训练模型会让 DPO 跟 LoRA SFT 互相拉扯
+        （SFT 刚把 chosen 的 logprob 抬上去，DPO 的 KL 项又往回压）。
+        本仓库把两种做法都实现成 `--ref-mode`，用实测对照来定夺（见笔记 §9）。
+
+【★ 与 GPT-2 线的区别】
+    GPT-2 线：SFT → Reward Model → PPO（要显式训一个标量奖励模型 + 采样 + KL 约束）
+    Qwen3 线：DPO 直接吃偏好对，**不训 Reward Model**，也不用 PPO、不做采样。
+
+【评估指标】
+    margin_mean / margin_std  隐式奖励间隔的均值 / 标准差
+    dpo_acc                   margin > 0 的比例（DPO 自己的「判对率」）
+    win_rate                  π_θ 下 chosen 总 logprob > rejected 的比例（策略口径）
+    win_rate_per_token        长度归一口径（用来监控长度偏置，见笔记 §5）
 """
 
 import argparse
 import os
+import sys
+from typing import Dict, List, Tuple
+
+# 把项目根补进 sys.path（脚本在 train/ 子目录里，sys.path[0] 不是项目根）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn.functional as F
@@ -6473,161 +6520,509 @@ import torch.nn.functional as F
 from config import DENSE_CONFIG
 from data.preference_data import generate_preference_dataset
 from data.tokenizer import BPETokenizer
-from model.common.lora import inject_lora, set_lora_enabled
+from model.common.lora import (
+    inject_lora,
+    mark_only_lora_trainable,
+    merge_lora,
+    set_lora_enabled,
+    strip_lora,
+)
 from model.qwen3_dense import Qwen3Dense
 from train.train_lora import encode_pair
-from utils import get_device, set_seed
+from utils import get_device, save_checkpoint, set_seed
 
 
 def dpo_loss(
-    model: torch.nn.Module,
+    model: "torch.nn.Module",
     pair: dict,
     tk: "BPETokenizer",
     beta: float,
     device: torch.device,
-) -> tuple:
+) -> Tuple["torch.Tensor", "torch.Tensor", Dict[str, float]]:
     """
     算一对 (chosen, rejected) 的 DPO loss。
 
     参数：
-        model:  已注入 LoRA 的模型
-        pair:   {"prompt", "chosen", "rejected"}
+        model:  已注入 DPO 用 LoRA 的模型（base 已被 merge 成 SFT 模型）
+        pair:   {"prompt", "chosen", "rejected", "strategy"}
         tk:     tokenizer
         beta:   KL 惩罚系数
         device: 设备
     返回：
-        (loss, margin)
-            loss:   scalar
-            margin: logπ_θ(y_w) - logπ_θ(y_l)（用于观察奖励间隔）
+        (loss, margin, stats)
+            loss:   scalar tensor，可反向传播
+            margin: scalar tensor = β·[(Δw_θ - Δw_ref) - (Δl_θ - Δl_ref)]，
+                    **带梯度**（它是 loss 的自变量）
+            stats:  标量诊断（lp_w_theta / lp_l_theta / lp_w_ref / lp_l_ref）
     """
-    # --- π_θ：开 LoRA ---
+    # --- π_θ：开 LoRA，带梯度 ---
     set_lora_enabled(model, True)
-    lp_w_theta, lp_l_theta = encode_pair(model, tk, pair, device)
+    (lp_w_theta, _), (lp_l_theta, _) = encode_pair(model, tk, pair, device)
 
-    # --- π_ref：关 LoRA（等价于纯预训练权重）---
+    # --- π_ref：关 LoRA（= base = SFT 模型），不回传 ---
     set_lora_enabled(model, False)
     with torch.no_grad():
-        lp_w_ref, lp_l_ref = encode_pair(model, tk, pair, device)
-
-    # --- 还原到 π_θ，准备回传 ---
+        (lp_w_ref, _), (lp_l_ref, _) = encode_pair(model, tk, pair, device)
+    # 还原成 π_θ，准备回传
     set_lora_enabled(model, True)
 
-    logits = beta * ((lp_w_theta - lp_w_ref) - (lp_l_theta - lp_l_ref))
-    loss = -F.logsigmoid(logits).mean()
-    margin = (lp_w_theta - lp_l_theta).mean()
-    return loss, margin
+    # 隐式奖励：r_θ(y) = β · (logπ_θ(y) - logπ_ref(y))
+    r_w = beta * (lp_w_theta - lp_w_ref)
+    r_l = beta * (lp_l_theta - lp_l_ref)
+    margin = r_w - r_l
+    loss = -F.logsigmoid(margin).mean()
+    stats = {
+        "lp_w_theta": float(lp_w_theta.item()),
+        "lp_l_theta": float(lp_l_theta.item()),
+        "lp_w_ref": float(lp_w_ref.item()),
+        "lp_l_ref": float(lp_l_ref.item()),
+    }
+    return loss, margin.mean(), stats
+
+
+@torch.no_grad()
+def evaluate_dpo(
+    model: "torch.nn.Module",
+    tk: "BPETokenizer",
+    pairs: List[dict],
+    device: torch.device,
+    beta: float,
+    max_samples: int,
+) -> dict:
+    """
+    评估 DPO 训练效果。
+
+    指标：
+        margin_mean / margin_std  隐式奖励间隔的均值 / 标准差
+        dpo_acc                   margin > 0 的比例
+        win_rate                  π_θ 下 chosen 总 logprob > rejected 的比例
+        win_rate_per_token        长度归一口径
+        by_strategy               按「变差策略」分组的 dpo_acc
+
+    参数：
+        model:       模型
+        tk:          tokenizer
+        pairs:       偏好对列表
+        device:      设备
+        beta:        KL 惩罚系数
+        max_samples: 最多评估多少对
+    返回：
+        指标字典
+    """
+    was_training = model.training
+    model.eval()
+    rows = []
+    for pair in pairs[:max_samples]:
+        set_lora_enabled(model, True)
+        (lp_w, n_w), (lp_l, n_l) = encode_pair(model, tk, pair, device)
+        set_lora_enabled(model, False)
+        (lp_w_ref, _), (lp_l_ref, _) = encode_pair(model, tk, pair, device)
+        set_lora_enabled(model, True)
+        margin = float(beta * ((lp_w - lp_w_ref) - (lp_l - lp_l_ref)).item())
+        rows.append((margin, float(lp_w.item()), float(lp_l.item()),
+                     n_w, n_l, pair.get("strategy", "?")))
+
+    n = max(1, len(rows))
+    margins = [r[0] for r in rows]
+    mean = sum(margins) / n
+    var = sum((m - mean) ** 2 for m in margins) / n
+    by_strategy = {}
+    for s in sorted({r[5] for r in rows}):
+        sub = [r for r in rows if r[5] == s]
+        by_strategy[s] = {
+            "n": len(sub),
+            "dpo_acc": sum(1 for r in sub if r[0] > 0) / max(1, len(sub)),
+            "margin_mean": sum(r[0] for r in sub) / max(1, len(sub)),
+            "win_rate": sum(1 for r in sub if r[1] > r[2]) / max(1, len(sub)),
+        }
+    out = {
+        "margin_mean": mean,
+        "margin_std": var ** 0.5,
+        "dpo_acc": sum(1 for m in margins if m > 0) / n,
+        "win_rate": sum(1 for r in rows if r[1] > r[2]) / n,
+        "win_rate_per_token": sum(
+            1 for r in rows if r[1] / max(1, r[3]) > r[2] / max(1, r[4])) / n,
+        "by_strategy": by_strategy,
+    }
+    if was_training:
+        model.train()
+    return out
+
+
+def print_eval(tag: str, m: dict) -> None:
+    """
+    打印一组 DPO 评估指标。
+
+    参数：
+        tag: 标签（如 BEFORE / AFTER）
+        m:   evaluate_dpo 的返回值
+    """
+    print(f"[dpo] {tag:<7} margin={m['margin_mean']:+.4f} ± {m['margin_std']:.4f}  "
+          f"dpo_acc={m['dpo_acc']:.3f}  win_rate={m['win_rate']:.3f}  "
+          f"win_rate_per_token={m['win_rate_per_token']:.3f}")
+    for s, v in sorted(m["by_strategy"].items()):
+        print(f"[dpo]   {s:<14} n={v['n']:<4} dpo_acc={v['dpo_acc']:.3f}  "
+              f"margin={v['margin_mean']:+.4f}  win_rate={v['win_rate']:.3f}")
+
+
+def build_policy(
+    ckpt_path: str,
+    tk: "BPETokenizer",
+    device: torch.device,
+    ref_mode: str,
+) -> "torch.nn.Module":
+    """
+    构造 DPO 的策略模型（**同时也是 π_ref**，靠开关分支切换）。
+
+    ref_mode:
+        "sft"         π_ref = LoRA SFT 后的模型（标准 DPO）
+        "pretrained"  π_ref = 纯预训练模型（消融：跳过 SFT 直接 DPO）
+
+    返回：
+        注入好「全新 LoRA」的模型；此时 B=0 ⇒ π_θ == π_ref，margin = 0
+    """
+    cfg = DENSE_CONFIG
+    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0).to(device)
+
+    if ref_mode == "sft":
+        # --- 1) 先注入 LoRA，才能加载 lora.pt（它的 state_dict 是注入后的键名）---
+        inject_lora(model, cfg.lora_target_modules, r=cfg.lora_r, alpha=cfg.lora_alpha)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"], strict=True)
+        # --- 2) 把 SFT 的 ΔW 折进 base ⇒ 模型 == SFT 模型 ---
+        merged = merge_lora(model)
+        # --- 3) 换回普通 Linear，再注入一个**全新**的 LoRA 给 DPO 用 ---
+        stripped = strip_lora(model)
+        inject_lora(model, cfg.lora_target_modules, r=cfg.lora_r, alpha=cfg.lora_alpha)
+        print(f"[dpo] π_ref = SFT 模型：merge {merged} 个模块 / strip {stripped} 个模块，"
+              f"base 已含 SFT 的 ΔW")
+    elif ref_mode == "pretrained":
+        # π_ref = 纯预训练模型：不加载 lora.pt，直接在预训练权重上注入新 LoRA
+        ckpt = torch.load(os.path.join("checkpoints", "pretrain_dense.pt"),
+                          map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"], strict=True)
+        inject_lora(model, cfg.lora_target_modules, r=cfg.lora_r, alpha=cfg.lora_alpha)
+        print(f"[dpo] π_ref = 预训练模型（消融：跳过 SFT）")
+    else:
+        raise ValueError(f"ref_mode 只能是 'sft' 或 'pretrained'，实得 {ref_mode}")
+
+    return model
 
 
 def main() -> None:
     """DPO 训练主流程。"""
     parser = argparse.ArgumentParser(description="Qwen3 DPO 训练")
     parser.add_argument("--max-iters", type=int, default=None, help="覆盖 config 的 dpo_max_iters")
+    parser.add_argument("--ref-mode", type=str, default="sft", choices=["sft", "pretrained"],
+                        help="π_ref 用 SFT 模型（默认）还是预训练模型（消融）")
+    parser.add_argument("--beta", type=float, default=None, help="覆盖 config 的 dpo_beta")
     args = parser.parse_args()
 
     cfg = DENSE_CONFIG
     max_iters = args.max_iters if args.max_iters is not None else cfg.dpo_max_iters
+    beta = args.beta if args.beta is not None else cfg.dpo_beta
 
     set_seed(cfg.seed)
     device = get_device()
-    print(f"[dpo] device={device} max_iters={max_iters} beta={cfg.dpo_beta}")
+    print(f"[dpo] device={device} max_iters={max_iters} beta={beta} ref_mode={args.ref_mode}")
 
     tk = BPETokenizer(os.path.join("data", "vocab.json"), os.path.join("data", "merges.txt"))
 
-    # --- 加载 LoRA 微调后的权重 ---
-    model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=cfg, dropout=0.0).to(device)
-    ckpt = torch.load(os.path.join("checkpoints", "lora.pt"), map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state"], strict=False)
-    inject_lora(model, cfg.lora_target_modules, r=cfg.lora_r, alpha=cfg.lora_alpha)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    print(f"[dpo] trainable params = {sum(p.numel() for p in trainable):,}")
+    # --- 构造 π_θ / π_ref ---
+    ckpt_path = os.path.join("checkpoints", "lora.pt")
+    if args.ref_mode == "sft" and not os.path.exists(ckpt_path):
+        print(f"[dpo] 找不到 {ckpt_path}，请先跑：python train/train_lora.py")
+        return
+    model = build_policy(ckpt_path, tk, device, args.ref_mode)
+
+    # --- 只训 LoRA（其余全部冻结）---
+    trainable = mark_only_lora_trainable(model)
+    n_trainable = sum(p.numel() for p in trainable)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"[dpo] trainable params = {n_trainable:,} / {n_total:,} ({n_trainable/n_total:.2%})")
 
     pairs = generate_preference_dataset(n_samples=cfg.dpo_n_pairs, seed=cfg.seed)
+    print(f"[dpo] preference pairs = {len(pairs)}")
+
+    # --- 训练前的基线：B=0 ⇒ π_θ == π_ref ⇒ margin 必为 0 ---
+    before = evaluate_dpo(model, tk, pairs, device, beta, cfg.eval_max_samples)
+    print_eval("BEFORE", before)
+    assert abs(before["margin_mean"]) < 1e-4, \
+        f"初始 margin 应为 0（B 零初始化 ⇒ π_θ == π_ref），实得 {before['margin_mean']}"
+
     optimizer = torch.optim.AdamW(trainable, lr=cfg.dpo_lr, weight_decay=cfg.weight_decay)
 
-    margins = []
+    # --- 训练 ---
     model.train()
     step = 0
-    for _epoch in range(max_iters // max(1, len(pairs)) + 1):
+    margins: List[float] = []
+    losses: List[float] = []
+    while step < max_iters:
         for pair in pairs:
             if step >= max_iters:
                 break
-            loss, margin = dpo_loss(model, pair, tk, cfg.dpo_beta, device)
+            loss, margin, _ = dpo_loss(model, pair, tk, beta, device)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
             optimizer.step()
 
             margins.append(float(margin.item()))
-            if step % 50 == 0:
-                recent = sum(margins[-50:]) / len(margins[-50:])
+            losses.append(float(loss.item()))
+            if step % cfg.log_every == 0:
+                recent = sum(margins[-cfg.log_every:]) / max(1, len(margins[-cfg.log_every:]))
                 print(f"[dpo] step {step:>4}/{max_iters} loss {loss.item():.4f} "
-                      f"margin {margin.item():.4f} (avg50 {recent:.4f})")
+                      f"margin {margin.item():+.4f} (avg{cfg.log_every} {recent:+.4f})")
             step += 1
-        if step >= max_iters:
-            break
 
     # --- 评估 ---
-    first = sum(margins[:50]) / max(1, len(margins[:50]))
-    last = sum(margins[-50:]) / max(1, len(margins[-50:]))
-    print(f"[dpo] margin 首50均 {first:.4f} → 末50均 {last:.4f}")
+    after = evaluate_dpo(model, tk, pairs, device, beta, cfg.eval_max_samples)
+    print_eval("AFTER", after)
+    print(f"[dpo] margin 首{cfg.log_every}均 {sum(margins[:cfg.log_every])/max(1,len(margins[:cfg.log_every])):+.4f} "
+          f"→ 末{cfg.log_every}均 {sum(margins[-cfg.log_every:])/max(1,len(margins[-cfg.log_every:])):+.4f}")
 
-    os.makedirs("checkpoints", exist_ok=True)
-    out = os.path.join("checkpoints", "dpo.pt")
-    torch.save({"model_state": model.state_dict(), "margin_first": first, "margin_last": last}, out)
-    print(f"[dpo] saved -> {out}")
+    # --- 落盘 ---
+    path = save_checkpoint(
+        {"model_state": model.state_dict(),
+         "vocab_size": tk.vocab_size,
+         "ref_mode": args.ref_mode,
+         "beta": beta,
+         "metrics": {"before": before, "after": after},
+         "margin_before": before["margin_mean"],
+         "margin_after": after["margin_mean"],
+         "dpo_acc": after["dpo_acc"],
+         "config": cfg.to_dict()},
+        os.path.join("checkpoints", "dpo.pt"),
+    )
+    print(f"[dpo] saved -> {path}")
 
 
 if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 2: 写 `tests/test_dpo.py`**
+- [x] **Step 3: 写 `tests/test_dpo.py`**
 
 ```python
 """
-DPO smoke：loss 有限、π_ref 与 π_θ 不同、margin 可计算。
+DPO smoke：目标函数的闭式正确性、π_θ / π_ref 机制、梯度只到 LoRA、strip/merge 往返。
+
+对应 feat-024（开发计划 Task 15）。
 
 运行：python tests/test_dpo.py
 """
 
+import os
+import sys
+
 import torch
+import torch.nn.functional as F
+
+# 直接执行 `python tests/test_dpo.py` 时 sys.path[0] 是 tests/ 目录，
+# 找不到项目根下的 config.py / model 包 —— 这里把项目根补进 sys.path。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import DENSE_CONFIG
 from data.preference_data import generate_preference_dataset
 from data.tokenizer import BPETokenizer
-from model.common.lora import inject_lora, set_lora_enabled
+from model.common.lora import (
+    LoRALinear,
+    inject_lora,
+    lora_parameters,
+    mark_only_lora_trainable,
+    merge_lora,
+    set_lora_enabled,
+    strip_lora,
+)
 from model.qwen3_dense import Qwen3Dense
-from train.train_dpo import dpo_loss
+from train.train_dpo import dpo_loss, evaluate_dpo
+from train.train_lora import encode_pair
 
 torch.manual_seed(DENSE_CONFIG.seed)
 
+BETA = DENSE_CONFIG.dpo_beta
+
 tk = BPETokenizer("data/vocab.json", "data/merges.txt")
 pairs = generate_preference_dataset(n_samples=8, seed=DENSE_CONFIG.seed)
-
 V = tk.vocab_size
+device = torch.device("cpu")
+
+# =====================================================================
+# 1) strip_lora 的往返：inject → strip 应当回到普通 nn.Linear，
+#    且权重与「注入前的 base」完全一致
+# =====================================================================
 model = Qwen3Dense(vocab_size=V, cfg=DENSE_CONFIG, dropout=0.0)
-inject_lora(model, DENSE_CONFIG.lora_target_modules, r=DENSE_CONFIG.lora_r,
-            alpha=DENSE_CONFIG.lora_alpha)
+model.eval()
+idx = torch.randint(0, V, (2, 8))
+with torch.no_grad():
+    plain_logits = model(idx)[0]
 
-loss, margin = dpo_loss(model, pairs[0], tk, DENSE_CONFIG.dpo_beta, torch.device("cpu"))
-assert torch.isfinite(loss), f"loss 非有限: {loss}"
-assert torch.isfinite(margin), f"margin 非有限: {margin}"
-assert loss.item() > 0, "DPO loss 应为正"
+replaced = inject_lora(model, DENSE_CONFIG.lora_target_modules,
+                       r=DENSE_CONFIG.lora_r, alpha=DENSE_CONFIG.lora_alpha)
+n_stripped = strip_lora(model)
+assert n_stripped == len(replaced), f"strip 的模块数应与注入数一致：{n_stripped} vs {len(replaced)}"
+assert not any(isinstance(m, LoRALinear) for m in model.modules()), "strip 后不应再有 LoRALinear"
+with torch.no_grad():
+    stripped_logits = model(idx)[0]
+assert torch.allclose(plain_logits, stripped_logits, atol=1e-6), \
+    "inject → strip（B=0，未 merge）应当回到注入前的输出"
+print("[strip] inject → strip 往返无损")
 
-# π_ref 与 π_θ 必须不同（否则 LoRA 分支没生效）
-idx = torch.randint(0, V, (1, 8))
+# =====================================================================
+# 2) merge → strip：SFT 的 ΔW 被折进 base，模型仍与「开着 LoRA」等价
+# =====================================================================
+model = Qwen3Dense(vocab_size=V, cfg=DENSE_CONFIG, dropout=0.0)
+model.eval()
+inject_lora(model, DENSE_CONFIG.lora_target_modules,
+            r=DENSE_CONFIG.lora_r, alpha=DENSE_CONFIG.lora_alpha)
+# 把 B 训成非零，模拟「SFT 学到了东西」
+with torch.no_grad():
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            m.lora_B.normal_(0, 0.02)
+set_lora_enabled(model, True)
+with torch.no_grad():
+    logits_on = model(idx)[0]
+assert merge_lora(model) > 0, "merge_lora 应至少合并一个模块"
+assert strip_lora(model) > 0, "strip_lora 应至少替换一个模块"
+with torch.no_grad():
+    logits_merged = model(idx)[0]
+assert torch.allclose(logits_on, logits_merged, atol=1e-4), \
+    f"merge + strip 后应与「开着 LoRA」等价，最大差异 {float((logits_on - logits_merged).abs().max())}"
+print("[strip] merge → strip 保住 SFT 的 ΔW")
+
+# =====================================================================
+# 3) DPO 初始状态：B 零初始化 ⇒ π_θ == π_ref ⇒ margin = 0、loss = log 2
+# =====================================================================
+model = Qwen3Dense(vocab_size=V, cfg=DENSE_CONFIG, dropout=0.0)
+model.eval()
+inject_lora(model, DENSE_CONFIG.lora_target_modules,
+            r=DENSE_CONFIG.lora_r, alpha=DENSE_CONFIG.lora_alpha)
 set_lora_enabled(model, True)
 with torch.no_grad():
     a = model(idx)[0]
 set_lora_enabled(model, False)
 with torch.no_grad():
     b = model(idx)[0]
-assert not torch.allclose(a, b, atol=1e-6), "开关 LoRA 分支后输出应不同"
+assert torch.allclose(a, b, atol=1e-6), "B 零初始化时开关 LoRA 分支输出应相同"
 
-print(f"test_dpo OK  loss={loss.item():.4f} margin={margin.item():.4f}")
+loss, margin, stats = dpo_loss(model, pairs[0], tk, BETA, device)
+assert torch.isfinite(loss), f"loss 非有限: {loss}"
+assert torch.isfinite(margin), f"margin 非有限: {margin}"
+assert abs(float(margin.item())) < 1e-4, \
+    f"初始 margin 应为 0（π_θ == π_ref），实得 {float(margin.item())}"
+assert abs(float(loss.item()) - float(torch.log(torch.tensor(2.0)))) < 1e-4, \
+    f"初始 loss 应为 log 2 = {float(torch.log(torch.tensor(2.0))):.4f}，实得 {float(loss.item())}"
+print(f"[dpo] 初始 margin={float(margin.item()):+.6f} loss={float(loss.item()):.4f}（= log 2）")
+
+# =====================================================================
+# 4) 目标函数的闭式正确性：手工算一遍，和 dpo_loss 的返回值逐位对上
+# =====================================================================
+# 把 B 调成非零，让 π_θ ≠ π_ref
+with torch.no_grad():
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            m.lora_B.normal_(0, 0.02)
+
+pair = pairs[0]
+set_lora_enabled(model, True)
+(lp_w_theta, _), (lp_l_theta, _) = encode_pair(model, tk, pair, device)
+set_lora_enabled(model, False)
+with torch.no_grad():
+    (lp_w_ref, _), (lp_l_ref, _) = encode_pair(model, tk, pair, device)
+set_lora_enabled(model, True)
+
+expect_margin = BETA * ((lp_w_theta - lp_w_ref) - (lp_l_theta - lp_l_ref))
+expect_loss = -F.logsigmoid(expect_margin).mean()
+loss2, margin2, stats2 = dpo_loss(model, pair, tk, BETA, device)
+assert torch.allclose(margin2, expect_margin, atol=1e-5), \
+    f"margin 与闭式不符：{float(margin2)} vs {float(expect_margin)}"
+assert torch.allclose(loss2, expect_loss, atol=1e-5), \
+    f"loss 与闭式不符：{float(loss2)} vs {float(expect_loss)}"
+# stats 里的 logprob 也要对得上
+assert abs(stats2["lp_w_theta"] - float(lp_w_theta.item())) < 1e-3
+assert abs(stats2["lp_l_ref"] - float(lp_l_ref.item())) < 1e-3
+print(f"[dpo] 闭式校验通过：margin={float(margin2):+.4f} loss={float(loss2):.4f}")
+
+# =====================================================================
+# 5) 梯度只到 LoRA 参数
+# =====================================================================
+trainable = mark_only_lora_trainable(model)
+assert len(trainable) > 0
+for p in model.parameters():
+    is_lora = any(p is q for q in trainable)
+    assert p.requires_grad == is_lora, "非 LoRA 参数必须冻结"
+loss2.backward()
+for p in trainable:
+    assert p.grad is not None, "LoRA 参数应有梯度"
+    assert torch.isfinite(p.grad).all(), "梯度应有限"
+n_with_grad = sum(1 for p in model.parameters() if p.grad is not None)
+assert n_with_grad == len(trainable), \
+    f"只有 LoRA 参数该有梯度：{n_with_grad} vs {len(trainable)}"
+print(f"[dpo] 梯度只到 {len(trainable)} 个 LoRA 张量（{n_with_grad} 个有梯度）")
+
+# =====================================================================
+# 6) 一步优化后 margin 应该上升（最小可跑训练）
+# =====================================================================
+model.zero_grad(set_to_none=True)
+opt = torch.optim.AdamW(trainable, lr=1e-3)
+margins_before = []
+margins_after = []
+for p in pairs[:4]:
+    l, m, _ = dpo_loss(model, p, tk, BETA, device)
+    margins_before.append(float(m.item()))
+    opt.zero_grad(set_to_none=True)
+    l.backward()
+    opt.step()
+for p in pairs[:4]:
+    l, m, _ = dpo_loss(model, p, tk, BETA, device)
+    margins_after.append(float(m.item()))
+avg_b = sum(margins_before) / len(margins_before)
+avg_a = sum(margins_after) / len(margins_after)
+assert avg_a > avg_b, f"一步优化后 margin 应上升：{avg_b:+.4f} → {avg_a:+.4f}"
+print(f"[dpo] 一步优化 margin {avg_b:+.4f} → {avg_a:+.4f}")
+
+# =====================================================================
+# 7) evaluate_dpo 的指标自洽：dpo_acc 与 margin 的符号一致
+# =====================================================================
+m_eval = evaluate_dpo(model, tk, pairs, device, BETA, max_samples=8)
+assert 0.0 <= m_eval["dpo_acc"] <= 1.0
+assert 0.0 <= m_eval["win_rate"] <= 1.0
+assert m_eval["margin_std"] >= 0.0
+assert set(m_eval["by_strategy"].keys()), "应按策略分组"
+# 逐条复算 dpo_acc，验证与实现一致
+manual = 0
+for pair in pairs[:8]:
+    set_lora_enabled(model, True)
+    (lp_w, _), (lp_l, _) = encode_pair(model, tk, pair, device)
+    set_lora_enabled(model, False)
+    (lp_w_ref, _), (lp_l_ref, _) = encode_pair(model, tk, pair, device)
+    set_lora_enabled(model, True)
+    margin = float(BETA * ((lp_w - lp_w_ref) - (lp_l - lp_l_ref)).item())
+    manual += 1 if margin > 0 else 0
+assert abs(m_eval["dpo_acc"] - manual / 8) < 1e-6, \
+    f"dpo_acc 与逐条复算不符：{m_eval['dpo_acc']} vs {manual/8}"
+print(f"[dpo] evaluate_dpo 自洽：dpo_acc={m_eval['dpo_acc']:.3f} margin={m_eval['margin_mean']:+.4f}")
+
+# =====================================================================
+# 8) 边界：β = 0 ⇒ margin 恒为 0、loss 恒为 log 2
+# =====================================================================
+loss0, margin0, _ = dpo_loss(model, pair, tk, 0.0, device)
+assert abs(float(margin0.item())) < 1e-6, "β=0 时 margin 应为 0"
+assert abs(float(loss0.item()) - float(torch.log(torch.tensor(2.0)))) < 1e-4, \
+    "β=0 时 loss 应恒为 log 2"
+print("[dpo] β=0 边界通过")
+
+# =====================================================================
+# 9) lora_parameters 与 mark_only_lora_trainable 返回同一批参数
+# =====================================================================
+assert len(lora_parameters(model)) == len(trainable), "两个 helper 应返回同一批参数"
+
+print(f"test_dpo OK  beta={BETA} loss={float(loss2):.4f} margin={float(margin2):+.4f} "
+      f"dpo_acc={m_eval['dpo_acc']:.3f}")
 ```
 
-- [ ] **Step 3: 运行**
+- [x] **Step 4: 运行 + 消融**
 
 ```bash
 cd qwen3-learning/qwen3-pytorch
@@ -6635,25 +7030,199 @@ python tests/test_dpo.py
 python train/train_dpo.py
 ```
 
-Expected: `test_dpo OK  loss=... margin=...`；训练中 `margin` 的 50 步滑动均值**上升**。
+实测输出（2026-10-22，CPU）：
 
-- [ ] **Step 4: 写笔记**
+```
+$ python tests/test_dpo.py
+[strip] inject → strip 往返无损
+[strip] merge → strip 保住 SFT 的 ΔW
+[dpo] 初始 margin=+0.000000 loss=0.6931（= log 2）
+[dpo] 闭式校验通过：margin=-0.0124 loss=0.6994
+[dpo] 梯度只到 16 个 LoRA 张量（16 个有梯度）
+[dpo] 一步优化 margin +0.0158 → +0.2230
+[dpo] evaluate_dpo 自洽：dpo_acc=0.750 margin=+0.0798
+[dpo] β=0 边界通过
+test_dpo OK  beta=0.1 loss=0.6994 margin=-0.0124 dpo_acc=0.750
 
-新增 `Qwen3_LoRA与DPO_学习笔记.md`（当前 7 篇笔记没有覆盖 LoRA / DPO），
-写清：LoRA 公式与 B 零初始化理由、DPO 目标函数推导、π_ref 复用同一模型对象的技巧。
+$ python train/train_dpo.py
+[dpo] device=cpu max_iters=1500 beta=0.1 ref_mode=sft
+[dpo] π_ref = SFT 模型：merge 8 个模块 / strip 8 个模块，base 已含 SFT 的 ΔW
+[dpo] trainable params = 8,704 / 994,560 (0.88%)
+[dpo] BEFORE  margin=+0.0000 ± 0.0000  dpo_acc=0.000  win_rate=0.605  win_rate_per_token=0.745
+[dpo] step    0/1500 loss 0.6931 margin +0.0000 (avg50 +0.0000)
+[dpo] AFTER   margin=+4.6512 ± 4.3952  dpo_acc=0.780  win_rate=0.665  win_rate_per_token=0.900
+[dpo]   noisy          n=43   dpo_acc=0.767  margin=+4.1993  win_rate=0.767
+[dpo]   too_short      n=47   dpo_acc=0.277  margin=-0.4568  win_rate=0.000
+[dpo]   unrelated      n=66   dpo_acc=1.000  margin=+8.0222  win_rate=0.848
+[dpo]   wrong_entity   n=44   dpo_acc=1.000  margin=+5.4928  win_rate=1.000
+[dpo] margin 首50均 +0.1230 → 末50均 +3.2850
+[dpo] saved -> checkpoints\dpo.pt
+```
 
-- [ ] **Step 5: Commit**
+**★ 关键观察一：BEFORE 的 margin 恰好是 0.0000，第 0 步的 loss 恰好是 0.6931。**
+这不是巧合，是构造保证的：B 零初始化 ⇒ π_θ 严格等于 π_ref ⇒ 间隔恒为 0 ⇒
+loss 恒为 log 2 = 0.6931。`train_dpo.py` 里有一条 assert 守着它，
+`tests/test_dpo.py` 第 3 条与 `init.sh` 的 DPO smoke 也各守一次。
+
+**★ 关键观察二：BEFORE 的 win_rate = 0.605，与 LoRA SFT 跑完时的 0.605 完全一致。**
+这说明 **merge → strip 的往返没有丢掉 SFT 学到的东西** ——
+SFT 模型被完整地搬进了 DPO 的 base 里。（若 merge / strip 有半点误差，这个数会漂。）
+
+**★ 关键观察三：margin 和绝对胜率不是一回事。**
+强配方（1500 步 / lr 1e-3）下 margin +4.65、绝对 win_rate 0.605 → 0.665（翻转 12/200）；
+弱配方（300 步 / lr 1e-4）下 margin +0.28、dpo_acc 0.945，绝对 win_rate 却 **0/200 翻转**。
+**报告时必须同时给目标口径（margin）与业务口径（win_rate）。**
+
+**★ 关键观察四：`too_short` 子集被强配方训坏了**（dpo_acc 1.000 → 0.277，margin 变负）。
+弱配方下 DPO 判它判得很对，强配方下反而判错 72%。
+**DPO 减掉 π_ref 的长度偏置之后，会按新目标重新造一个偏置。**
+
+**★ 消融表（步数 / lr / β / π_ref 取法）**
+
+| π_ref | 步数 | lr | β | reward margin | dpo_acc | 绝对 win_rate | 翻转数 |
+|---|---|---|---|---|---|---|---|
+| sft | 300 | 0.0001 | 0.1 | +0.0000 → +0.2831 | 0.000 → 0.945 | 0.605 → 0.605 | 0 |
+| sft | 1500 | 0.0001 | 0.1 | +0.0000 → +1.6338 | 0.000 → 0.710 | 0.605 → 0.630 | 5 |
+| sft | 1500 | 0.001 | 0.1 | +0.0000 → +4.6512 | 0.000 → 0.780 | 0.605 → 0.665 | 12 |
+| sft | 1500 | 0.001 | 1.0 | +0.0000 → +8.4384 | 0.000 → 0.950 | 0.605 → 0.625 | 4 |
+| sft | 1500 | 0.001 | 0.01 | +0.0000 → +1.0109 | 0.000 → 0.710 | 0.605 → 0.715 | 22 |
+| pretrained | 1500 | 0.001 | 0.1 | +0.0000 → +8.4640 | 0.000 → 0.930 | 0.515 → 0.650 | 27 |
+| sft | 1500 | 0.0003 | 0.1 | +0.0000 → +4.1526 | 0.000 → 0.715 | 0.605 → 0.665 | 12 |
+| sft | 3000 | 0.001 | 0.1 | +0.0000 → +5.0101 | 0.000 → 0.920 | 0.605 → 0.665 | 12 |
+
+**★ 结论（写进笔记 §8）**
+
+1. **DPO 的目标函数实现是对的**（闭式校验 + 初始 loss = log 2 + 梯度只到 LoRA）。
+2. **π_ref 用 SFT 模型（标准做法）与用预训练模型都能把业务指标推上去**，
+   终点几乎一样（0.665 vs 0.650）。但两行的 margin 参照系不同、起点基线也不同，
+   不可直接比大小；**默认仍取 `--ref-mode sft`**（标准做法更稳）。
+3. **「DPO 指标涨了但绝对胜率没动」是可复现的**（弱配方 0/200 翻转），
+   根因是间隔推得不够远（+0.28），而不是 DPO 没用。
+4. **dpo_acc 是训练内指标**（评估集 = 训练集的前 200 对），不能当泛化能力。
+
+- [x] **Step 5: 挂进 `init.sh` 的 L4 层**
+
+L4 增加一条 DPO smoke：初始 margin 必须为 0、loss 必须为 log 2、可训练参数占比 < 10%。
 
 ```bash
-git add qwen3-learning/
-git commit -m "feat-024: 从零手写 DPO（π_ref 复用同一模型对象 + 关 LoRA 分支）"
+  # --- DPO smoke（feat-024）：初始 margin=0（π_θ == π_ref）+ loss=log2 + 只训 LoRA ---
+  if [ -f "$QWEN_DIR/train/train_dpo.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_dpo.log 2>&1
+import torch
+from config import DENSE_CONFIG
+from data.preference_data import generate_preference_dataset
+from data.tokenizer import BPETokenizer
+from model.common.lora import inject_lora, mark_only_lora_trainable
+from model.qwen3_dense import Qwen3Dense
+from train.train_dpo import dpo_loss
+
+tk = BPETokenizer("data/vocab.json", "data/merges.txt")
+pairs = generate_preference_dataset(n_samples=4, seed=DENSE_CONFIG.seed)
+
+model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=DENSE_CONFIG, dropout=0.0)
+model.eval()
+inject_lora(model, DENSE_CONFIG.lora_target_modules, r=DENSE_CONFIG.lora_r,
+            alpha=DENSE_CONFIG.lora_alpha)
+trainable = mark_only_lora_trainable(model)
+
+loss, margin, _ = dpo_loss(model, pairs[0], tk, DENSE_CONFIG.dpo_beta, torch.device("cpu"))
+# B 零初始化 ⇒ π_θ 严格等于 π_ref ⇒ margin 必为 0、loss 必为 log 2
+assert abs(float(margin.item())) < 1e-4, f"初始 margin 应为 0，实得 {float(margin.item())}"
+assert abs(float(loss.item()) - 0.6931472) < 1e-4, f"初始 loss 应为 log 2，实得 {float(loss.item())}"
+assert torch.isfinite(loss), "loss 非有限"
+
+n_train = sum(p.numel() for p in trainable)
+n_all = sum(p.numel() for p in model.parameters())
+assert n_train < n_all * 0.1, f"可训练参数应远小于总参数：{n_train}/{n_all}"
+print(f"[dpo] 初始 margin={float(margin.item()):+.6f} loss={float(loss.item()):.4f}(=log2)；"
+      f"可训练 {n_train:,}/{n_all:,} ({n_train/n_all:.2%})")
+PY
+    )
+    ...
+  fi
+```
+
+实测输出：
+
+```
+  [PASS] Qwen3 DPO smoke（初始 margin=0 + loss=log2）[dpo] 初始 margin=+0.000000 loss=0.6931(=log2)；可训练 8,704/994,560 (0.88%)
+  PASS=25  SKIP=0  FAIL=0
+```
+
+- [x] **Step 6: 实测修正记录（初稿的 9 个真 bug）**
+
+1. **`train/train_dpo.py` 缺 sys.path 引导** → `ModuleNotFoundError: No module named 'config'`
+   （脚本在 `train/` 子目录里）。修法同 Task 13 / 14。
+2. **`tests/test_dpo.py` 缺 sys.path 引导** → 直接跑会 `ModuleNotFoundError`。
+3. **★ `load_state_dict(ckpt["model_state"], strict=False)` 会静默把权重加载丢掉**：
+   `checkpoints/lora.pt` 的 state_dict 是**注入 LoRA 之后**的键名
+   （`blocks.0.attn.q_proj.base.weight` / `.lora_A` / `.lora_B`），
+   而初稿是先 `load_state_dict` 到**没注入**的模型上 ——
+   于是 `q_proj` / `v_proj` / 全部 LoRA 参数**一个都没加载上**，
+   `strict=False` 又不会报错，**模型静默地变成了随机初始化的 q/v**。
+   修法：`strict=True` + **先 inject 再 load**（键名对得上）。
+4. **★ `trainable = [p for p in model.parameters() if p.requires_grad]`** ——
+   与 feat-023 同一个坑：`inject_lora` 只冻结被包装的那一个 Linear，
+   embedding / Norm / MLP / lm_head 仍可训 ⇒ 「DPO 只训 LoRA」悄悄变成「几乎全参」。
+   修法：改用 `mark_only_lora_trainable(model)`。
+5. **★ ★ 最严重的一个：初稿的 π_ref 是「预训练模型」，不是「SFT 模型」。**
+   初稿加载完 lora.pt 之后**没有 merge**，直接 inject 了一个新 LoRA ——
+   于是「关掉 LoRA 分支」得到的是**纯预训练模型**。
+   但 DPO 的 KL 锚点按定义是 **SFT 模型**（DPO 从 SFT 出发，锚回 SFT）。
+   锚到预训练模型 ⇒ DPO 会跟刚做完的 LoRA SFT 互相拉扯
+   （SFT 刚把 chosen 的 logprob 抬上去，DPO 的 KL 项又往回压）。
+   修法：引入 `strip_lora`，走 **merge → strip → 重新 inject** 三步，
+   让 base 变成 SFT 模型，新 LoRA 只承载 DPO 的增量。
+   **这一条初稿自己看不出来 —— 它跑得通、loss 也降，但锚错了模型。**
+6. **★ `os.makedirs` + `torch.save` 手写落盘** → 违反「工具函数统一放 utils.py」的既有约定，
+   改用 `utils.save_checkpoint`（自动建目录 + 统一格式）。
+7. **`step % 50` 硬编码** → 违反「超参一律从 config.py 读」，改用 `cfg.log_every`。
+8. **★ 评估指标不满足 feat-024 的验证项**：
+   初稿只打印 `margin 首50均 → 末50均`，缺 **margin 标准差** 与 **chosen>rejected 准确率**。
+   修法：`evaluate_dpo` 增加 `margin_std` / `dpo_acc` / `by_strategy`。
+9. **初稿的 margin 定义不完整**：初稿的 `margin = (lp_w_theta - lp_l_theta).mean()`
+   是**策略口径**的 logprob 差，**没有减 π_ref**，不是 DPO 的 reward margin。
+   修法：margin 定义为 `β·[(Δw_θ - Δw_ref) - (Δl_θ - Δl_ref)]`，
+   也就是 DPO 损失的自变量本身。
+
+**附带**：`config.py` 的 `dpo_lr` / `dpo_max_iters` 按 Step 4 的消融表调整
+（`dpo_lr` 1e-4 → **1e-3**，`dpo_max_iters` 300 → **1500**，`dpo_beta` 保持 0.1）。
+
+**教训**：DPO 这类「两个模型、两个目标」的算法里，
+**「参考模型到底是哪一个」是最容易搞错、而且最不容易被发现的 bug** ——
+它不会让代码崩、不会让 loss 变 NaN，只是让整个实验锚在错的基线上。
+**所以「π_ref 到底是什么」必须有一条可运行断言来钉**（本仓库用的是「初始 margin 恒为 0」）。
+
+- [x] **Step 7: 顺带修掉一个模型层的静默 bug（dropout 覆盖没传到 Block）**
+
+做消融时发现同一份 DPO 配方跑两遍 margin 差 0.028。追下去发现根因在模型层：
+
+- `Qwen3Dense.__init__` / `Qwen3MoE.__init__` 算了覆盖值 `d`，
+  却只把它给了 `self.drop`（embedding 的 Dropout），
+  **Block 里写的是 `dropout=cfg.dropout`** ⇒ `dropout=0.0` 只关掉了一半；
+- 注意力/MLP 的 Dropout 一直是 `p=0.1`，而 **p>0 的 Dropout 在 train 模式下会推进全局 torch RNG**
+  （实测：p=0.0 不推进，p=0.1 推进）⇒ 「训练前多做 200 次前向」就会改变训练轨迹。
+
+修法：`Block` / `MoEBlock` 接受 `dropout` 覆盖参数并真正传下去；
+回归断言写进 `tests/test_dense.py` 第 13 条与 `tests/test_moe.py` 末尾
+（**结构断言 + 行为断言各一条**，缺一不可）。
+
+**影响面**：修完之后 SFT/DPO 阶段真的没有 dropout ⇒ **LoRA 与 DPO 的全部数字都变了**
+⇒ 重新跑了 LoRA 主训练、LoRA 8 行消融、DPO 主训练、DPO 8 行消融，并更新了笔记。
+**预训练不受影响**（它显式传 `cfg.dropout=0.1`，重跑核对：
+`initial_loss=6.7154 → val_loss=1.3510 val_ppl=3.86`，与修复前逐位一致）。
+
+详见笔记 `Qwen3_LoRA与DPO_学习笔记.md` §6.4。
+
+- [x] **Step 8: Commit**
+
+```bash
+git add qwen3-learning/ init.sh
+git commit -m "feat-024: 从零手写 DPO（π_ref = SFT 模型，merge → strip → 重新 inject）"
 ```
 
 ---
 
-## Phase 4 — 评估、推理与退化对照
-
----
 
 ### Task 16: feat-025 精简评估脚本
 

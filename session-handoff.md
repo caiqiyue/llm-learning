@@ -9,9 +9,9 @@
 ## 一句话现状
 
 GPT-2 线**全链路已复验通过**（torch 环境已修好，训练 + 9 项评估全绿）；
-Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA 已从零手写完并真跑通**
+Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO 已从零手写完并真跑通**
 （RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE /
-语料与偏好数据 / `--model dense|moe` 预训练 / 手写 LoRA 微调），**DPO / 评估侧尚未开工**。
+语料与偏好数据 / `--model dense|moe` 预训练 / 手写 LoRA 微调 / 手写 DPO），**评估侧尚未开工**。
 
 ---
 
@@ -37,8 +37,8 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 
 ## Verified Now（哪些是已验证的）
 
-- `bash init.sh` → **PASS=24 SKIP=0 FAIL=0**（2026-10-22，L4 已有四条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke**）
-- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=11 FAIL=0 TOTAL=11**
+- `bash init.sh` → **PASS=25 SKIP=0 FAIL=0**（2026-10-22，L4 已有五条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke**）
+- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=12 FAIL=0 TOTAL=12**
 - Qwen3 前向 smoke 已用**真实 BPE 词表**（vocab 778）跑通：`logits (2, 8, 778) loss 6.6897 params 985,856`
 - Qwen3 训练步 smoke：`[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05`
 - **预训练真跑通**（CPU，脚本在 `train/train_pretrain.py`，超参全从 `config.py` 读）：
@@ -50,9 +50,31 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 - **LoRA 真跑通**（CPU，`train/train_lora.py`）：
   - `trainable params = 8,704 / 994,560 (0.88%)`（基座 985,856 全冻结，只训 A/B）
   - `BEFORE win_rate=0.515 win_rate_per_token=0.400 mean_logp(chosen)=-603.26`
-    → `AFTER win_rate=0.595 win_rate_per_token=0.745 mean_logp(chosen)=-389.48`
+    → `AFTER win_rate=0.605 win_rate_per_token=0.745 mean_logp(chosen)=-385.99`
+  - ⚠️ 这组数字是**修完 dropout 覆盖 bug 之后**重测的（修复前是 0.595 / 0.745 / -389.48），见下面的「静默 bug」条目
   - 「注入即无损」实测成立：注入前后 logits `torch.allclose(atol=1e-6)`
   - `tests/test_lora.py` 9 组断言全过 → `test_lora OK  replaced=8 r=4 alpha=8 scaling=2.0`
+- **DPO 真跑通**（CPU，`train/train_dpo.py`，不训 RM、不做 PPO、不采样）：
+  - `π_ref = SFT 模型`：靠 **merge → strip → 重新 inject** 三步在同一模型对象上变出来
+  - `trainable params = 8,704 / 994,560 (0.88%)`（只训 A/B）
+  - `BEFORE margin=+0.0000 ± 0.0000 dpo_acc=0.000 win_rate=0.605`
+    → `AFTER margin=+4.6512 ± 4.3952 dpo_acc=0.780 win_rate=0.665 win_rate_per_token=0.900`
+  - **不变量**：B 零初始化 ⇒ `π_θ ≡ π_ref` ⇒ 初始 margin 恒为 0、loss 恒为 `log 2 = 0.6931`
+    （被守了三次：训练脚本 assert / `tests/test_dpo.py` 第 3 组 / `init.sh` 的 DPO smoke）
+  - `tests/test_dpo.py` 9 组断言全过 → `test_dpo OK  beta=0.1 loss=0.6994 margin=-0.0124 dpo_acc=0.750`
+- **★ DPO 消融（步数 / lr / β / π_ref 取法）**：
+
+| π_ref | 步数 | lr | β | reward margin | dpo_acc | 绝对 win_rate | 翻转数 |
+|---|---|---|---|---|---|---|---|
+| sft | 300 | 0.0001 | 0.1 | +0.0000 → +0.2831 | 0.000 → 0.945 | 0.605 → 0.605 | 0 |
+| sft | 1500 | 0.0001 | 0.1 | +0.0000 → +1.6338 | 0.000 → 0.710 | 0.605 → 0.630 | 5 |
+| sft | 1500 | 0.001 | 0.1 | +0.0000 → +4.6512 | 0.000 → 0.780 | 0.605 → 0.665 | 12 |
+| sft | 1500 | 0.001 | 1.0 | +0.0000 → +8.4384 | 0.000 → 0.950 | 0.605 → 0.625 | 4 |
+| sft | 1500 | 0.001 | 0.01 | +0.0000 → +1.0109 | 0.000 → 0.710 | 0.605 → 0.715 | 22 |
+| pretrained | 1500 | 0.001 | 0.1 | +0.0000 → +8.4640 | 0.000 → 0.930 | 0.515 → 0.650 | 27 |
+| sft | 1500 | 0.0003 | 0.1 | +0.0000 → +4.1526 | 0.000 → 0.715 | 0.605 → 0.665 | 12 |
+| sft | 3000 | 0.001 | 0.1 | +0.0000 → +5.0101 | 0.000 → 0.920 | 0.605 → 0.665 | 12 |
+
 - **消融结论**：低秩约束 + 注入点决定「能学到什么」——
   全参微调 loss ~1.06 vs r=4 LoRA loss ~5.7（**内容型任务上 LoRA 明显吃力**，
   LoRA 的主场是风格/格式型任务）
@@ -64,27 +86,26 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 
 ## Broken Or Unverified（坏的 / 没验证的）
 
-- **Qwen3 的 DPO / 评估侧完全没跑过**：`train/` 下只有 `train_pretrain.py` / `train_lora.py`，其余待写（plan Task 15–16）
-- **LoRA 的胜率是「训练内指标」**：合成偏好数据只有 5 个 prompt × 5 个 chosen，训练集与评估集同分布 ——
+- **Qwen3 的评估侧完全没跑过**：`train/` 下已有 `train_pretrain.py` / `train_lora.py` / `train_dpo.py`，但**精简评估脚本还没写**（plan Task 16 / feat-025）
+- **LoRA / DPO 的胜率都是「训练内指标」**：合成偏好数据只有 5 个 prompt × 5 个 chosen，训练集与评估集同分布 ——
   它证明的是「LoRA 确实让模型更偏向 chosen」，**不能当泛化能力**
 - **BPE 词表只有 778 < 目标 1000**：合成语料的可合并对用尽（521 次后没有频次 ≥ 2 的对），属语料多样性问题，非实现 bug
 - **MoE 在本仓库体现不出容量优势**：val_loss 1.3607 vs dense 1.3510（MoE 反而略差）——
   语料太简单 + 专家更窄（参数量只多 1.21×）+ 只训 300 步。**写笔记时别暗示「MoE 一定更好」**（前提条件见笔记 §25.1）
 - **笔记缺口**：`Qwen3_BPE_学习笔记.md` 仍缺；
-  `Qwen3_LoRA与DPO_学习笔记.md` **已建且 LoRA 半部（§1–§9）已写**，但 **DPO 半部（§8）待 feat-024 补**
-  （按计划在 feat-008 / Task 19 做全量交叉引用）
+  `Qwen3_LoRA与DPO_学习笔记.md` **已补齐 LoRA 半部（§1–§7）与 DPO 半部（§8）**，§9 教训 7 条
+  （全量交叉引用按计划在 feat-008 / Task 19 做）
 - **本仓库的 aux_loss 与 HF 数值不能直接比大小**：本实现 = HF Mixtral 同款公式的 1/K（见下面的陷阱表）
 
 ## Next Best Step（按顺序，不要跳）
 
 | 顺序 | feature | 做什么 | 为什么是它 |
 |------|---------|--------|--------|
-| 1 | `feat-024` | 手写 DPO（**π_θ = LoRA 分支开着 / π_ref = LoRA 分支关着，同一个模型对象**，不训 Reward Model、不做 PPO） | 用户明确要求 DPO |
-| 2 | `feat-025` | Qwen3 精简评估（pretrain/lora/dpo/speedup 四段） | 验收 |
-| 3 | `feat-018` | KV Cache 推理 + 采样（temperature/top-k/top-p） | 推理侧 |
-| 4 | `feat-017` | 与 GPT-2 的**退化对照**（逐组件消融 + max_abs_diff 记录） | 本线最有价值的产出 |
-| 5 | `feat-008` | 笔记 ↔ 源码交叉引用（补 BPE 笔记 + LoRA-DPO 笔记的 DPO 半部） | 收尾 |
-| 6 | `feat-009` | 笔记数字与 `config.py` 全量核对 | 收尾 |
+| 1 | `feat-025` | Qwen3 精简评估（pretrain/lora/dpo/speedup 四段） | 验收 |
+| 2 | `feat-018` | KV Cache 推理 + 采样（temperature/top-k/top-p） | 推理侧 |
+| 3 | `feat-017` | 与 GPT-2 的**退化对照**（逐组件消融 + max_abs_diff 记录） | 本线最有价值的产出 |
+| 4 | `feat-008` | 笔记 ↔ 源码交叉引用（补 BPE 笔记） | 收尾 |
+| 5 | `feat-009` | 笔记数字与 `config.py` 全量核对 | 收尾 |
 
 **这一步不许动的**：不改 GPT-2 线的任何训练代码或超参；不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值。
 
@@ -104,6 +125,9 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 | 脚本放在子目录 | Qwen3 线脚本在 `train/` / `tests/` 里，`sys.path[0]` 不是项目根 → **必须显式 `sys.path.insert(0, <项目根>)`** |
 | **偏好胜率的长度偏置** | 总 logprob 口径偏袒**短回复**（`too_short` 策略胜率**恒为 0.000**，因为 rejected 只有 6.3 token），把整体胜率天花板压到 ~0.75；长度归一口径反过来偏袒「可预测」的文本。**必须按策略分组看，否则误判「没进步」** |
 | **旁路注入的「结构性 bug」** | `merge_lora` 合并后分支还开着 → ΔW 算两遍；`inject_lora` 只冻被包装的那一个 Linear → embedding/Norm/MLP/lm_head 仍可训；loss 掩码把 prompt 也算进去。**三条都不报错、只静默给错结论 ⇒ 必须用「等价性断言」守，不能靠看 loss 曲线** |
+| **DPO 的 π_ref 是「哪一个」模型** | 标准做法锚 **SFT 模型**。本仓库「关掉 LoRA 分支」得到的是**预训练模型** —— 锚错**不报错、loss 也降、指标照涨**，只是整个实验锚在错的基线上。解法：`merge_lora` → `strip_lora`（新增）→ 重新 `inject_lora`。**必须用「初始 margin 恒为 0 / loss 恒为 log 2」这条可运行断言来钉** |
+| **DPO 目标指标 ≠ 业务指标** | 强配方 margin +4.65 / dpo_acc 0.78 / 绝对胜率 0.605→0.665；**弱配方 dpo_acc 冲到 0.945，绝对胜率却是 0/200 翻转**。**报告时必须同时给 margin（目标口径）与 win_rate（业务口径）**，只给前者是自我欺骗 |
+| **覆盖参数没传到子模块 = 静默的半配置** | `Qwen3Dense(dropout=0.0)` 只关掉了 embedding 的 dropout，注意力/MLP 一直是 `cfg.dropout=0.1`；而 **p>0 的 Dropout 在 train 模式下会推进全局 torch RNG**⇒ 「训练前多做几次评估」就改变训练轨迹（同一配方 margin 差 0.028）。**每个覆盖开关都要配一条等价性断言（结构 + 行为各一条）** |
 | **LoRA ≠ 弱化版全参** | 低秩约束 + 注入点决定「能学到什么」：内容型任务上全参 loss ~1.06 vs r=4 LoRA ~5.7。**LoRA 是风格/格式型任务的主场** |
 
 ---
@@ -113,8 +137,8 @@ mlp          = "gelu"  → 退化为 GPT-2 的 FFN
 | 决策 | 出现在 | 说明 |
 |------|--------|------|
 | ~~LoRA 的注入点与超参~~ | `feat-023` | **已定**：`lora_r=4 / lora_alpha=8 / lora_target_modules=("q_proj","v_proj")`；`lora_lr` 3e-4→**1e-3**、`lora_max_iters` 300→**1500**（消融实测依据） |
-| DPO 的 β 与训练步数 | `feat-024` | `config.py` 已预留 `dpo_beta=0.1 / dpo_lr=1e-4` |
-| DPO 偏好数据要不要引入真实数据集 | `feat-024` | 目前是合成数据，引入真实数据会动依赖上限 |
+| ~~DPO 的 β 与训练步数~~ | `feat-024` | **已定**：`dpo_beta=0.1`、`dpo_lr` 1e-4 → **1e-3**、`dpo_max_iters` 300 → **1500**（消融实测依据，见上面的表） |
+| DPO 偏好数据要不要引入真实数据集 | `feat-024` | 目前是合成数据，引入真实数据会动依赖上限（**未做**） |
 | 评估要不要和 GPT-2 线的 9 项对齐 | `feat-025` | Qwen3 线目前规划的是 4 段精简评估 |
 
 ---
@@ -135,12 +159,14 @@ python evaluate.py --stage all
 # Qwen3 线（组件 + 数据 + 预训练已就位）
 cd qwen3-learning/qwen3-pytorch
 python data/build_vocab.py       # 重建 BPE 词表（vocab.json / merges.txt）
-python tests/run_all.py          # 11 个 smoke 汇总
+python tests/run_all.py          # 12 个 smoke 汇总
 python tests/test_pretrain.py    # 单个 smoke
 python tests/test_lora.py        # LoRA 的 9 组断言
 python train/train_pretrain.py --model dense   # 预训练（dense，~47s CPU）
 python train/train_pretrain.py --model moe     # 预训练（MoE，~59s CPU）
 python train/train_lora.py       # LoRA 微调（r=4 q/v, lr=1e-3, 1500 步）
+python train/train_dpo.py        # DPO（π_ref = SFT 模型，merge → strip → 重新 inject）
+python tests/test_dpo.py         # DPO 的 9 组断言
 
 # 状态
 cat feature_list.json            # 含 phase 阶段标记 + 每条的 evidence
@@ -154,7 +180,7 @@ git log --oneline -5
 |----------|--------|
 | 开工前必读 | `AGENTS.md` §0 framing / §3 硬约束 / §5 验证路径 |
 | 当前阶段与任务顺序 | `feature_list.json` 的 `phase` + priority 最小的非 passing 项 |
-| Qwen3 设计 / 实施计划 | `qwen3-learning/qwen3-pytorch设计.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–14 已就地纠错，含「实测修正记录」） |
-| Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（8 篇，缺 BPE；LoRA-DPO 篇缺 DPO 半部） |
+| Qwen3 设计 / 实施计划 | `qwen3-learning/qwen3-pytorch设计.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–15 已就地纠错，含「实测修正记录」） |
+| Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（8 篇，缺 BPE；LoRA-DPO 篇已补齐 DPO 半部） |
 | GPT-2 对照实现 | `gpt-learning/gpt-learning-pytorch/model/gpt2.py` |
 | 收班自查 | `clean-state-checklist.md` |

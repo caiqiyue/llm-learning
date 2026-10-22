@@ -30,6 +30,13 @@
        前向再算一次 LoRA 分支就变成 **(base + ΔW)x + ΔWx = 被算两遍**。
        合并的语义是「把旁路收进主干」，所以合并完必须关掉分支。
 
+【第四个动作：strip_lora（feat-024 用）】
+    把 LoRALinear 换回普通 nn.Linear（保留 base 权重）。
+    DPO 的标准做法是「π_ref = SFT 模型」；本仓库不加载第二份权重，
+    而是把 SFT 训好的 LoRA **merge 进 base**（base 就成了 SFT 模型），
+    再 strip 成普通 Linear，最后重新 inject 一个**新的** LoRA 给 DPO 训练。
+    于是「关掉新 LoRA 分支 = π_ref = SFT 模型」，同一个模型对象搞定两套策略。
+
 【与 DPO 的关系】
     DPO 需要两个模型：π_θ（当前策略）与 π_ref（参考策略）。
     本实现**不加载第二份权重**：同一个模型对象，开着 LoRA 分支是 π_θ，
@@ -182,6 +189,45 @@ def set_lora_enabled(model: nn.Module, enabled: bool) -> None:
     for module in model.modules():
         if isinstance(module, LoRALinear):
             module.scaling = module.alpha / module.r if enabled else 0.0
+
+
+def strip_lora(model: nn.Module) -> int:
+    """
+    把 LoRALinear 换回普通 nn.Linear，**保留当前 base 权重**。
+
+    用途：
+        1. 导出成普通模型（推理时不想再走一遍旁路）
+        2. **DPO 的关键一步**（见 train/train_dpo.py）：
+           先把 SFT 训好的 LoRA 用 merge_lora 折进 base，
+           再 strip 成普通 Linear，最后重新 inject 一个新的 LoRA。
+           这样 base 就是「SFT 模型」，关掉新 LoRA 分支即得 π_ref = SFT 模型。
+
+    ⚠️ strip 之前如果不 merge，base 里就**不含** LoRA 学到的 ΔW，
+       等于把 LoRA 训出来的东西丢掉了 —— 顺序必须是 merge → strip。
+
+    参数：
+        model: 已注入 LoRA 的模型
+    返回：
+        被替换的模块数量
+    """
+    # 先收集再替换：边遍历边 setattr 会破坏迭代
+    targets: List[tuple] = []
+    for module in model.modules():
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, LoRALinear):
+                targets.append((module, child_name, child))
+
+    for parent, child_name, child in targets:
+        in_features = child.base.in_features
+        out_features = child.base.out_features
+        has_bias = child.base.bias is not None
+        new_linear = nn.Linear(in_features, out_features, bias=has_bias)
+        with torch.no_grad():
+            new_linear.weight.copy_(child.base.weight)
+            if has_bias:
+                new_linear.bias.copy_(child.base.bias)
+        setattr(parent, child_name, new_linear)
+    return len(targets)
 
 
 def lora_parameters(model: nn.Module) -> List["torch.nn.Parameter"]:

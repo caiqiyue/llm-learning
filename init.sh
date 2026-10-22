@@ -365,6 +365,48 @@ PY
   else
     skip "Qwen3 LoRA smoke" "model/common/lora.py 尚未就绪（feat-023），或 torch 不可用"
   fi
+
+  # --- DPO smoke（feat-024）：初始 margin=0（π_θ == π_ref）+ loss=log2 + 只训 LoRA ---
+  if [ -f "$QWEN_DIR/train/train_dpo.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_dpo.log 2>&1
+import torch
+from config import DENSE_CONFIG
+from data.preference_data import generate_preference_dataset
+from data.tokenizer import BPETokenizer
+from model.common.lora import inject_lora, mark_only_lora_trainable
+from model.qwen3_dense import Qwen3Dense
+from train.train_dpo import dpo_loss
+
+tk = BPETokenizer("data/vocab.json", "data/merges.txt")
+pairs = generate_preference_dataset(n_samples=4, seed=DENSE_CONFIG.seed)
+
+model = Qwen3Dense(vocab_size=tk.vocab_size, cfg=DENSE_CONFIG, dropout=0.0)
+model.eval()
+inject_lora(model, DENSE_CONFIG.lora_target_modules, r=DENSE_CONFIG.lora_r,
+            alpha=DENSE_CONFIG.lora_alpha)
+trainable = mark_only_lora_trainable(model)
+
+loss, margin, _ = dpo_loss(model, pairs[0], tk, DENSE_CONFIG.dpo_beta, torch.device("cpu"))
+# B 零初始化 ⇒ π_θ 严格等于 π_ref ⇒ margin 必为 0、loss 必为 log 2
+assert abs(float(margin.item())) < 1e-4, f"初始 margin 应为 0，实得 {float(margin.item())}"
+assert abs(float(loss.item()) - 0.6931472) < 1e-4, f"初始 loss 应为 log 2，实得 {float(loss.item())}"
+assert torch.isfinite(loss), "loss 非有限"
+
+n_train = sum(p.numel() for p in trainable)
+n_all = sum(p.numel() for p in model.parameters())
+assert n_train < n_all * 0.1, f"可训练参数应远小于总参数：{n_train}/{n_all}"
+print(f"[dpo] 初始 margin={float(margin.item()):+.6f} loss={float(loss.item()):.4f}(=log2)；"
+      f"可训练 {n_train:,}/{n_all:,} ({n_train/n_all:.2%})")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 DPO smoke（初始 margin=0 + loss=log2）$(tail -1 /tmp/llm_init_l4_dpo.log)"
+    else
+      fail "Qwen3 DPO smoke" "$(tail -3 /tmp/llm_init_l4_dpo.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 DPO smoke" "train/train_dpo.py 尚未就绪（feat-024），或 torch 不可用"
+  fi
 fi
 
 # -----------------------------------------------------------------------------

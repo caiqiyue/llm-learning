@@ -40,7 +40,12 @@ class Qwen3Config:
     rms_eps: float = 1e-6
     # 最大上下文长度
     block_size: int = 128
-    # dropout 比例
+    # dropout 比例。
+    # **只用于预训练**（train_pretrain.py 显式传 cfg.dropout）。
+    # SFT / LoRA / DPO 阶段传 0.0（数据少、要求确定性）—— 见笔记 §6.4。
+    # ⚠️ 模型侧的 `dropout` 覆盖参数必须真的传到每一处（embedding + 注意力 + MLP），
+    #    否则「关掉 dropout」只是关了一半，train 模式的前向会继续推进全局 RNG，
+    #    实验就不可复现。回归断言在 tests/test_dense.py 第 13 条。
     dropout: float = 0.1
     # Qwen3 全线 Linear 均无 bias
     attention_bias: bool = False
@@ -91,21 +96,33 @@ class Qwen3Config:
     # 注入 LoRA 的模块名后缀
     lora_target_modules: tuple = ("q_proj", "v_proj")
     # LoRA 微调学习率
-    # （实测 r=4/attn/1500 步：lr 3e-4 → loss 5.926 / 总 logprob 胜率 0.590；
-    #   lr 1e-3 → loss 5.701 / 胜率 0.595。取 1e-3。
-    #   注：长度归一口径上 3e-4 反而略高（0.810 vs 0.745）—— 两个口径排序不同，
-    #   见 Qwen3_LoRA与DPO_学习笔记.md §5）
+    # （实测 r=4/attn/1500 步：lr 3e-4 → loss 5.743 / 总 logprob 胜率 0.590；
+    #   lr 1e-3 → loss 5.517 / 胜率 0.605。取 1e-3。
+    #   注：长度归一口径上 300 步的配方反而更高（0.825 vs 0.745）—— 两个口径排序不同，
+    #   见 Qwen3_LoRA与DPO_学习笔记.md §7.4）
+    # ⚠️ 这组数字是**修完 dropout 覆盖 bug 之后**重测的（笔记 §6.4），
+    #    修复前同一配方是 5.926 / 0.590 与 5.701 / 0.595。
     lora_lr: float = 1e-3
     # LoRA 微调步数
-    # （实测 r=4/attn/lr=1e-3：300 步 loss 6.121 / 胜率 0.570（还在平台期），
-    #   1500 步 loss 5.701 / 胜率 0.595；基线 0.515）
+    # （实测 r=4/attn/lr=1e-3：300 步 loss 6.073 / 胜率 0.575（还在平台期），
+    #   1500 步 loss 5.517 / 胜率 0.605；基线 0.515）
     lora_max_iters: int = 1500
 
     # ---------------- DPO ----------------
     # DPO 的 KL 惩罚系数 β
+    # （消融实测：β=0.1 → margin +4.65 / dpo_acc 0.78 / 绝对胜率 0.605→0.665；
+    #   β=1.0  → margin +8.44 / dpo_acc 0.95 / 绝对胜率 0.605→0.625（只涨 margin 不涨胜率）；
+    #   β=0.01 → margin +1.01 / dpo_acc 0.71 / 绝对胜率 0.605→0.715（KL 太松，间隔被摊薄）。
+    #   取标准做法 0.1，详见 Qwen3_LoRA与DPO_学习笔记.md §8.8）
     dpo_beta: float = 0.1
-    dpo_lr: float = 1e-4
-    dpo_max_iters: int = 300
+    # DPO 学习率
+    # （消融实测 1500 步 / β=0.1：lr 1e-4 → margin +1.63 / 绝对胜率 0.630；
+    #   lr 1e-3 → margin +4.65 / 绝对胜率 0.665。取 1e-3）
+    dpo_lr: float = 1e-3
+    # DPO 训练步数
+    # （消融实测 lr=1e-4：300 步 → margin +0.28 / dpo_acc 0.945 但绝对胜率 0.605→0.605
+    #   （一点没动）；1500 步 → margin +1.63 / 绝对胜率 0.630。取 1500）
+    dpo_max_iters: int = 1500
     # 偏好数据集规模
     dpo_n_pairs: int = 2000
 
