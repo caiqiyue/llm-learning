@@ -11,13 +11,14 @@
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（WIP=0；**27 个 feature 全部 passing**，feat-027 是最后一个，已于 Session 014 完成）
+- 当前活跃 feature：**无**（WIP=0；**28 个 feature 全部 passing**，feat-028 是最后一个，已于 Session 015 完成）
 - 当前最高优先级未完成 feature：**无** → 下一步是收班
 - ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
 - 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-23 在修复后的环境里、按 feat-027 定下的口径重跑产出**，指标可信（见 `feature_list.json` feat-002~007、feat-027 的 evidence）
 - **P1 线的 SFT 塌陷已修**（feat-027）：三个互相咬合的缺陷 —— ① SFT 的 labels 同下标 + 模型 loss 不左移 ⇒ 学成「复制当前 token」；② `encode` 逐字符查表 ⇒ `BOS/EOS/SEP` 永远不可达 ⇒ 学不会自己停；③ 评估按字符串长度切回答 ⇒ 每条带 `"? <unk>sep<unk> "` 前缀。修完：公共后缀 0%（原 98%）、`ppo_rm_score` +0.9188（原 0.0696）、`improvement` +3.6509（原 0.0000）。**口径写进了 `init.sh` 的 L1/L2 守卫**
 - 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` **9 篇**（BPE 笔记已补齐，feat-008；**每篇开头都有「对应 GPT-2 / 对应 Qwen3 源码 / 对应可跑测试」三行**，由 `tests/test_note_refs.py` 自动校验）
 - **笔记 ↔ config.py 的自动守卫**（feat-009）：`tests/test_config_sync.py` 把 27 篇笔记里的 `` `超参名 = 值` `` 跟各自 `config.py` 逐条对齐（实测 88 处断言 / 25 条例外登记）；**改 `config.py` 忘了改笔记 ⇒ 测试直接红**。已知盲点：`开发计划.md` 跨线比较，不适用自动守卫，改为人工核对
+- **笔记 ↔ 代码实测的「派生量」自动守卫**（feat-028）：`tests/test_derived_sync.py` 核对**算出来的**数字 —— 参数量（794,496 / 985,856 / 8,704 / 1,184,512）、词表大小（45 / 778）、算式、比值（实测 **41 处**主张 / 8 条例外登记）。**期望值不手写，而是现场把模型搭出来数参数** ⇒ 改一个 `n_embd` / `n_layer`，几十个参数量数字会**同时**变红。**表格里的数字也跑不掉**（行级规则）
 - 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 训练三段 + 评估侧 + 退化对照全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 预训练 / LoRA / DPO / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py`），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke + LoRA smoke + DPO smoke + 推理 smoke + 评估 smoke + **生成质量 smoke** + **退化对照 smoke**」九条
 - **两条线现在有第三个「数字可并排」的地方**（feat-026）：`quality.py` 是**两条线共用的一份指标实现**，`ablations/compare_quality.py` 用 GPT-2 线**自己的** `evaluate.py` 在同一批回答上重算并断言**逐值相等**（实测差 0.000e+00）⇒「同名同口径」是机器证明，不是承诺。⚠️ 并排数字带着三条不可比性（探针域内外 / tokenizer 粒度 / 词表大小），详见 `Qwen3_训练推理完整学习笔记.md` §13.5
 
@@ -1505,3 +1506,133 @@ cd qwen3-learning/qwen3-pytorch && python ablations/compare_quality.py
 | `bash init.sh` | `PASS=30  SKIP=0  FAIL=0` |
 | GPT-2 `evaluate.py --stage all` | 退出码 0，9 个评估函数全跑完 |
 | `qwen3-pytorch` `python tests/run_all.py` | `PASS=18  FAIL=0  TOTAL=18` |
+
+---
+
+### Session 015 — 笔记里的「派生量」纳入机器守卫（feat-028）
+
+#### 立项：先把交接文档里的两条待办**量一遍**再决定做什么
+
+feat-009 收班时在守卫注释里写下第三个盲点 ——「写成『128 维』『4 层』的散文数字仍靠人读」，
+在 `session-handoff.md` 的「Next Best Step ②」里被留成待办。**这次先不写代码，先量**：
+
+| 候选做法 | 实测结果 | 结论 |
+|---|---|---|
+| 正则扫散文里的「N 维」「N 层」 | 「层」在本仓**语义冲突**：`init.sh` 的 **L4 层**（18 处）、「4 层 Transformer」、SwiGLU 的 3 个矩阵；「维」的命中多是**教学玩具值**（`n_embd = 4`）或**官方模型值**（768 维）。真正带 key 名的散文主张只有 **12 处**，一半还是跨线引用 | ❌ 会变成**误报机器** |
+| 守卫「笔记代码块 ↔ 源码逐字一致」 | **164/164** 个笔记代码块都是**故意简化**的摘录，**没有一个**与源文件逐字相同 | ❌ 要先改 164 处笔记（那是改内容，不是加守卫），上线当天就是 164 条红灯 |
+| 守卫**能算出真值**的派生量 | 参数量 / 词表大小 / 算式 / 比值 —— 全部可以**从代码现场算出来** | ✅ **做这个** |
+
+⇒ feat-028 的范围由**实测**决定，不由「交接文档怎么写」决定。
+
+#### 新守卫：`qwen3-learning/qwen3-pytorch/tests/test_derived_sync.py`
+
+**立身之本：不手写期望值，而是现场把模型搭出来数参数。**
+
+```
+GPT-2：按 config.py 造模型 → parameters() = 794,496（vocab 45，走 CharTokenizer.vocab_size）
+Qwen3：dense 985,856 / 注入 LoRA 后 994,560 / LoRA 可训练 8,704 / MoE 1,184,512 / SwiGLU FFN 147,456
+```
+
+> 踩过的坑：词表大小**不能数行** —— `vocab.txt` 里有一行是「空格」，
+> 用 `.strip()` 数出来是 **44** 而不是 45。必须走两条线**自己的 tokenizer**。
+> 另一个坑：`_dense()` 一开始是「造完就注入 LoRA 再数」，于是 dense 少了 8,704
+> （笔记里的 `dense=951,808` 是**注入前**，`994,560` 才是**注入后**）⇒ 两个数都要收录。
+
+**7 条规则**
+
+| 规则 | 查什么 |
+|---|---|
+| R1 | 算式自洽（含链式等号「A + B = C + C = D」） |
+| R2a | 紧邻式参数量：`参数量 = 794,496` / `11520 个参数` |
+| **R2b** | **行级**：这一行只要出现参数关键词，行上**每一个**参数化数字都要对得上 |
+| R3 | 词表大小 = 实测词表大小 |
+| R4 | `8,704 / 994,560 (0.88%)` 三元组：分子分母是实测值，百分比真的算得出来 |
+| R5 | `比值 = 1.21x` 真的等于该行两个数字之比 |
+| R6 | `可训练总计: A + B + C = N` 里的 N = 模型实测总参数量 |
+
+**归属判定（分层）**：数字**前面最近的关键词**（`GPT-2`/`GELU` → GPT-2 侧；
+`Qwen3`/`SwiGLU`/`dense`/`moe`/`LoRA` → Qwen3 侧）→ 判不出来按**文件所在目录**判
+（`gpt-learning/` → GPT-2 侧，`qwen3-learning/` → Qwen3 侧）。
+⇒「GPT-2 的 794,496」和「Qwen3 的 794,496」会被分别对待（后者红）。
+归属启发式判错、但数字本身是实测值时只报**提示**不拦 CI。
+
+#### ★ 覆盖：21 → 41 处
+
+补上行级 R2b 后，主张数从 21 涨到 **41**。新增的 20 处里有 **6 处是表格 / 散文里
+从来没被核对过的参数量** —— 最典型：
+
+```
+| 总可训练参数 | 见 [§1.9 of 主文档](GPT全流程详解.md#19-参数量级) | **794,496** |
+```
+
+关键词和数字被 `|` 隔开 ⇒ R2a 抓不到 ⇒ **这些数字一直没人核对过**。
+
+#### 改了哪些文件
+
+| 文件 | 改了什么 |
+|---|---|
+| `qwen3-learning/qwen3-pytorch/tests/test_derived_sync.py` | **新增**（守卫本体，约 560 行） |
+| `gpt-learning/0.GPT全流程详解.md` | 1 行：「TF 端（含 embedding transpose 差异）: ~ 800,256」→「TF 端**参数量**（含 embedding transpose 差异）: ~ 800,256」（加了「参数量」三个字，它才进 R2b 的核对范围） |
+| `qwen3-learning/qwen3-pytorch/README.md` | 新增「笔记里的**派生量** ↔ 代码实测：自动守卫（feat-028）」小节（规则表 + 为什么不做散文守卫） |
+| `README.md`（根） | 新增一段派生量守卫说明；测试数 18 → 19 |
+| `feature_list.json` | 新增 feat-028（passing，8 条 evidence） |
+| `session-handoff.md` | 新增 feat-028 段 + 改「Next Best Step」（② done、③ 判为不可行并给出替代方向）+ 4 行陷阱表 + 1 行文件速查 |
+| `claude-progress.md` | 本节 |
+
+**没动的**：`config.py` 的任何超参、任何训练脚本、`evaluate.py` 的任何指标与阈值、
+`init.sh`（新守卫被 `tests/run_all.py` **自动发现** ⇒ L4 天然覆盖）。
+
+#### 验证命令与实测输出
+
+```bash
+# ① 轻量验证
+$ bash init.sh
+  [PASS] Qwen3 组件 smoke（tests/run_all.py）[run_all] all green
+  PASS=30  SKIP=0  FAIL=0
+
+# ② 全部 smoke（自动发现 ⇒ 第 19 个）
+$ cd qwen3-learning/qwen3-pytorch && python tests/run_all.py
+  [PASS] test_derived_sync.py — test_derived_sync OK
+  [run_all] PASS=19  FAIL=0  TOTAL=19
+
+# ③ 守卫单独跑
+$ python tests/test_derived_sync.py
+[derived] 真值：GPT-2 总参数 794,496（vocab 45） / Qwen3 dense 985,856（vocab 778，注入 LoRA 后 994,560，MoE 1,184,512）
+[derived] 核对笔记 27 篇；派生量主张 41 处；例外登记 8 条（命中 8，过时 0）
+[derived] 人工核对文档（不进自动守卫）：qwen3-learning/qwen3-pytorch开发计划.md
+test_derived_sync OK
+```
+
+#### ★ 反证 4 连（改完全部复原）
+
+| # | 改了什么 | 守卫的反应 |
+|---|---|---|
+| ① | `config.py` 的 `n_layer` 4→5 | **15 处**不一致，EXIT=1（GPT-2 侧不受影响，Qwen3 侧全线漂移） |
+| ② | 笔记 `794,496`→`794,497`（`GPT2训练数学公式与超参详解.md:1086`） | **1 处** —— 正是 R2a 抓不到、被 **R2b** 抓到的那一行 |
+| ③ | LoRA 笔记百分比 `0.88%`→`0.99%` | **2 处**（R4） |
+| ④ | `0.GPT全流程详解.md` 算式 `131,072`→`131,073` | **1 处**（R1 链式等号） |
+
+⇒ 守卫**真的会咬**，不是「一个恒真的断言」。
+
+#### 五个方法论教训
+
+1. **守卫的期望值不能手写** —— 手写期望值 = 守卫变成「第二份要同步的文档」，
+   改配置时它自己就过期了。**现场把模型搭出来数参数**才是可持续的。
+2. **「关键词紧邻」的正则会漏掉表格** —— `| 总可训练参数 | … | **794,496** |`
+   里的数字一直没人核对过。**行级规则**（这一行有参数关键词 ⇒ 行上每个参数化数字都要对得上）
+   才补得上这个洞（21 → 41 处）。
+3. **数字要有量级门槛** —— 只查「带千分位或 ≥5 位」的数字（`§1.9`、`0.8M`、`256` 不是参数量）
+   ⇒ 误报率保持 0。
+4. **例外要能自己作废** —— 登记簿里「已不再命中」的条目自动报出来要求删除；
+   本 feature 借此清掉 4 条过时登记，并新登记 1 条（`Qwen3_BPE_学习笔记.md` 的 293）。
+5. **别用行级跳过** —— 遇「785065 字节」就跳过**整行**，会连带把同一行真正该核对的
+   「目标词表 1000」一起放过。改成**只涂掉那个数字**，其余照常核对。
+
+#### 最终状态
+
+| 项 | 值 |
+|---|---|
+| `feature_list.json` | **28 passing / 0 in_progress / 0 not_started**（priority 严格 1..28） |
+| `bash init.sh` | `PASS=30  SKIP=0  FAIL=0` |
+| `qwen3-pytorch` `python tests/run_all.py` | `PASS=19  FAIL=0  TOTAL=19` |
+| `python tests/test_derived_sync.py` | 27 篇笔记 / **41 处**主张 / 8 条例外（命中 8，过时 0） |

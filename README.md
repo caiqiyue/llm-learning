@@ -85,7 +85,7 @@ qwen3-learning/qwen3-pytorch/
 ├── evaluate.py        # 精简 6 段评估（pretrain / moe / lora / dpo / speedup / quality）
 ├── quality.py         # 生成质量指标（两条线共用同一份实现，feat-026）
 ├── ablations/         # 与 GPT-2 的退化对照（feat-017）+ 生成质量并排对照（feat-026，唯一跨目录引用 GPT-2 线的地方）
-└── tests/             # 18 个 test_*.py + run_all.py 汇总
+└── tests/             # 19 个 test_*.py + run_all.py 汇总
 ```
 
 **核心思路**：不靠"读懂论文"，而是**把 Qwen3 的每个组件做成一个可关掉的开关**（`use_gqa` / `use_rope` / `use_qk_norm` / `mlp_type` / `norm_type`），
@@ -141,6 +141,14 @@ qwen3-learning/qwen3-pytorch/
 > 形如 `` `超参名 = 值` `` 的写法抽出来，跟各自的 `config.py` 逐条对齐 ——
 > **改完 `config.py` 忘了改笔记，测试直接红**。
 > 不属于本仓库配置的取值（教学举例、官方模型参数、算法定义表……）必须**登记理由**。
+
+> **笔记里的「派生量」↔ 代码实测也自动校验**（feat-028）：
+> `qwen3-learning/qwen3-pytorch/tests/test_derived_sync.py` 管的是**算出来的**数字 ——
+> 参数量（794,496 / 985,856 / 8,704）、词表大小（45 / 778）、
+> 单层 FFN 参数量与比值（147,456 / 131,072 / 1.125x）。
+> 它**不手写期望值，而是现场把模型搭出来数参数** ——
+> 改一个 `n_embd` / `n_layer`，几十个参数量数字会**同时**变红。
+> 表格里那种「`| 总可训练参数 | … | **794,496** |`」的写法也跑不掉（行级规则）。
 
 ---
 
@@ -205,7 +213,7 @@ python train/train_dpo.py                # ③ DPO（π_ref = LoRA 后的 SFT �
 python evaluate.py --stage all            # 精简 6 段评估
 python ablations/compare_with_gpt2.py    # 与 GPT-2 的退化对照（6 行消融表）
 python ablations/compare_quality.py      # 与 GPT-2 的生成质量并排 + 口径交叉验证
-python tests/run_all.py                  # 18 个 smoke 汇总
+python tests/run_all.py                  # 19 个 smoke 汇总
 ```
 
 单项说明见 [`qwen3-pytorch/README.md`](qwen3-learning/qwen3-pytorch/README.md)。
