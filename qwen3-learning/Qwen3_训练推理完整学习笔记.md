@@ -1111,41 +1111,57 @@ token_entropy     2.7251     2.7251  0.000e+00
 ### 13.6 ★ 实测数字（seed 1234，两次跑逐字相同）
 
 脚本会比**两对**模型：微调对（`sft.pt` vs `lora.pt`）与底模对（`pretrain.pt` vs `pretrain_dense.pt`）。
-加底模对是因为下一节那个发现。
+加底模对是为了区分「模型塌了」和「架构谁更强」。
+
+> ⚠️ **2026-10-23 更新（feat-027）**：下表里 **GPT-2 那一侧的数字已经变了**。
+> 原因：feat-026 当时测到的 GPT-2 `sft.pt` 是**塌掉的**模型
+> （恒定输出 `"? <unk>sep<unk>"` + 空格），feat-027 修好了 P1 线的训练口径后重测。
+> 旧数字留档见本节末尾的「修之前的数字」。
 
 **微调对**（`python evaluate.py --stage quality` 的 Qwen3 侧数字与下表一致）：
 
 | 指标 | GPT-2 (`sft.pt`) | Qwen3 (`lora.pt`) |
 |---|---|---|
-| `distinct_1` | 0.0076 | 0.0258 |
-| `distinct_2` | 0.0092 | 0.1277 |
-| `self_bleu` | 1.0000 | 0.7907 |
-| `token_entropy` | 0.0000 | 5.7975 |
-| `token_entropy_normalized` | 0.0000 | 0.8709 |
-| `response_quality` | 0.2500 | 0.0833 |
-| `response_quality_ex_length` | 0.0000 | 0.1111 |
-| `mean_response_chars` | 48.0 | 139.6 |
+| `distinct_1` | 0.0292 | 0.0258 |
+| `distinct_2` | 0.1548 | 0.1277 |
+| `self_bleu` | 0.7595 | 0.7907 |
+| `token_entropy` | 1.4653 | 5.7975 |
+| `token_entropy_normalized` | 0.3849 | 0.8709 |
+| `response_quality` | 0.2583 | 0.0833 |
+| `response_quality_ex_length` | 0.0111 | 0.1111 |
+| `mean_response_chars` | 32.0 | 139.6 |
 
-规则命中率：GPT-2 侧 `length=1.00 / entity=0 / verb=0 / ending=0`，
+规则命中率：GPT-2 侧 `length=1.00 / entity=0.03 / verb=0 / ending=0`，
 Qwen3 侧 `length=0 / entity=0.13 / verb=0 / ending=0.20`。
-**GPT-2 那 0.25 的总分全部来自「长度规则」** —— 它的回答恒为 48 字符。
+GPT-2 的 0.2583 里**大部分来自「长度规则」**（它的回答恒为 32 字符，落在 10~50 区间），
+扣掉长度规则后只剩 0.0111 —— 也就是说**它几乎没答对题**，
+「答对题」的两个规则（entity / verb）命中率为 0.03 / 0。
 
 **底模对**：
 
 | 指标 | GPT-2 (`pretrain.pt`) | Qwen3 (`pretrain_dense.pt`) |
 |---|---|---|
-| `distinct_1` | 0.0187 | 0.0099 |
-| `distinct_2` | 0.1745 | 0.0296 |
-| `self_bleu` | 0.6959 | 0.9825 |
-| `token_entropy_normalized` | 0.7159 | 0.1954 |
+| `distinct_1` | 0.0269 | 0.0099 |
+| `distinct_2` | 0.2623 | 0.0296 |
+| `self_bleu` | 0.4574 | 0.9825 |
+| `token_entropy` | 2.7261 | 1.3009 |
+| `token_entropy_normalized` | 0.7161 | 0.1954 |
 | `response_quality` | 0.2750 | 0.0750 |
 | `response_quality_ex_length` | 0.0333 | 0.1000 |
+| `mean_response_chars` | 32.3 | 205.2 |
 
-读法：**底模对里 GPT-2 全面更高**（探针对它是域内，而且它的模型没塌）；
-**微调对里 Qwen3 全面更高**（因为 GPT-2 那一侧塌了，见下节）。
-两个数字放在一起才说得清 —— 只报其中一个都会误导。
+读法：**两条线都没有塌了**（公共后缀占比都是 0%）。
+底模对里 GPT-2 全面更高 —— 但**主因是探针对它是域内**（它的预训练语料就是动物童话），
+不是架构更强；微调对里两边的 `distinct_1` 几乎持平（0.0292 vs 0.0258），
+GPT-2 的 `response_quality` 优势**几乎全部来自长度规则**（扣掉后 0.0111 vs 0.1111，反而是 Qwen3 高）。
 
-### 13.7 ★ 顺手挖出来的一个 P1 线问题：SFT / PPO checkpoint 退化成常量输出
+> **修之前的数字（feat-026 当时测的，留档对比）**：
+> GPT-2 `sft.pt`：`distinct_1=0.0076 / distinct_2=0.0092 / self_bleu=1.0000 /
+> token_entropy=0.0000 / response_quality=0.2500 / mean_response_chars=48.0`
+> —— `self_bleu=1.0` + `token_entropy=0` 就是「恒定输出」的指纹。
+
+
+### 13.7 ★ 顺手挖出来的一个 P1 线问题：SFT / PPO checkpoint 退化成常量输出（feat-027 已修）
 
 测「退化」这件事本身需要判据。一开始用「不同回答的数量」，
 **被骗了**：GPT-2 的 `sft.pt` 会把 prompt 的最后一个字符（`?` / `.`）一起吐出来，
@@ -1163,11 +1179,60 @@ GPT-2 的 `sft.pt` 与 `ppo.pt` 对**任何** prompt 都输出同一串常量
 ⇒ **P1 线的 SFT 之后模型塌成了常量输出**。
 
 这与 handoff 里早就记着的「PPO 相对 SFT 无提升、`rm_score = 0.0696`」是**同一个现象**：
-模型只能吐一个常量 ⇒ 奖励模型只能给一个常量分 ⇒ PPO 没有可优化的方向。
+模型只能吐常量 ⇒ 奖励模型只能给一个常量分 ⇒ PPO 没有可优化的方向。
 
-> **本 feature 不修它**（修它要改 P1 线的训练代码并跑 L3 全量，
-> 那是另一条 feature 的事）。这里只负责**如实报告**，
-> 并把它写进 `session-handoff.md` 的「Broken Or Unverified」。
+#### 根因（feat-027，2026-10-23 查清并修好）
+
+**三个互相咬合的缺陷**，根因是「训练口径 ≠ 推理口径」：
+
+| # | 缺陷 | 位置 | 后果 |
+|---|------|------|------|
+| ① | **SFT 的 labels 与 input 同下标，而模型的 loss 不左移** | `data/sft_data.py` + `model/gpt2.py` | 模型学的是「输出**当前** token」（复制）⇒ 推理时 prompt 以空格结尾，模型把最后一个 token 复制出来 ⇒ **无限吐空格**（实测 48 个 token 全是空格，第一步 top-1 logit 14.949 vs 第二名 3.237） |
+| ② | **`encode` 逐字符查表 ⇒ `"<sep>"` 被拆成 5 个字符** | `data/tokenizer.py` | `BOS_ID/EOS_ID/SEP_ID` **永远不可达** ⇒ 模型从没学过吐 EOS ⇒ 生成永远跑满 `max_new_tokens` |
+| ③ | **用字符串长度切回答** | `evaluate.py::_generate_responses` | `UNK` 解码回来是 5 字符的 `"<unk>"` ⇒ 每条回答都被塞上 `"? <unk>sep<unk> "` 前缀 ⇒ 污染 `distinct_n` / `self_bleu` / `response_quality` |
+
+①的细节值得记：预训练线当时在**数据侧**左移（`target[t] = input[t+1]`），
+SFT 线却没左移 —— **两条数据线的口径不一致**，比任何一条单独写错更危险，
+因为它不报错，只是让模型悄悄学成另一个任务。
+
+#### 修法
+
+```text
+错位（"logits[t] 预测 token t+1"）只在模型里做一次：
+    CE(logits[:, :-1], targets[:, 1:])
+两条数据线都保持「labels 与 input 同下标」。
+```
+
+外加：特殊 token 整体一个 id（最长匹配优先）；回答按 **token id 个数**切。
+
+#### 修完的效果（P1 线重跑 L3 全链后的实测）
+
+| 指标 | 修之前 | 修之后 |
+|---|---|---|
+| SFT `distinct_1` | 0.0076 | **0.0292** |
+| SFT `self_bleu` | 1.0000（恒定输出） | **0.7595** |
+| SFT `token_entropy` | 0.0000 | **1.4653** |
+| SFT `response_quality` | 0.2500（全靠长度规则） | **0.3600**（`evaluate.py --stage sft`） |
+| `sft_rm_score` | 0.0696 | **−2.7321** |
+| `ppo_rm_score` | 0.0696 | **+0.9188** |
+| PPO `improvement` | **0.0000** | **+3.6509** |
+| PPO 训练中的 RM 走势 | 无（常量） | 前 5 次 −1.4…−3.7 → 后 5 次 **+1.3…+2.6** |
+
+> ⚠️ **上表右列的可复现性**：`evaluate.py` 的 `sft` / `compare` 段是**采样**生成（不是贪心）
+> ⇒ 这些数字**每次跑都在动**（本次 `sft_rm_score` 在两次跑之间是 −2.7469 / −2.7321）。
+> **要逐字复现的数字看 `ablations/compare_quality.py`**（固定 `eval_seed=1234`）：
+> GPT-2 侧 `distinct_1 = 0.0292` / `self_bleu = 0.7595` / `token_entropy = 1.4653` /
+> `response_quality = 0.2583` / 平均回答 32.0 字符 —— **连跑两次逐字相同**。
+> **判据（公共后缀）不受采样影响**：修完之后 GPT-2 侧「公共后缀 0 字符 / 平均 32.0 字符 = 0%」，
+> 修之前是「47 字符 / 48.0 字符 = 98%」—— 这个**才是**塌陷与否的可靠信号。
+
+**结论**：塌陷不是「小模型学不会」，是**训练目标写错了**。
+修完之后 PPO 第一次真的在优化奖励（RM 分数从负数爬到正数）。
+
+> **这一节的教训比数字更重要**：
+> ① **判「模型是否退化」不能看「回答数量」**（要看公共后缀长度）；
+> ② **指标异常时先怀疑度量，再怀疑模型** —— 这次的 `distinct_1=0.0076` 有一半是切片 bug 造成的；
+> ③ **训练口径必须写进守卫**（`init.sh` 的 L1/L2 现在会直接判红）。
 
 ### 13.8 ★ 域内 vs 域外：结论必须由数据算出
 

@@ -152,6 +152,9 @@ def _generate_responses(
     """
     对一组 prompt 字符串生成 response（不含 prompt），返回 list[str]。
     走 GPT2.generate() 朴素路径（不依赖 KV cache，CPU 友好）。
+
+    【feat-027】切 response 的规则：**按 token id 个数切**，不按字符串长度切
+    （UNK 解码回来是 5 字符的 "<unk>"，按长度切会错位）。
     """
     responses = []
     safe_top_k = min(config.top_k, tokenizer.vocab_size - 1)
@@ -168,11 +171,13 @@ def _generate_responses(
                 temperature=config.temperature, top_k=safe_top_k, top_p=config.top_p,
                 eos_id=EOS_ID,
             )
-        full_text = tokenizer.decode(out[0].tolist())
-        resp = full_text[len(full_prompt):]
-        if "<eos>" in resp:
-            resp = resp[: resp.index("<eos>")]
-        responses.append(resp)
+        # 【feat-027】按 **token id 个数**切出回答，不按字符串长度切。
+        #   字符级 tokenizer 里 UNK（id=0）解码回来是整条 "<unk>"（5 字符），
+        #   用 len(full_prompt) 切会错位 ⇒ 每条 response 都被塞上 "? <unk>sep<unk> " 前缀。
+        new_ids = out[0].tolist()[len(ids):]
+        if EOS_ID in new_ids:            # 双保险：generate 一般已在 EOS 处停住
+            new_ids = new_ids[: new_ids.index(EOS_ID)]
+        responses.append(tokenizer.decode(new_ids))
     return responses
 
 

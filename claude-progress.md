@@ -11,10 +11,11 @@
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（WIP=0；**26 个 feature 全部 passing**，feat-026 是最后一个，已于 Session 013 完成）
+- 当前活跃 feature：**无**（WIP=0；**27 个 feature 全部 passing**，feat-027 是最后一个，已于 Session 014 完成）
 - 当前最高优先级未完成 feature：**无** → 下一步是收班
 - ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
-- 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-22 在修复后的环境里重跑产出**，指标可信（见 `feature_list.json` feat-002~007 的 evidence）
+- 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-23 在修复后的环境里、按 feat-027 定下的口径重跑产出**，指标可信（见 `feature_list.json` feat-002~007、feat-027 的 evidence）
+- **P1 线的 SFT 塌陷已修**（feat-027）：三个互相咬合的缺陷 —— ① SFT 的 labels 同下标 + 模型 loss 不左移 ⇒ 学成「复制当前 token」；② `encode` 逐字符查表 ⇒ `BOS/EOS/SEP` 永远不可达 ⇒ 学不会自己停；③ 评估按字符串长度切回答 ⇒ 每条带 `"? <unk>sep<unk> "` 前缀。修完：公共后缀 0%（原 98%）、`ppo_rm_score` +0.9188（原 0.0696）、`improvement` +3.6509（原 0.0000）。**口径写进了 `init.sh` 的 L1/L2 守卫**
 - 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` **9 篇**（BPE 笔记已补齐，feat-008；**每篇开头都有「对应 GPT-2 / 对应 Qwen3 源码 / 对应可跑测试」三行**，由 `tests/test_note_refs.py` 自动校验）
 - **笔记 ↔ config.py 的自动守卫**（feat-009）：`tests/test_config_sync.py` 把 27 篇笔记里的 `` `超参名 = 值` `` 跟各自 `config.py` 逐条对齐（实测 88 处断言 / 25 条例外登记）；**改 `config.py` 忘了改笔记 ⇒ 测试直接红**。已知盲点：`开发计划.md` 跨线比较，不适用自动守卫，改为人工核对
 - 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 训练三段 + 评估侧 + 退化对照全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 预训练 / LoRA / DPO / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py`），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke + LoRA smoke + DPO smoke + 推理 smoke + 评估 smoke + **生成质量 smoke** + **退化对照 smoke**」九条
@@ -1360,3 +1361,147 @@ GPT-2 的 `sft.pt` 与 `ppo.pt` 对**任何** prompt 都输出同一串常量
 | `python tests/run_all.py` | `PASS=18  FAIL=0  TOTAL=18` |
 | Qwen3 `evaluate.py --stage all` | **6/6 段** |
 | 笔记守卫 | `test_note_refs.py` 81 条链接 / 115 处路径；`test_config_sync.py` 88 处断言 / 25 条例外（过时 0） |
+
+---
+
+### Session 014 — 修 P1 线的 SFT 塌陷（feat-027）
+
+对应 feat-027。立项动机：Session 013 的 feat-026 收班时顺带挖出 P1 线的
+「SFT / PPO checkpoint 退化成常量输出」——`sft.pt` / `ppo.pt` 对**任何** prompt
+都输出同一串常量（公共后缀 47 字符 / 平均 48.0 字符 = **98%**），
+而 `pretrain.pt` 正常（0%）。这与早就记着的「PPO 相对 SFT 无提升、
+`sft_rm_score = ppo_rm_score = 0.0696`」是**同一个现象**：
+只能吐常量 ⇒ RM 只能给常量分 ⇒ PPO 没有可优化的方向。
+⇒ **GPT-2 线所有「生成质量 / RM / PPO」的结论都建立在一个塌掉的模型上。**
+
+#### 诊断：三个互相咬合的缺陷
+
+| # | 缺陷 | 位置 | 后果 |
+|---|---|---|---|
+| ① **根因** | SFT 的 `labels` 与 `input_ids` **同下标**，而模型的 loss **不做错位** | `data/sft_data.py` + `model/gpt2.py` | 模型学的是「输出**当前** token」（copy）⇒ 推理时 prompt 以空格结尾 ⇒ 把最后一个 token 复制出来 ⇒ **无限吐空格**（实测 48 个 token 全是空格 id=5，第一步 top-1 logit **14.949** vs 第二名 'A' 3.237） |
+| ② | `encode` 逐字符查表 ⇒ `"<sep>"` 被拆成 5 个字符 | `data/tokenizer.py` | `BOS_ID=2 / SEP_ID=4 / EOS_ID=3` **永远不可达** ⇒ 模型从没学过吐 EOS ⇒ 生成永远跑满 `max_new_tokens` |
+| ③ | 评估用**字符串长度**切**解码后**的文本 | `evaluate.py::_generate_responses` | `UNK` 解码回来是 5 字符的 `"<unk>"` ⇒ 解码后 prompt 前缀 47 字符 vs 原始 31 字符 ⇒ 每条回答都前缀着 `"? <unk>sep<unk> "` ⇒ 污染 `distinct_n` / `self_bleu` / `response_quality` |
+
+★ ①里最要命的一点：**预训练线当时在数据侧左移（`target[t]=input[t+1]`），SFT 线没左移**
+⇒ **两条数据线的口径不一致**。这比任何一条单独写错更危险：
+**它不报错，只是让模型悄悄学成另一个任务**（预训练对、SFT 错）。
+
+#### 口径决策（定下来的唯一约定）
+
+```text
+错位（"logits[t] 预测 token t+1"）只在模型里做一次：
+    F.cross_entropy(logits[:, :-1, :], targets[:, 1:])
+两条数据线都保持「labels 与 input 同下标」。
+```
+
+**为什么是这个方向**（不是「数据侧预左移」）：
+① 笔记 `5.损失函数.md` 与 `7.sft-train.md` **原本就写的是这一套**（HF 的标准形式）——
+   改代码去迁就另一种口径 = 让笔记变成错的；
+② 错位只在一处 ⇒ 第三条数据线也不容易跑偏；
+③ 预训练线原本在数据侧左移、SFT 线没有 ⇒ 两条线口径不一致比任何一条单独写错更危险。
+
+#### 改了哪些文件
+
+| 文件 | 性质 | 内容 |
+|---|---|---|
+| `gpt-learning/gpt-learning-pytorch/model/gpt2.py` | 改 | loss 改成 `CE(logits[:, :-1, :], targets[:, 1:])`（**错位搬进模型**）+ 两处 docstring 写清口径 |
+| `.../data/sft_data.py` | 改 | `labels` 保持同下标（`labels = [-100]*prompt_len + input_ids[prompt_len:]`）+ docstring 写清「错位在模型内部」 |
+| `.../data/pretrain_data.py` | 改 | `target` 从「数据侧左移」改成**与 input 同下标**（两条线口径统一） |
+| `.../data/tokenizer.py` | 改 | `encode` 改「**最长匹配优先**」⇒ 特殊 token 整体一个 id（`encode("<bos>")==[2]`） |
+| `.../evaluate.py` | 改 | `_generate_responses` 改成**按 token id 个数**切回答 |
+| `.../generate.py` | 改 | 新增 `generate_response()`（只要回答那一段） |
+| `.../train_sft.py` | 改 | 样例打印改用 `generate_response`（不再按字符串长度切） |
+| `.../data/debug_tokenizer.py` | 改 | 「重要发现」块改成 feat-027 后的正确描述 + 现场断言 |
+| `init.sh` | 改 | **L1 新增「P1 训练口径守卫（feat-027）」**；**L2 新增「模型 loss 确实错位」断言** |
+| `gpt-learning/5.损失函数.md` | 改 | 新增 §14「本仓库的实现位置 + 「错位做几次」这个坑」 |
+| `gpt-learning/7.sft-train.md` | 改 | 新增 §16「本仓库怎么实现的（源码位置 + 一个真实的坑）」 |
+| `gpt-learning/13.gpt2评估.md` | 改 | 新增 §十八「四个生成类指标的前提：回答是怎么切出来的」 |
+| `.../gpt-learning-pytorch/README.md` | 改 | 新增「训练口径（三条线必须一致，feat-027）」小节 |
+| `qwen3-learning/Qwen3_训练推理完整学习笔记.md` | 改 | §13.6 换成修后的数字（留档修前的）；**§13.7 改写成「根因 + 修法 + 修后效果」** |
+
+**没动的**：`config.py` 的**任何**超参、`evaluate.py` 的**任何**指标与阈值、
+Qwen3 线的任何代码（它的 LoRA/DPO 路线本来就不走 SFT）。
+
+#### 验证命令与实测输出
+
+```bash
+# ① 轻量验证（含新增的两条守卫）
+bash init.sh
+  [PASS] P1 训练口径守卫（feat-027）口径一致：特殊 token 单 id；SFT/预训练 labels 同下标；末位监督目标 = EOS
+  [PASS] 模型前向 smoke（logits 形状 + loss 有限 + 错位口径 + 参数量）logits (2, 8, 45) loss 3.8658 params 794496；错位口径 OK
+  ...
+  PASS=30  SKIP=0  FAIL=0
+
+# ② L3 全链重跑（改训练代码 ⇒ 必须全量）
+cd gpt-learning/gpt-learning-pytorch
+python data/build_vocab.py && python train_pretrain.py && python train_sft.py \
+  && python train_reward.py && python train_ppo.py
+  [pretrain] val_loss 3.0069 | val_ppl 20.23
+  [sft]     done. iter=1000 | val_loss=1.5994 | val_ppl=4.95 | best_val_loss=1.5994 | wall=227.0s
+  [reward]  done. iter=1000 | val_acc=0.7365 | val_loss=0.3839 | best_val_acc=0.7365 | best_val_loss=0.3839 | wall=225.6s
+  [ppo]     === done === iter=100 | final RM(last10)=+1.7366 | final ref_KL/token=+0.1696 | best RM=+3.0704 | wall=140.3s
+  [ppo] RM trend: first 5 = ['-1.419','-3.664','-1.367','-3.303','-0.552']
+               | mid  = ['+0.992','+1.070','+1.143','+2.670','+1.048']
+               | last 5 = ['+1.351','+1.264','+2.711','+2.052','+2.641']
+
+# ③ 9 项评估
+python evaluate.py --stage all
+  [eval] stage=pretrain → perplexity = 20.24  loss = 3.0076
+  [eval] stage=sft      → distinct_1 0.0119 / distinct_2 0.0861 / distinct_3 0.2664
+                            self_bleu 0.8579 / token_entropy 1.3094 / response_quality 0.3600
+                            benchmark_accuracy 0.2500
+  [eval] stage=reward   → value 0.7365 / val_loss 0.3839 / margin 2.9890
+                            mean_r_chosen 3.5436 / mean_r_rejected 0.5546
+  [eval] stage=ppo      → distinct_1 0.0159 / mean_response_length 37.8200 / response_quality 0.5150
+  [eval] stage=compare  → sft_distinct_1 0.0200 / ppo_distinct_1 0.0266
+                            sft_response_quality 0.3417 / ppo_response_quality 0.5167
+                            sft_rm_score -2.7321 / ppo_rm_score 0.9188 / improvement 3.6509
+  [eval] stage=speedup  → value 2.1504（naive 50.87ms / kv 23.66ms）
+
+# ④ 跨线并排（固定 seed ⇒ 逐字可复现）
+cd qwen3-learning/qwen3-pytorch && python ablations/compare_quality.py
+  表 1 微调对（GPT-2 SFT vs Qwen3 LoRA）
+    distinct_1 0.0292/0.0258  distinct_2 0.1548/0.1277  self_bleu 0.7595/0.7907
+    token_entropy 1.4653/5.7975  token_entropy_normalized 0.3849/0.8709
+    response_quality 0.2583/0.0833  response_quality_ex_length 0.0111/0.1111
+    mean_response_chars 32.0000/139.6333
+  · GPT-2 这一侧：正常（公共后缀 0 字符 / 平均 32.0 字符 = 0%）
+  表 2 口径交叉验证：两对模型各 5 个指标全部逐值相等（差值 0.000e+00，容差 1e-09）
+```
+
+#### 修之前 vs 修之后
+
+| 指标 | 修之前 | 修之后 | 出处 |
+|---|---|---|---|
+| 退化判据（公共后缀占比） | 47 / 48.0 = **98%** | 0 / 32.0 = **0%** | `compare_quality.py` |
+| SFT `distinct_1` | 0.0076 | 0.0292 | `compare_quality.py`（固定 seed） |
+| SFT `self_bleu` | 1.0000（恒定输出） | 0.7595 | 同上 |
+| SFT `token_entropy` | 0.0000 | 1.4653 | 同上 |
+| SFT `response_quality` | 0.2500（全靠长度规则） | 0.2583（扣长度规则后 0.0111） | 同上 |
+| `sft_rm_score` | 0.0696 | **−2.7321** | `evaluate.py --stage compare`（采样，数值会浮动） |
+| `ppo_rm_score` | 0.0696 | **+0.9188** | 同上 |
+| PPO `improvement` | **0.0000** | **+3.6509** | 同上 |
+| PPO 训练中的 RM 走势 | 无（常量） | 前 5 次 −1.4…−3.7 → 后 5 次 **+1.3…+2.6** | `train_ppo.py` 日志 |
+
+⇒ **塌陷不是「小模型学不会」，是训练目标写错了。**
+修完之后 PPO 第一次真的在优化奖励（RM 分数从负数爬到正数）。
+
+#### 三个方法论教训
+
+1. **判「模型是否退化」不能看「回答数量」** —— 要看**公共后缀长度**。
+   （`sft.pt` 会把 prompt 的最后一个字符一起吐出来，30 条不同问题得到 30 条「看起来不同」的回答。）
+2. **指标异常时先怀疑度量，再怀疑模型 —— 但别把两者混成一个。**
+   这次的 `distinct_1=0.0076` 有一半是**切片 bug** 造成的；
+   可**切片不是塌陷的原因**：修完切片，公共后缀**仍是** 47/48 = 98%，
+   三个缺陷全修完才变成 0%。**两个独立根因要分别验证、分别修。**
+3. **训练口径必须写进机器守卫** —— 「换个数据线就换个学到的任务」永远没人会发现，
+   除非 `init.sh` 里有一条断言直接把它判红。
+
+#### 最终状态
+
+| 项 | 值 |
+|---|---|
+| `feature_list.json` | **27 passing / 0 in_progress / 0 not_started**（priority 严格 1..27） |
+| `bash init.sh` | `PASS=30  SKIP=0  FAIL=0` |
+| GPT-2 `evaluate.py --stage all` | 退出码 0，9 个评估函数全跑完 |
+| `qwen3-pytorch` `python tests/run_all.py` | `PASS=18  FAIL=0  TOTAL=18` |

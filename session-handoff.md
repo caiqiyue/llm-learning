@@ -17,8 +17,10 @@ Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO + KV Cache 推理�
 **生成质量已与 GPT-2 线并排**（4 个指标**共用同一份实现** `quality.py`，
 并用 GPT-2 线**自己的** `evaluate.py` 做**口径交叉验证** ⇒ 5 个指标**逐值相等**，差 0.000e+00），
 **9 篇笔记的源码交叉引用已补齐**（BPE 笔记新建 + 每篇开头三行引用块 + 一个可运行的链接校验测试），
-**笔记数字 ↔ `config.py` 的全量核对也做完了**（真错 2 处已改笔记 + 一个可运行的数字一致性守卫）。
-**26 个 feature 全部 passing**，只剩收班。
+**笔记数字 ↔ `config.py` 的全量核对也做完了**（真错 2 处已改笔记 + 一个可运行的数字一致性守卫），
+**P1 线的 SFT 塌陷也修好了**（feat-027：三个互相咬合的缺陷 —— 训练目标与推理目标不一致 /
+特殊 token 不可达 / 评估切片错位；修完 PPO 第一次真的在优化奖励）。
+**27 个 feature 全部 passing**，只剩收班。
 
 ---
 
@@ -54,7 +56,7 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 ## Verified Now（哪些是已验证的）
 
-- `bash init.sh` → **PASS=29 SKIP=0 FAIL=0**（2026-10-23，L4 已有九条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke** / **评估 smoke** / **生成质量 smoke** / **退化对照 smoke**）
+- `bash init.sh` → **PASS=30 SKIP=0 FAIL=0**（2026-10-23，L4 已有九条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke** / **评估 smoke** / **生成质量 smoke** / **退化对照 smoke**；L1 另加「**P1 训练口径守卫（feat-027）**」、L2 另加「模型 loss 确实错位」断言）
 - `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=18 FAIL=0 TOTAL=18**
 - Qwen3 前向 smoke 已用**真实 BPE 词表**（vocab 778）跑通：`logits (2, 8, 778) loss 6.6897 params 985,856`
 - Qwen3 训练步 smoke：`[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05`
@@ -153,6 +155,9 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
   - 根 `README.md` 的 Qwen3 索引表补「Qwen3 源码」列并覆盖全部 9 篇；
     同时把根 README 里几处**过期描述**改成现状（目录树 / 阶段表 / 代码结构 / torch 环境 / 核心思路）
 - GPT-2 线：`python evaluate.py --stage all` 退出码 0，9 项评估全过
+  （**feat-027 修完之后**：pretrain ppl 20.24 / sft distinct_1 0.0119 self_bleu 0.8579
+  response_quality 0.3600 / ppo distinct_1 0.0159 response_quality 0.5150 /
+  compare `sft_rm_score −2.7321` `ppo_rm_score +0.9188` `improvement +3.6509`）
 - 各 feature 的详细证据在 `feature_list.json` 的 `evidence` 数组里（feat-011 ~ feat-025 都有）
 
 ### feat-009 — 笔记数字 ↔ `config.py` 全量核对（Session 012）
@@ -184,19 +189,58 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 - **⚠️ 唯一例外：实测值（speedup）不能当超参审计** —— 笔记写 1.748x / 1.999x，
   同机复跑是 **1.6992x / 1.841x**。**结论不变，但小数点不可当常数** ⇒ 已给该表加免责说明。
 
+### feat-027 — P1 线 SFT 塌陷的根因与修法（Session 014）
+
+- **症状**：`sft.pt` / `ppo.pt` 对**任何** prompt 都输出同一串常量
+  （公共后缀 47 字符 / 平均 48.0 字符 = **98%**）；`pretrain.pt` 正常（0%）。
+  PPO 相对 SFT 零提升（`sft_rm_score = ppo_rm_score = 0.0696`，`improvement = 0.0000`）。
+- **根因**：**训练目标 ≠ 推理目标**。`data/sft_data.py` 的 labels 与 input_ids **同下标**，
+  而 `model/gpt2.py` 的 loss **不做错位** ⇒ SFT 教模型「输出**当前** token」（copy）
+  ⇒ 推理时 prompt 以空格结尾 ⇒ 模型把最后一个 token 复制出来 ⇒ **无限吐空格**
+  （实测 48 个 token 全是空格 id=5，第一步 top-1 logit 14.949 vs 第二名 'A' 3.237）。
+  预训练线当时在**数据侧**左移、SFT 线没左移 ⇒ **两条数据线口径不一致**
+  （比任何一条单独写错更危险：不报错，只是让模型悄悄学成另一个任务）。
+- **另外两个互相咬合的缺陷**：
+  ② `encode` 逐字符查表 ⇒ `"<sep>"` 变成 5 个字符 ⇒ **BOS/EOS/SEP 的 id 永远不可达**
+  ⇒ 模型从没学过吐 EOS ⇒ 生成永远跑满 `max_new_tokens`；
+  ③ 评估用**字符串长度**切解码后的文本，而 `UNK` 解码回来是 5 字符的 `"<unk>"`
+  ⇒ 每条回答都被塞上 `"? <unk>sep<unk> "` 前缀 ⇒ 污染 `distinct_n` / `self_bleu` / `response_quality`。
+- **修法（定下来的唯一口径）**：**错位只在模型里做一次**
+  —— 两条数据线都保持「labels 与 input 同下标」，模型内部
+  `F.cross_entropy(logits[:, :-1, :], targets[:, 1:])`；
+  特殊 token 整体一个 id（`encode` 改「最长匹配优先」）；回答按 **token id 个数**切。
+  **为什么不用「数据侧预左移」**：笔记 5/7 原本写的就是这一套（HF 标准形式），
+  改代码迁就另一种口径 = 让笔记变成错的；而且错位只在一处，第三条数据线不容易跑偏。
+- **修完的效果**（L3 全链重跑 + `evaluate.py --stage all`，退出码 0）：
+
+| 指标 | 修之前 | 修之后 |
+|---|---|---|
+| 退化判据（公共后缀占比） | 47 / 48.0 = **98%** | 0 / 32.0 = **0%** |
+| SFT `self_bleu` | 1.0000（恒定输出） | 0.8579 |
+| SFT `token_entropy` | 0.0000 | 1.3094 |
+| SFT `response_quality` | 0.2500 | 0.3600 |
+| `sft_rm_score` | 0.0696 | **−2.7321** |
+| `ppo_rm_score` | 0.0696 | **+0.9188** |
+| PPO `improvement` | **0.0000** | **+3.6509** |
+| PPO 训练中的 RM 走势 | 无（常量） | 前 5 次 −1.4…−3.7 → 后 5 次 **+1.3…+2.6** |
+
+  ⇒ **塌陷不是「小模型学不会」，是训练目标写错了**；修完之后 PPO 第一次真的在优化奖励。
+- **机器守卫**：`init.sh` L1「P1 训练口径守卫（feat-027）」+
+  L2「模型 loss 必须等于手工算的 `CE(logits[:,:-1], targets[:,1:])`」
+  ⇒ 改坏口径直接判红，不再靠人读代码发现。
+- **受影响的笔记**：`gpt-learning/5.损失函数.md` §14、`gpt-learning/7.sft-train.md` §16、
+  `gpt-learning/13.gpt2评估.md` §十八、`gpt-learning/gpt-learning-pytorch/README.md`
+  「训练口径」小节、`qwen3-learning/Qwen3_训练推理完整学习笔记.md` §13.7。
+
 ## Broken Or Unverified（坏的 / 没验证的）
 
-- **★ P1 线：SFT / PPO checkpoint 退化成常量输出（Session 013 新发现，未修）**
-  GPT-2 线的 `sft.pt` 与 `ppo.pt` 对**任何** prompt 都输出同一串常量
-  （`'? <unk>sep<unk>'` + 41 个空格，48 字符；公共后缀占比 **98%**），
-  而 `pretrain.pt` 的输出是**有变化的**（公共后缀 0%）
-  ⇒ **SFT 之后模型塌成了常量输出**。
-  这与早就记着的「PPO 相对 SFT 无提升、`sft_rm_score = ppo_rm_score = 0.0696`」是**同一个现象**：
-  只能吐常量 ⇒ RM 只能给常量分 ⇒ PPO 没有可优化的方向。
-  **没有修**（修它要改 P1 线的训练代码并跑 L3 全量 ≈ 10 分钟，是另一个 feature 的事）。
-  判据见 `qwen3-learning/qwen3-pytorch/ablations/compare_quality.py` 的 `_degeneracy_report()`。
-  ⚠️ 后果：**GPT-2 线所有「生成质量 / RM / PPO」的结论都建立在一个塌掉的模型上**，
-  引用那些数字时必须带上这条。
+- ~~**★ P1 线：SFT / PPO checkpoint 退化成常量输出**~~ **✅ 已修（feat-027，Session 014）**
+  症状：`sft.pt` / `ppo.pt` 对任何 prompt 都输出同一串常量（公共后缀 47/48 = 98%），
+  PPO 相对 SFT 零提升（`rm_score = 0.0696` / `improvement = 0.0000`）。
+  **根因**：训练目标 ≠ 推理目标（SFT 的 labels 同下标 + 模型 loss 不左移 ⇒ 学成「复制当前 token」），
+  外加「特殊 token 不可达」与「评估切片错位」两个缺陷。
+  修完：公共后缀 0%（0/32.0）、`ppo_rm_score` **+0.9188**、`improvement` **+3.6509**。
+  细节与新数字见上面「feat-027」小节。
 - **Qwen3 的评估侧是「精简 6 段」**（feat-025 六段 + feat-026 补齐生成质量）：
   GPT-2 线那 9 项里的 `benchmark` **本线没有**（合成语料没有 QA 题库）—— 差异已在
   `qwen3-learning/qwen3-pytorch/README.md` 逐项列出。
@@ -234,20 +278,21 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 | 顺序 | feature | 做什么 | 为什么是它 |
 |------|---------|--------|--------|
-| — | **无** | — | **26 个 feature 全部 passing**，P2 阶段（Qwen3 从零实现）已收班 |
+| — | **无** | — | **27 个 feature 全部 passing**，P2 阶段（Qwen3 从零实现）已收班 |
 
 **下一个 session 建议做的第一件事**（不在 `feature_list.json` 里，因为还没立项）：
 读本卡的「Broken Or Unverified」段落，挑一条已知缺口**立项**成新的 feature。
 目前最值得做的三条：
-① **修 P1 线的 SFT 塌陷**（Session 013 新发现）—— `sft.pt` / `ppo.pt` 对任何 prompt 都输出同一串常量，
-   导致 RM / PPO 的结论全部建立在一个塌掉的模型上。要动 P1 线的训练代码 + 跑 L3 全量（≈10 min），
-   **属于「改 GPT-2 线」的活，需要先跟用户确认**；
+① ~~**修 P1 线的 SFT 塌陷**~~ **✅ 已做（feat-027，Session 014）** ——
+   `sft.pt` / `ppo.pt` 不再吐常量（公共后缀 0%），`ppo_rm_score` 0.0696 → +0.9188，
+   `improvement` 0.0000 → +3.6509；口径写进了 `init.sh` 的 L1/L2 守卫；
 ② **feat-009 守卫的第 3 个盲点自动化**（散落在散文里的「128 维」「4 层」目前靠人读）；
 ③ **把 GPT-2 线的 `get_lr` 等实现细节也做成「笔记抄源码必须逐字一致」的守卫**
    （本次手抄的 `get_lr` 就抄错了，是靠人眼发现的）。
 
-**这一步不许动的**：不改 GPT-2 线的任何训练代码或超参（除非按 ① 立项并得到用户确认）；
-不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值。
+**这一步不许动的**：不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值；
+GPT-2 线的训练代码只允许在**已立项且已确认**的 feature 里改（feat-027 已改完，
+它改的只有**口径**与**切片**，没有动 `config.py` 的任何超参，也没有动 `evaluate.py` 的指标与阈值）。
 
 ---
 
@@ -292,6 +337,11 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 | **「目录 → config」的规则对跨线文档不成立** | `qwen3-learning/` 里的文档引用了 **GPT-2** 的值时，守卫会拿 Qwen3 的 config 去比 ⇒ 误报。**这不是 bug，是守卫的适用范围问题** —— 跨线比较的文档（如 `开发计划.md`）应**移出自动守卫、改为人工核对**，而不是把报错关掉 |
 | **实测值不是超参** | 耗时 / 加速比随机器负载浮动（笔记写 1.748x / 1.999x，复跑 1.6992x / 1.841x）。**只能写「同机复跑」并注明波动范围，不能锁死小数点**；`evaluate.py` 对 speedup 的门槛也应该是**方向性**的（> 1）而不是固定阈值 |
 | **「同一个事实写在两处就会漂移」** | 设计.md §5.1 的 RMSNorm 判据写「均值≈0」（错），而 `开发计划.md` 同一处**早已是正确写法**（「平方均值归一化到 1」）—— 两处只改一处，就出现矛盾。**判据类文字必须能指向一个可跑断言** |
+| **「错位做几次」决定模型学到什么** | SFT 的 labels 与 input **同下标** + 模型 loss **不左移** ⇒ 模型学的是「输出**当前** token」（复制）⇒ 推理时无限吐空格。**预训练对、SFT 错**，因为两条数据线的错位次数不一致。**错位只允许做一次**（放在模型里），两条数据线都用同一口径 |
+| **特殊 token 是多字符词表条目 ⇒ 逐字符 encode 永远够不到它** | `"<sep>"` 会被拆成 5 个字符（`'<'`→UNK）⇒ `BOS/EOS/SEP` 的 id 永不出现 ⇒ **模型学不会自己停**，生成永远跑满 `max_new_tokens`。修法：`encode` 改成「最长匹配优先」，特殊 token 整体一个 id |
+| **回答不能按「字符串长度」切，要按「token id 个数」切** | `UNK` 在词表里是**整条** `"<unk>"`（5 个字符）⇒ 解码后的 prompt 前缀 47 字符 vs 原始 31 字符 ⇒ 每条回答被塞上 `"? <unk>sep<unk> "` 前缀 ⇒ 污染 `distinct_n` / `self_bleu` / `response_quality` |
+| **指标异常时先怀疑度量，再怀疑模型 —— 但别把两者混成一个** | feat-026 里 GPT-2 侧 `distinct_1` 低得离谱，一半是切片 bug 造成的；可**切片不是塌陷的原因**（修完切片，公共后缀仍是 47/48 = 98%）。**两个独立根因要分别验证、分别修** |
+| **「训练口径」必须写进机器守卫** | 「换个数据线就换个学到的任务」这件事不报错、只看指标才发现 ⇒ 断言要直接钉在数据与 loss 上：`labels[j]==x[j]`、末位监督目标 == EOS、以及**手工重算 `CE(logits[:,:-1], targets[:,1:])` 与模型 loss 比对** |
 
 ---
 

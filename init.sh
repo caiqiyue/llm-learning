@@ -151,6 +151,58 @@ PY
   else
     fail "数据层 smoke" "$(tail -3 /tmp/llm_init_l1.log | tr '\n' ' ')"
   fi
+
+  # 【feat-027】P1 线「训练口径守卫」——纯 Python，不依赖 torch。
+  #   守卫 feat-027 修掉的三个缺陷，防止以后改代码时又踩回去：
+  #   ① 特殊 token 必须整体一个 id（BOS/SEP/EOS 可达，否则模型学不会停）；
+  #   ② SFT / 预训练两条数据线的 labels 必须**同下标**（labels[t] = input_ids[t]），
+  #      错位统一由模型内部做（model/gpt2.py: CE(logits[:, :-1], targets[:, 1:])）；
+  #      口径错了模型会学成"复制当前 token"，推理时塌成吐空格；
+  #   ③ prompt 部分必须被 mask 干净，且最后一个监督目标必须是 EOS。
+  PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l1b.log 2>&1
+from data.tokenizer import CharTokenizer, BOS_ID, SEP_ID, EOS_ID
+from data.sft_data import SFTDataset, generate_sft_dataset
+from data.pretrain_data import format_pretrain_for_lm, generate_pretrain_dataset
+
+tk = CharTokenizer("data/vocab.txt")
+
+# ① 特殊 token 整体一个 id
+assert tk.encode("<bos>") == [BOS_ID], f"<bos> 应是单 token: {tk.encode('<bos>')}"
+assert tk.encode("<sep>") == [SEP_ID], f"<sep> 应是单 token: {tk.encode('<sep>')}"
+assert tk.encode("<eos>") == [EOS_ID], f"<eos> 应是单 token: {tk.encode('<eos>')}"
+
+# 往返：含特殊 token 的串也能 decode 回原文（表外字符会变 UNK，不在断言范围）
+s = "<bos> A dog runs. <sep> It runs fast. <eos>"
+assert tk.decode(tk.encode(s)) == s, "特殊 token 往返失败"
+
+# ② SFT labels 与 input_ids 同下标，prompt 部分被 mask
+ds = SFTDataset(generate_sft_dataset(n_samples=8, seed=42))
+for k in range(len(ds)):
+    it = ds[k]
+    x = it["input_ids"].tolist()
+    y = it["labels"].tolist()
+    pl = int(it["prompt_len"])
+    sup = [j for j, v in enumerate(y) if v != -100]
+    assert sup, "SFT 样本没有任何监督位置"
+    assert all(y[j] == -100 for j in range(pl)), "prompt 部分没有 mask 干净"
+    for j in sup:
+        assert y[j] == x[j], f"labels[{j}] != input_ids[{j}]（口径不是同下标）"
+    # 最后一个监督目标必须是 EOS（模型要学会自己停）
+    assert y[sup[-1]] == EOS_ID, f"最后一个监督目标不是 EOS: {y[sup[-1]]}"
+
+# ③ 预训练线同口径（target_ids 与 input_ids 同下标）
+blocks = format_pretrain_for_lm(generate_pretrain_dataset(n_samples=8, seed=42), block_size=64)
+for b in blocks[:2]:
+    xi, yi = b["input_ids"], b["target_ids"]
+    assert list(xi) == list(yi), "预训练线口径与 SFT 线不一致（应同下标）"
+
+print("口径一致：特殊 token 单 id；SFT/预训练 labels 同下标；末位监督目标 = EOS")
+PY
+  if [ $? -eq 0 ]; then
+    ok "P1 训练口径守卫（feat-027）$(tail -1 /tmp/llm_init_l1b.log)"
+  else
+    fail "P1 训练口径守卫（feat-027）" "$(tail -3 /tmp/llm_init_l1b.log | tr '\n' ' ')"
+  fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -161,7 +213,7 @@ if [ "$HAS_TORCH" -ne 1 ]; then
 else
   cd "$PY_DIR" || fail "进入代码目录失败" "$PY_DIR"
 
-  "$PY" - <<'PY' >/tmp/llm_init_l2.log 2>&1
+  PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l2.log 2>&1
 import torch
 import config
 from data.tokenizer import CharTokenizer
@@ -182,11 +234,26 @@ out2 = model(idx, targets=targets)
 loss = out2[1]
 assert loss is not None and torch.isfinite(loss), f"loss 异常: {loss}"
 
+# 【feat-027】口径守卫：模型内部必须真的做「错位一位」。
+#   期望 CE(logits[:, :-1], targets[:, 1:])；若模型改成不左移，
+#   SFT 会把模型训成"复制当前 token" ⇒ 推理塌成吐空格（feat-027 的原始 bug）。
+import torch.nn.functional as F
+model.eval()
+with torch.no_grad():
+    lg, _, _ = model(idx)
+    manual = F.cross_entropy(
+        lg[:, :-1, :].contiguous().view(-1, lg.size(-1)),
+        targets[:, 1:].contiguous().view(-1),
+        ignore_index=-100,
+    )
+assert abs(float(loss) - float(manual)) < 1e-5, \
+    f"模型 loss 没有做错位：{float(loss):.6f} vs 期望 {float(manual):.6f}"
+
 n_params = sum(p.numel() for p in model.parameters())
-print(f"logits {tuple(logits.shape)} loss {loss.item():.4f} params {n_params}")
+print(f"logits {tuple(logits.shape)} loss {loss.item():.4f} params {n_params}；错位口径 OK")
 PY
   if [ $? -eq 0 ]; then
-    ok "模型前向 smoke（logits 形状 + loss 有限 + 参数量）$(tail -1 /tmp/llm_init_l2.log)"
+    ok "模型前向 smoke（logits 形状 + loss 有限 + 错位口径 + 参数量）$(tail -1 /tmp/llm_init_l2.log)"
   else
     fail "模型前向 smoke" "$(tail -3 /tmp/llm_init_l2.log | tr '\n' ' ')"
   fi

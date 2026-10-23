@@ -48,6 +48,17 @@ python evaluate.py --stage all       --all_checkpoints checkpoints/
 
 9 个评估函数：PPL、pairwise accuracy、Distinct-N、Self-BLEU、token entropy、response quality、SFT vs PPO、toy benchmark、KV speedup。
 
+## 训练口径（三条线必须一致，feat-027）
+
+| 约定 | 在哪 | 为什么 |
+|------|------|--------|
+| `labels` / `target_ids` 与 `input_ids` **同下标** | `data/sft_data.py` / `data/pretrain_data.py` | 错位（"logits[t] 预测 token t+1"）**只在模型里做一次**（`model/gpt2.py`：`CE(logits[:, :-1], targets[:, 1:])`）⇒ 两条数据线口径必然一致，不会一边左移一边不左移 |
+| 特殊 token（`<bos>` `<sep>` `<eos>`）**整体一个 id** | `data/tokenizer.py` 的 `encode`（最长匹配优先） | 否则 `BOS/EOS/SEP` 三个 id 永远不会被产生 ⇒ 模型学不会自己停，生成永远跑满 `max_new_tokens` |
+| 回答按 **token id 个数**切，不按字符串长度切 | `evaluate._generate_responses` / `generate.generate_response` | `UNK` 解码回来是 5 字符的 `"<unk>"`，按字符数切会错位，每条回答都被塞上 `"? <unk>sep<unk> "` 前缀 |
+
+> 这三条都有**机器守卫**：`bash init.sh` 的 L1（数据线同下标 + 特殊 token 单 id）
+> 与 L2（模型 loss 确实错位）会直接把改坏的代码判红。
+
 ## 推理示例
 
 ```python

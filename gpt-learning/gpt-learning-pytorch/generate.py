@@ -342,6 +342,67 @@ def generate_text(
 
 
 # ===========================================================================
+# 4.5 generate_response：只要「回答」那一段（【feat-027】）
+# ===========================================================================
+def generate_response(
+    model_or_wrapped: nn.Module,
+    tokenizer,
+    prompt_str: str,
+    max_new_tokens: int = 64,
+    mode: str = "kv",
+    temperature: float = 1.0,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    eos_id: Optional[int] = None,
+    device: str = "cpu",
+) -> str:
+    """
+    生成并**只返回回答部分**（不含 prompt）。
+
+    【feat-027】为什么不能直接 `full[len(prompt_str):]`？
+      字符级 tokenizer 里，UNK（id=0）在词表里是**整条** "<unk>"（5 个字符），
+      逐字符 decode 出来会长于 1 个字符 ⇒ 用**字符串长度**去切**解码后的文本**会错位：
+      实测 GPT-2 的每条 response 都被切掉了 prompt 的尾巴，多出 "? <unk>sep<unk> " 前缀。
+      正确做法：按 **token id 个数**切（prompt 占前 n_prompt 个），
+      再把新生成的 id 单独 decode。
+
+    参数：
+        同 generate_text
+    返回：
+        str：回答文本（已去掉 EOS 本身）
+    """
+    if eos_id is None:
+        eos_id = getattr(tokenizer, "EOS_ID", 3)
+
+    model_or_wrapped.eval()
+    ids = tokenizer.encode(prompt_str)
+    if not ids:
+        return ""
+    idx = torch.tensor([ids], dtype=torch.long, device=device)
+
+    if mode == "naive":
+        out = generate_naive(
+            model_or_wrapped, idx, max_new_tokens,
+            temperature=temperature, top_k=top_k, top_p=top_p, eos_id=eos_id,
+        )
+    elif mode == "kv":
+        if not isinstance(model_or_wrapped, GPT2WithKVCache):
+            model_or_wrapped = GPT2WithKVCache(model_or_wrapped)
+        out = generate_kv(
+            model_or_wrapped, idx, max_new_tokens,
+            temperature=temperature, top_k=top_k, top_p=top_p, eos_id=eos_id,
+        )
+    else:
+        raise ValueError(f"mode 必须是 'naive' 或 'kv'，收到 {mode!r}")
+
+    # ★ 按 token 个数切，不按字符串长度切
+    new_ids = out[0].tolist()[len(ids):]
+    if eos_id in new_ids:            # 双保险：generate_* 一般已在 EOS 处停住
+        new_ids = new_ids[: new_ids.index(eos_id)]
+    return tokenizer.decode(new_ids)
+
+
+# ===========================================================================
 # 5. benchmark_speed：naive vs kv 速度对比
 # ===========================================================================
 def benchmark_speed(

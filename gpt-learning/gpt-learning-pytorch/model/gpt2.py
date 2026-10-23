@@ -413,7 +413,8 @@ class GPT2(nn.Module):
 
     forward 输入：
         idx: (B, T) LongTensor 的 token id
-        targets: (B, T) LongTensor 的下一 token id（训练时给，-100 表示忽略）
+        targets: (B, T) LongTensor，与 idx **同下标**（训练时给，-100 表示忽略）；
+                  错位（"logits[t] 预测 token t+1"）在 forward 内部完成，见下方说明
         kv_cache: KVCache 或 None（推理加速用）
         position_ids: (B, T) LongTensor，**绝对位置**（与 sinusoidal pos_emb 对齐）
                        若 kv_cache 不为 None，必须显式提供
@@ -626,9 +627,20 @@ class GPT2(nn.Module):
           - value_head 默认 None；调用 attach_value_head() 后才挂载（PPO/RM 用）
           - 当 value_head 存在时返回 4 元组，否则 3 元组（向后兼容）
 
+        【targets 的口径（feat-027 定下来的唯一约定）】
+          约定：**targets 与 idx 同下标**（targets[t] = idx[t]），只是 SFT 会把
+          prompt 部分置 -100。**错位（"logits[t] 预测 token t+1"）在本函数内部做**：
+              CE(logits[:, :-1], targets[:, 1:])
+          · 预训练线：`data/pretrain_data.py` 的 target_ids = input_ids（同下标）✅
+          · SFT 线：`data/sft_data.py` 的 labels = input_ids，prompt 部分 -100 ✅
+            （feat-027 之前：模型不左移 + labels 同下标 ⇒ 模型学成"复制当前 token"
+              ⇒ 推理塌成吐空格；且预训练的数据侧左移、SFT 不左移，两条线口径打架）
+          ⇒ 推论：logits[t] 恒等于「下一个 token 的分布」，PPO 的
+            log_softmax(logits[:, :-1]) 配 full_ids[:, 1:] 用的就是这个约定。
+
         参数：
             idx:         (B, T) LongTensor 的 token id
-            targets:     (B, T) LongTensor 下一 token id；-100 表示 mask
+            targets:     (B, T) LongTensor，与 idx **同下标**；-100 表示该位置不算 loss
                          None 时不计算 loss
             kv_cache:    KVCache 或 None（推理时用）
             position_ids:(B, T) LongTensor 绝对位置；kv_cache 不为 None 时必须显式提供
@@ -692,16 +704,21 @@ class GPT2(nn.Module):
         logits = self.head(x) #32,128,45             /infra 1,22,45                  # (B, T, V)
 
         # === 6) [可选] 损失计算：cross_entropy（错位 1 位）===
-        #    训练时 targets = input_ids 左移 1 位（即 target[t] = input[t+1]）
-        #    logits[:, :-1, :] 是"位置 0..T-2 的预测"，对应预测位置 1..T-1
+        #    口径：**错位在模型内部做**，数据侧不动。
+        #    targets[t] = input[t]（同下标），于是
+        #      logits[:, :-1]  ↔  targets[:, 1:]
+        #    即「位置 t 的输出预测位置 t+1 的 token」。
+        #    ⇒ logits[t] 恒等于「下一个 token 的分布」，
+        #      PPO（log_softmax(logits[:, :-1]) 配 full_ids[:, 1:]）与
+        #      eval_benchmark 用的都是这个约定。
         loss: Optional[torch.Tensor] = None
         if targets is not None:    #targets 32,128
-            # logits: (B, T, V) → view → (B*T, V)
-            # targets: (B, T)  → view → (B*T,)
+            # logits: (B, T, V) → 去掉最后一个位置 → view → (B*(T-1), V)
+            # targets: (B, T)  → 去掉第一个位置 → view → (B*(T-1),)
             # ignore_index=-100：SFT 的 prompt 部分 loss 自动被 mask 掉
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),            # (B*T, V)  4096,45
-                targets.view(-1),                            # (B*T,)   4096
+                logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),  # (B*(T-1), V)
+                targets[:, 1:].contiguous().view(-1),                        # (B*(T-1),)
                 ignore_index=-100,
             )
 

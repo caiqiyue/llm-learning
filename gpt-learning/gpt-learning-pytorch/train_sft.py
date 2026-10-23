@@ -36,7 +36,7 @@ from utils import set_seed, get_device, load_checkpoint, save_checkpoint
 from model.gpt2 import GPT2
 from data.sft_data import make_sft_loader
 from data.tokenizer import CharTokenizer
-from generate import generate_text
+from generate import generate_text, generate_response
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +285,9 @@ try:
         # 拼成 SFT 训练时同样的 prompt 格式
         prompt_text = f"<bos> {s['prompt']} <sep> "
         try:
-            full_text = generate_text(
+            # 【feat-027】用 generate_response：按 token id 个数切出回答，
+            #   不用 len(prompt_text) 切解码后的字符串（UNK 解码成 5 字符 "<unk>" 会错位）。
+            resp = generate_response(
                 model,
                 tokenizer,
                 prompt_text,
@@ -295,10 +297,6 @@ try:
                 top_k=safe_top_k,
                 top_p=config.top_p,
             )
-            # 截取 response 部分
-            resp = full_text[len(prompt_text):]
-            if "<eos>" in resp:
-                resp = resp[: resp.index("<eos>")]
             print(f"  prompt:   {s['prompt']!r}")
             print(f"  response: {resp!r}")
             print()

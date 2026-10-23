@@ -105,8 +105,12 @@ def generate_pretrain_dataset(n_samples: int = 10000, seed: int = 42) -> List[Di
 def format_pretrain_for_lm(samples: List[Dict], block_size: int = 128) -> List[Dict]:
     """
     把一摞文本拼接成一个长序列，再用 block_size 切分为固定长块。
-    每块的 input_ids 和 target_ids 都是 block_size 长，target = input 整体左移一位
-    （即 target[t] = input[t+1]，最后一个位置的 target 设为 0，作为填充无影响）。
+    每块的 input_ids 和 target_ids 都是 block_size 长，且**同下标**
+    （target[t] = input[t]）。
+
+    【feat-027】错位（"logits[t] 预测 token t+1"）由**模型内部**完成
+    （`model/gpt2.py`：`F.cross_entropy(logits[:, :-1], targets[:, 1:])`），
+    数据侧不再左移 —— 错位只有**一个**地方，两条数据线（预训练 / SFT）口径必然一致。
 
     注意：拼接前在每个文本之间插入一个换行作为边界，避免两段末尾字符意外相接。
     tokenizer 的 vocab 一定包含 '\\n'（来自 char 集）。
@@ -133,11 +137,13 @@ def format_pretrain_for_lm(samples: List[Dict], block_size: int = 128) -> List[D
         start = i * block_size
         end = start + block_size
         chunk = ids[start:end]
-        # Causal LM 标准目标：target = input 向左错一位
-        # target[t] = input[t+1]，最后一格用 input[-1] 填充（用 0 即可，因为 loss 会自然 mask）
-        # 但更常见的做法是 target = input[:-1] 然后补一个 padding；为了简单 + 与 char-level 自洽，
-        # 我们把 target[t] 设为 chunk[t+1]（如果存在），不存在则用 chunk[t]（最后一个 token 自监督）
-        target = chunk[1:] + [chunk[-1]] # 答案就是 prompt 往后移一位，比如说 prompt是 1-100 那么答案就是2-101
+        # 【feat-027】target 与 input **同下标**（target = input）。
+        #   错位（"logits[t] 预测 token t+1"）统一由 **模型内部** 完成：
+        #   model/gpt2.py 里是 F.cross_entropy(logits[:, :-1], targets[:, 1:])。
+        #   之前这里做的是 target[t] = input[t+1]（数据侧左移），而模型的 loss 又不左移，
+        #   两条数据线（预训练 / SFT）口径不一致 ⇒ SFT 把模型训成"复制当前 token"
+        #   ⇒ 推理塌成吐空格。现在错位只有**一个**地方，避免以后新增数据线时再踩。
+        target = list(chunk) # 与 input 同下标；最后一格不会被用到（模型丢掉 logits[-1]）
         chunks.append({
             "input_ids": chunk,
             "target_ids": target,

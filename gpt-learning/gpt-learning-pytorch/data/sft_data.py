@@ -187,8 +187,16 @@ class SFTDataset:
 
             input_ids = self.tokenizer.encode(full_text) # len=85
             prompt_len = len(self.tokenizer.encode(prompt_part)) # prompt 32
-            # labels：前 prompt_len 个设为 -100，后面的复制 input_ids
-            labels = [-100] * prompt_len + input_ids[prompt_len:] # len=85， 但前32个位置全是-100 ，代表是prompt
+            # 【feat-027】labels 与 input_ids **同下标**：labels[i] = input_ids[i]，
+            #   只是 prompt 部分（含 <sep>）置 -100。
+            #   错位（"logits[t] 预测 token t+1"）由**模型内部**完成：
+            #   model/gpt2.py 里是 F.cross_entropy(logits[:, :-1], targets[:, 1:])。
+            #   ★ 之前模型的 loss **不左移**，而这里 labels 又与 input 同下标
+            #     ⇒ SFT 教模型"输出**当前** token"（copy）
+            #     ⇒ 推理时 prompt 以空格结尾，模型把最后一个 token 复制出来
+            #     ⇒ 无限吐空格（实测 48 个 token 全是空格 id=5）。
+            #   现在错位只在模型里做一次 ⇒ 预训练线与 SFT 线口径必然一致。
+            labels = [-100] * prompt_len + input_ids[prompt_len:] # len=85，前 32 个位置是 -100（代表 prompt）
             self._cached.append({
                 "input_ids": input_ids,
                 "labels": labels,

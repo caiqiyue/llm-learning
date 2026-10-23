@@ -10237,7 +10237,7 @@ test_config_sync OK
 | `bash init.sh` | `PASS=28  SKIP=0  FAIL=0` |
 | `python tests/run_all.py` | `PASS=17  FAIL=0  TOTAL=17` |
 | Qwen3 `evaluate.py --stage all` | 5/5 段（pretrain / moe / lora / dpo / speedup） |
-| GPT-2 `evaluate.py --stage all` | **9 个评估函数全部跑完，退出码 0**；compare 段复现 feat-006 记录的数值（`sft_rm_score=0.0696` / `ppo_rm_score=0.0696` / `improvement=0.0000`）|
+| GPT-2 `evaluate.py --stage all` | **9 个评估函数全部跑完，退出码 0**；compare 段复现 feat-006 记录的数值（`sft_rm_score=0.0696` / `ppo_rm_score=0.0696` / `improvement=0.0000`）⚠️ **这三个数字已被 feat-027 取代**（当时那条记录的是「塌成常量输出」的塌掉模型：修完训练口径后是 `sft_rm_score=-2.7321` / `ppo_rm_score=+0.9188` / `improvement=+3.6509`）|
 | 笔记 | 数字守卫覆盖 **27 篇**：`gpt-learning/` 17 篇 + `qwen3-learning/` 10 篇（9 篇学习笔记 + `qwen3-pytorch设计.md`）；另 `qwen3-pytorch开发计划.md` 走人工核对（跨线文档，见 Task 20） |
 
 **★ 收班时值得记下来的三件事**
