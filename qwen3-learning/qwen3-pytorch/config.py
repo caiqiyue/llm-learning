@@ -158,6 +158,10 @@ class Qwen3Config:
     # ---------------- 评估 ----------------
     eval_max_samples: int = 200
     eval_seed: int = 1234
+    # 生成质量评估（feat-026）：探针条数与每条最多生成多少 token
+    # （探针 = 动物类问题，GPT-2 线域内 / Qwen3 线域外，见 data/quality_prompts.py）
+    quality_n_samples: int = 30
+    quality_max_new_tokens: int = 32
 
     # ---------------- 系统 ----------------
     seed: int = 42

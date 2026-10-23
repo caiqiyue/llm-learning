@@ -16,6 +16,7 @@ python train/train_lora.py
 python train/train_dpo.py
 python evaluate.py --stage all
 python ablations/compare_with_gpt2.py   # 与 GPT-2 的退化对照（feat-017）
+python ablations/compare_quality.py     # 与 GPT-2 的生成质量并排对照（feat-026）
 ```
 
 ## 概念 → 笔记 → 源码
@@ -32,6 +33,7 @@ python ablations/compare_with_gpt2.py   # 与 GPT-2 的退化对照（feat-017�
 | LoRA / DPO | [LoRA与DPO_学习笔记](../Qwen3_LoRA与DPO_学习笔记.md) | `model/common/lora.py`、`train/train_lora.py`、`train/train_dpo.py` |
 | 训练 → 推理 | [训练推理完整学习笔记](../Qwen3_训练推理完整学习笔记.md) | `train/`、`inference.py` |
 | 与 GPT-2 的退化对照 | [训练推理完整学习笔记 §12](../Qwen3_训练推理完整学习笔记.md) | `ablations/compare_with_gpt2.py` |
+| 生成质量评估 | [训练推理完整学习笔记 §13](../Qwen3_训练推理完整学习笔记.md) | `quality.py`、`data/quality_prompts.py`、`ablations/compare_quality.py` |
 
 > **每篇笔记开头都有「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置 / 对应可跑测试」三行**，
 > 链接的可点开性由 `python tests/test_note_refs.py` 自动校验（链接指向的文件不存在 ⇒ 测试直接红）。
@@ -97,7 +99,7 @@ python ablations/compare_with_gpt2.py
 
 结论与解读见 [`Qwen3_训练推理完整学习笔记.md` §12](../Qwen3_训练推理完整学习笔记.md)。
 
-### 评估指标：与 GPT-2 线 9 项评估的差异（feat-025 的验收项）
+### 评估指标：与 GPT-2 线 9 项评估的差异（feat-025 的验收项 + feat-026 补齐生成质量）
 
 GPT-2 线的 `evaluate.py` 有 9 个评估函数（8 个 `--stage` + `diversity` 里打包的 4 个），
 整套是围绕 **Reward Model + PPO** 设计的。
@@ -113,13 +115,27 @@ Qwen3 线走的是 **LoRA + DPO**：没有显式奖励模型、没有 PPO、没�
 | `ppo` | `eval_ppo`（reward / KL） | 🔁 `dpo` | **本线没有 PPO**。对应物是 DPO 的**隐式奖励 margin**（`r_θ(y) = β(logπ_θ − logπ_ref)`） |
 | `compare` | `eval_sft_vs_ppo` | 🔁 `lora` | **本线没有 PPO**。对应物是 LoRA 段里的「注入前（= 预训练模型）→ 训练后」胜率对比 |
 | `benchmark` | `eval_benchmark`（QA 准确率） | ❌ 无 | 本线语料是**合成语料**，没有 QA benchmark 可做 |
-| `diversity` | `eval_distinct_n` / `eval_self_bleu` / `eval_token_entropy` | ⏳ 未实现 | 属「生成质量」类，本线**尚未实现**（feat-025 的范围是精简评估，不是复制整套生成质量指标） |
-| `response_quality` | `eval_response_quality` | ⏳ 未实现 | 同上 |
+| `diversity` | `eval_distinct_n` / `eval_self_bleu` / `eval_token_entropy` | ✅ `quality` | **同名同口径**（feat-026）：实现放在 `quality.py`，两条线**共用同一份代码**；`ablations/compare_quality.py` 用 GPT-2 线自己的 `evaluate.py` 在同一批回答上重算，**逐值相等**（实测差 0.000e+00） |
+| `response_quality` | `eval_response_quality` | ✅ `quality` | **同名同口径**（feat-026）：4 条规则各 0.25（长度 10~50 / 含动物名 / 含动词 / 以 `.!?` 结尾） |
 | — | — | ➕ `moe` | **Qwen3 独有**：专家负载分布 + `aux_loss`（GPT-2 线没有 MoE） |
 
 **结论一句话**：GPT-2 线的评估是「**生成质量 + RLHF 三件套**」；
-Qwen3 线的评估是「**训练质量（loss/ppl）+ 偏好对齐（margin/胜率）+ 推理效率（speedup）**」。
-两条线只在 **pretrain** 与 **speedup** 两项上能直接并排比数字。
+Qwen3 线的评估是「**训练质量（loss/ppl）+ 偏好对齐（margin/胜率）+ 推理效率（speedup）+ 生成质量**」。
+两条线能在 **pretrain**、**speedup**、**生成质量** 三处并排比数字 ——
+但生成质量那一处**带着下面三条不可比性**，别把它当「谁更好」的结论。
+
+### 生成质量（`quality` 段）的三条不可比性（feat-026）
+
+并排数字本身是可信的（口径已被交叉验证），但**结论要打折**：
+
+| 不可比性 | 具体表现 | 怎么读 |
+|---|---|---|
+| **探针的域内外** | 动物探针对 GPT-2 是**域内**（它的预训练语料就是动物童话），对 Qwen3 是**域外**（Qwen3 训在 transformer 主题语料上） | 表 1 只说明「同一把尺子下的绝对水平」，**不是**「架构谁更好」 |
+| **tokenizer 粒度** | `response_quality` 的长度规则（10~50 **字符**）按字符级 tokenizer 标定；Qwen3 用 BPE，回答普遍更长 ⇒ 这一条规则对 Qwen3 系统性不利 | 同时看 `response_quality_ex_length`（扣掉长度规则）与每条规则的命中率 |
+| **词表大小** | `token_entropy` 的绝对值依赖词表大小（均匀分布时 H = log V；GPT-2 ~64 字符 vs Qwen3 778 子词） | 跨线只看 `token_entropy_normalized` = H / log(V) |
+
+跑一遍对照：`python ablations/compare_quality.py`（会同时打**两对**模型：微调对 + 底模对，
+并打印口径交叉验证表 —— 不相等直接报错退出）。
 
 ### 评估脚本的「不删/不改弱门槛」
 
@@ -131,6 +147,7 @@ Qwen3 线的评估是「**训练质量（loss/ppl）+ 偏好对齐（margin/胜�
 | `lora` | 胜率 ∈ [0, 1] |
 | `dpo` | checkpoint 的 LoRA `B` 必须非零（B 全零 ⇒ DPO 没训过）；`margin_std >= 0`；准确率 ∈ [0, 1] |
 | `speedup` | **有/无 KV Cache 的 greedy 输出必须逐位相同**，不一致直接报错退出 |
+| `quality` | 4 个指标全部 ∈ [0, 1]；`token_entropy` 有限且 > 0；探针数 > 0（都是**自洽性**门槛，与模型好坏无关） |
 
 checkpoint 缺失时**跳过该段并打印原因**（那是「还没跑到那一步」，不是「指标不合格」）。
 

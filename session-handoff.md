@@ -12,11 +12,13 @@ GPT-2 线**全链路已复验通过**（torch 环境已修好，训练 + 9 项�
 Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO + KV Cache 推理已从零手写完并真跑通**
 （RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE /
 语料与偏好数据 / `--model dense|moe` 预训练 / 手写 LoRA 微调 / 手写 DPO / prefill-decode 推理与采样），
-**精简评估脚本已跑通**（pretrain / moe / lora / dpo / speedup 五段），
+**精简评估脚本已跑通**（pretrain / moe / lora / dpo / speedup / **quality** 六段），
 **与 GPT-2 的退化对照实验已跑通**（全关时 `max_abs_diff = 0` 逐位相同，5 个组件各自的影响量已量化），
+**生成质量已与 GPT-2 线并排**（4 个指标**共用同一份实现** `quality.py`，
+并用 GPT-2 线**自己的** `evaluate.py` 做**口径交叉验证** ⇒ 5 个指标**逐值相等**，差 0.000e+00），
 **9 篇笔记的源码交叉引用已补齐**（BPE 笔记新建 + 每篇开头三行引用块 + 一个可运行的链接校验测试），
 **笔记数字 ↔ `config.py` 的全量核对也做完了**（真错 2 处已改笔记 + 一个可运行的数字一致性守卫）。
-**25 个 feature 全部 passing**，只剩收班。
+**26 个 feature 全部 passing**，只剩收班。
 
 ---
 
@@ -52,8 +54,8 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 ## Verified Now（哪些是已验证的）
 
-- `bash init.sh` → **PASS=28 SKIP=0 FAIL=0**（2026-10-23，L4 已有八条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke** / **评估 smoke** / **退化对照 smoke**）
-- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=16 FAIL=0 TOTAL=16**
+- `bash init.sh` → **PASS=29 SKIP=0 FAIL=0**（2026-10-23，L4 已有九条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke** / **评估 smoke** / **生成质量 smoke** / **退化对照 smoke**）
+- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=18 FAIL=0 TOTAL=18**
 - Qwen3 前向 smoke 已用**真实 BPE 词表**（vocab 778）跑通：`logits (2, 8, 778) loss 6.6897 params 985,856`
 - Qwen3 训练步 smoke：`[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05`
 - **预训练真跑通**（CPU，脚本在 `train/train_pretrain.py`，超参全从 `config.py` 读）：
@@ -184,10 +186,28 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 ## Broken Or Unverified（坏的 / 没验证的）
 
-- **Qwen3 的评估侧只做了「精简 5 段」**：GPT-2 线那 9 项里的
-  `diversity`（distinct-n / self-BLEU / token entropy）与 `response_quality` **本线未实现**，
-  `benchmark` **本线没有**（合成语料没有 QA 题库）—— 差异已在
+- **★ P1 线：SFT / PPO checkpoint 退化成常量输出（Session 013 新发现，未修）**
+  GPT-2 线的 `sft.pt` 与 `ppo.pt` 对**任何** prompt 都输出同一串常量
+  （`'? <unk>sep<unk>'` + 41 个空格，48 字符；公共后缀占比 **98%**），
+  而 `pretrain.pt` 的输出是**有变化的**（公共后缀 0%）
+  ⇒ **SFT 之后模型塌成了常量输出**。
+  这与早就记着的「PPO 相对 SFT 无提升、`sft_rm_score = ppo_rm_score = 0.0696`」是**同一个现象**：
+  只能吐常量 ⇒ RM 只能给常量分 ⇒ PPO 没有可优化的方向。
+  **没有修**（修它要改 P1 线的训练代码并跑 L3 全量 ≈ 10 分钟，是另一个 feature 的事）。
+  判据见 `qwen3-learning/qwen3-pytorch/ablations/compare_quality.py` 的 `_degeneracy_report()`。
+  ⚠️ 后果：**GPT-2 线所有「生成质量 / RM / PPO」的结论都建立在一个塌掉的模型上**，
+  引用那些数字时必须带上这条。
+- **Qwen3 的评估侧是「精简 6 段」**（feat-025 六段 + feat-026 补齐生成质量）：
+  GPT-2 线那 9 项里的 `benchmark` **本线没有**（合成语料没有 QA 题库）—— 差异已在
   `qwen3-learning/qwen3-pytorch/README.md` 逐项列出。
+- **★ 生成质量虽然已经能并排，但并排数字带着三条不可比性**（feat-026）：
+  ① **探针的域内外** —— 动物探针对 GPT-2 是**域内**（它的预训练语料就是动物童话）、
+  对 Qwen3 是**域外**（Qwen3 训在 transformer 主题语料上）⇒ **不能**读成「架构谁更好」；
+  ② **tokenizer 粒度** —— `response_quality` 的长度规则（10~50 **字符**）按字符级 tokenizer 标定，
+  Qwen3 用 BPE、回答普遍更长 ⇒ 这一条规则对 Qwen3 **系统性不利**（跨线只看 `response_quality_ex_length`）；
+  ③ **词表大小** —— 熵的绝对值依赖 V（均匀分布时 H = log V；GPT-2 ~64 字符 vs Qwen3 778 子词）
+  ⇒ 跨线只看 `token_entropy_normalized` = H / log(V)。
+  详见 `qwen3-learning/Qwen3_训练推理完整学习笔记.md` §13.5。
 - **LoRA / DPO 的胜率都是「训练内指标」**：合成偏好数据只有 5 个 prompt × 5 个 chosen，训练集与评估集同分布 ——
   它证明的是「LoRA 确实让模型更偏向 chosen」，**不能当泛化能力**
 - **BPE 词表只有 778 < 目标 1000**：合成语料的可合并对用尽（521 次后没有频次 ≥ 2 的对），属语料多样性问题，非实现 bug
@@ -214,17 +234,20 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 | 顺序 | feature | 做什么 | 为什么是它 |
 |------|---------|--------|--------|
-| — | **无** | — | **25 个 feature 全部 passing**，P2 阶段（Qwen3 从零实现）已收班 |
+| — | **无** | — | **26 个 feature 全部 passing**，P2 阶段（Qwen3 从零实现）已收班 |
 
 **下一个 session 建议做的第一件事**（不在 `feature_list.json` 里，因为还没立项）：
 读本卡的「Broken Or Unverified」段落，挑一条已知缺口**立项**成新的 feature。
 目前最值得做的三条：
-① **评估侧补齐生成质量指标**（`diversity` / `response_quality`）—— 唯一让两条线能真正并排的缺口；
+① **修 P1 线的 SFT 塌陷**（Session 013 新发现）—— `sft.pt` / `ppo.pt` 对任何 prompt 都输出同一串常量，
+   导致 RM / PPO 的结论全部建立在一个塌掉的模型上。要动 P1 线的训练代码 + 跑 L3 全量（≈10 min），
+   **属于「改 GPT-2 线」的活，需要先跟用户确认**；
 ② **feat-009 守卫的第 3 个盲点自动化**（散落在散文里的「128 维」「4 层」目前靠人读）；
 ③ **把 GPT-2 线的 `get_lr` 等实现细节也做成「笔记抄源码必须逐字一致」的守卫**
    （本次手抄的 `get_lr` 就抄错了，是靠人眼发现的）。
 
-**这一步不许动的**：不改 GPT-2 线的任何训练代码或超参；不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值。
+**这一步不许动的**：不改 GPT-2 线的任何训练代码或超参（除非按 ① 立项并得到用户确认）；
+不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值。
 
 ---
 
@@ -238,6 +261,12 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 | MoE aux_loss | Switch 论文版均匀时 = 1；**本仓库版均匀时也 = 1**（f 对 tokens×k 槽位求均值、Σf=1）；HF Mixtral 版把槽位计数除以 N（Σf=K），均匀时 = **K**（K=2 → 2）。**本实现 = HF 的 1/K**。⚠️ 曾把这条写成「1/K = 0.5」，已被预训练日志（aux≈1.0）与 `tests/test_moe.py` 第 11 节实测纠正 |
 | BPE 的 id 分配 | 合并 token 从 **257** 开始（不是 256 —— 256 是字节 0xFF 的位置，撞车会把它静默吞掉） |
 | 量纲类结论 | **必须用代码实测锚定**，不能公式心算后直接写进文档（aux_loss 就是这么错了一倍） |
+| 采样类指标的复现 | 生成是**采样**（temperature 0.8）⇒ 不固定种子，每次跑数字都在动。**生成质量类指标必须先 `torch.manual_seed`** 再算，否则笔记里记的数字明天就复现不出来 |
+| 对照实验的**结论文字** | 也是**实验输出**，必须**由数据算出**（脚本里比大小再打印）。写死「域内比域外高」，而实测恰好相反 ⇒ 结论与数字互相打脸 |
+| 判「模型是否退化成常量输出」 | **不能看「不同回答的数量」** —— GPT-2 的 `sft.pt` 会把 prompt 的最后一个字符（`?`/`.`）一起吐出来，30 条不同问题得到 30 条「看起来不同」的回答。用**公共后缀长度**才露馅（47/48 = 98%） |
+| 跨线复用同名包 | 两条线都有 `data` 包、都有 `model` 包 ⇒ 同进程里只能解析到一个。跨线复用要么**按绝对路径加载文件**，要么开**子进程**并把 `PYTHONPATH` 指向要用的那一条线 |
+| import 别人的 `evaluate.py` | GPT-2 线的 `evaluate.py` 在**模块层**就 `argparse.parse_args()` 并按 `args.stage` 分派 ⇒ 直接 import 会顺手把一整个 stage 跑一遍。用 `argparse.ArgumentParser.parse_args` 打补丁的办法把它变成「只定义函数、不执行」 |
+| 「同名」≠「同口径」 | 抄两份指标实现只是**看起来**一样，迟早分叉。口径一致要靠**同一份实现** + 一条**机器证明**（同一批输入两边算出的值必须逐值相等，不相等就报错退出） |
 | Windows 子进程输出编码 | bash 按 UTF-8 解码、Windows Python 默认 stdout 是 GBK → 中文乱码。证据命令加 `PYTHONIOENCODING=utf-8` |
 | 脚本放在子目录 | Qwen3 线脚本在 `train/` / `tests/` 里，`sys.path[0]` 不是项目根 → **必须显式 `sys.path.insert(0, <项目根>)`** |
 | **偏好胜率的长度偏置** | 总 logprob 口径偏袒**短回复**（`too_short` 策略胜率**恒为 0.000**，因为 rejected 只有 6.3 token），把整体胜率天花板压到 ~0.75；长度归一口径反过来偏袒「可预测」的文本。**必须按策略分组看，否则误判「没进步」** |
@@ -273,7 +302,7 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 | ~~LoRA 的注入点与超参~~ | `feat-023` | **已定**：`lora_r=4 / lora_alpha=8 / lora_target_modules=("q_proj","v_proj")`；`lora_lr` 3e-4→**1e-3**、`lora_max_iters` 300→**1500**（消融实测依据） |
 | ~~DPO 的 β 与训练步数~~ | `feat-024` | **已定**：`dpo_beta=0.1`、`dpo_lr` 1e-4 → **1e-3**、`dpo_max_iters` 300 → **1500**（消融实测依据，见上面的表） |
 | DPO 偏好数据要不要引入真实数据集 | `feat-024` | 目前是合成数据，引入真实数据会动依赖上限（**未做**） |
-| 评估要不要和 GPT-2 线的 9 项对齐 | `feat-025`（已决） | **不对齐**：只保留 pretrain / speedup 逐字同名列，其余 7 项要么有对应物（lora/dpo）要么本线没有（benchmark）要么未实现（diversity / response_quality），差异写在 README |
+| 评估要不要和 GPT-2 线的 9 项对齐 | `feat-025`（已决）+ `feat-026`（已决） | **不对齐 RLHF 三件套**（sft / reward / ppo / compare）：本线走 LoRA+DPO，有对应物（lora / dpo），列名不通用；**pretrain 与 speedup 保留逐字同名列**；`benchmark` 本线没有（合成语料没有 QA 题库）；**`diversity` / `response_quality` 已于 feat-026 补齐并做成「同名同口径」**（共用 `quality.py` + 交叉验证断言）。差异写在 README |
 
 ---
 
@@ -293,7 +322,7 @@ python evaluate.py --stage all
 # Qwen3 线（组件 + 数据 + 预训练已就位）
 cd qwen3-learning/qwen3-pytorch
 python data/build_vocab.py       # 重建 BPE 词表（vocab.json / merges.txt）
-python tests/run_all.py          # 17 个 smoke 汇总
+python tests/run_all.py          # 18 个 smoke 汇总
 python tests/test_pretrain.py    # 单个 smoke
 python tests/test_lora.py        # LoRA 的 9 组断言
 python train/train_pretrain.py --model dense   # 预训练（dense，~47s CPU）
@@ -302,7 +331,10 @@ python train/train_lora.py       # LoRA 微调（r=4 q/v, lr=1e-3, 1500 步）
 python train/train_dpo.py        # DPO（π_ref = SFT 模型，merge → strip → 重新 inject）
 python tests/test_dpo.py         # DPO 的 9 组断言
 python tests/test_inference.py   # KV Cache 推理与采样（12 组断言）
-python tests/test_evaluate.py    # 精简评估（7 组断言）
+python tests/test_evaluate.py    # 精简评估（6 段）
+python evaluate.py --stage quality   # 生成质量段（feat-026）
+python ablations/compare_quality.py  # 与 GPT-2 的生成质量并排 + 口径交叉验证（feat-026）
+python tests/test_quality.py     # 生成质量的 8 组断言
 python ablations/compare_with_gpt2.py   # 与 GPT-2 的退化对照（feat-017，6 行消融表）
 python tests/test_compare_with_gpt2.py # 退化对照的 6 组断言（含 3 条反证）
 python tests/test_note_refs.py    # 笔记 ↔ 源码交叉引用校验（feat-008，链接全可点开）
@@ -321,8 +353,9 @@ git log --oneline -5
 | 开工前必读 | `AGENTS.md` §0 framing / §3 硬约束 / §5 验证路径 |
 | 当前阶段与任务顺序 | `feature_list.json` 的 `phase` + priority 最小的非 passing 项 |
 | Qwen3 设计 / 实施计划 | `qwen3-learning/qwen3-pytorch设计.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–20 已就地纠错，含「实测修正记录」与「9 个真 bug」清单；Task 20 = feat-009 数字核对，含例外分类表与 4 条经验） |
-| Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（**9 篇**，BPE 已补齐；每篇开头有 GPT-2 / Qwen3 源码交叉引用；训练推理篇含 §10 推理 + §11 评估 + **§12 退化对照**） |
+| Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（**9 篇**，BPE 已补齐；每篇开头有 GPT-2 / Qwen3 源码交叉引用；训练推理篇含 §10 推理 + §11 评估 + **§12 退化对照** + **§13 生成质量**） |
 | 笔记数字一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_config_sync.py`（feat-009；27 篇笔记 / 88 处断言 / 25 条例外登记；改 `config.py` 忘了改笔记 ⇒ 红灯） |
 | GPT-2 对照实现 | `gpt-learning/gpt-learning-pytorch/model/gpt2.py`（**只能按文件路径 import**，见陷阱表） |
 | 对照实验脚本 | `qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`（本仓唯一跨目录引用 GPT-2 线的地方，单向） |
+| 生成质量（两条线共用） | `qwen3-learning/qwen3-pytorch/quality.py`（**唯一一份指标实现**，两条线共用）+ `data/quality_prompts.py`（共享探针）+ `ablations/compare_quality.py` + `ablations/_gpt2_quality_runner.py`（GPT-2 侧子进程） |
 | 收班自查 | `clean-state-checklist.md` |

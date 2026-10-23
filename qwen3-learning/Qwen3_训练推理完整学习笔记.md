@@ -1,8 +1,8 @@
 # Qwen3 学习笔记：从训练到 KV Cache 推理，再到 GQA 的 Head 映射
 
 > **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/train_pretrain.py`](../gpt-learning/gpt-learning-pytorch/train_pretrain.py) / [`gpt-learning/gpt-learning-pytorch/train_sft.py`](../gpt-learning/gpt-learning-pytorch/train_sft.py) / [`gpt-learning/gpt-learning-pytorch/inference.py`](../gpt-learning/gpt-learning-pytorch/inference.py) / [`gpt-learning/gpt-learning-pytorch/evaluate.py`](../gpt-learning/gpt-learning-pytorch/evaluate.py)
-> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/train/train_pretrain.py`](qwen3-pytorch/train/train_pretrain.py) / [`qwen3-learning/qwen3-pytorch/train/train_lora.py`](qwen3-pytorch/train/train_lora.py) / [`qwen3-learning/qwen3-pytorch/train/train_dpo.py`](qwen3-pytorch/train/train_dpo.py) / [`qwen3-learning/qwen3-pytorch/inference.py`](qwen3-pytorch/inference.py) / [`qwen3-learning/qwen3-pytorch/evaluate.py`](qwen3-pytorch/evaluate.py) / [`qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`](qwen3-pytorch/ablations/compare_with_gpt2.py)
-> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_pretrain.py`](qwen3-pytorch/tests/test_pretrain.py) / [`qwen3-learning/qwen3-pytorch/tests/test_inference.py`](qwen3-pytorch/tests/test_inference.py) / [`qwen3-learning/qwen3-pytorch/tests/test_evaluate.py`](qwen3-pytorch/tests/test_evaluate.py) / [`qwen3-learning/qwen3-pytorch/tests/test_compare_with_gpt2.py`](qwen3-pytorch/tests/test_compare_with_gpt2.py)
+> **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/train/train_pretrain.py`](qwen3-pytorch/train/train_pretrain.py) / [`qwen3-learning/qwen3-pytorch/train/train_lora.py`](qwen3-pytorch/train/train_lora.py) / [`qwen3-learning/qwen3-pytorch/train/train_dpo.py`](qwen3-pytorch/train/train_dpo.py) / [`qwen3-learning/qwen3-pytorch/inference.py`](qwen3-pytorch/inference.py) / [`qwen3-learning/qwen3-pytorch/evaluate.py`](qwen3-pytorch/evaluate.py) / [`qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`](qwen3-pytorch/ablations/compare_with_gpt2.py) / [`qwen3-learning/qwen3-pytorch/quality.py`](qwen3-pytorch/quality.py) / [`qwen3-learning/qwen3-pytorch/ablations/compare_quality.py`](qwen3-pytorch/ablations/compare_quality.py)
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_pretrain.py`](qwen3-pytorch/tests/test_pretrain.py) / [`qwen3-learning/qwen3-pytorch/tests/test_inference.py`](qwen3-pytorch/tests/test_inference.py) / [`qwen3-learning/qwen3-pytorch/tests/test_evaluate.py`](qwen3-pytorch/tests/test_evaluate.py) / [`qwen3-learning/qwen3-pytorch/tests/test_compare_with_gpt2.py`](qwen3-pytorch/tests/test_compare_with_gpt2.py) / [`qwen3-learning/qwen3-pytorch/tests/test_quality.py`](qwen3-pytorch/tests/test_quality.py)
 
 > 学习目标：把 Transformer / GPT 基础与 Qwen3 的 RMSNorm、QK-Norm、RoPE、GQA、SwiGLU 和 KV Cache 串起来，重点跟踪 **Tensor Shape**。本笔记是我们多轮问答的综合版。示例是**微型 Qwen3 风格模型**，用于讲解机制，并不是声称能复现真实 Qwen3 的训练结果。
 
@@ -689,7 +689,7 @@ argmax 不受影响；② 保留 A、B、C（D、E 被删）—— 减掉 `probs
 对应 feat-025。源码：[qwen3-pytorch/evaluate.py](qwen3-pytorch/evaluate.py)，
 测试：[qwen3-pytorch/tests/test_evaluate.py](qwen3-pytorch/tests/test_evaluate.py)。
 
-### 11.1 五段评估
+### 11.1 六段评估
 
 | stage | 指标 | 对应 checkpoint |
 |---|---|---|
@@ -698,10 +698,12 @@ argmax 不受影响；② 保留 A、B、C（D、E 被删）—— 减掉 `probs
 | `lora` | 偏好胜率（前 → 后对比） | `checkpoints/lora.pt` |
 | `dpo` | reward margin 均值/标准差、chosen>rejected 准确率 | `checkpoints/dpo.pt` |
 | `speedup` | 有/无 KV Cache 的输出一致性 + 加速比 | `checkpoints/pretrain_dense.pt` |
+| `quality` | distinct-n / self-BLEU / token 熵 / response quality | `checkpoints/lora.pt` |
 
 ```bash
-python evaluate.py --stage all        # 5 段一起跑
+python evaluate.py --stage all        # 6 段一起跑
 python evaluate.py --stage dpo        # 只跑 DPO 段
+python evaluate.py --stage quality    # 只跑生成质量段（见 §13）
 ```
 
 ### 11.2 ★ 评估脚本的数字必须与训练日志对得上
@@ -746,7 +748,7 @@ Qwen3 线走 **LoRA + DPO**：没有显式奖励模型、没有 PPO、没有采�
 | `ppo`（reward / KL） | 🔁 `dpo` | 本线没有 PPO；对应物是**隐式奖励 margin** |
 | `compare`（SFT vs PPO） | 🔁 `lora` | 本线没有 PPO；对应物是 LoRA 前→后对比 |
 | `benchmark` | ❌ 无 | 语料是合成的，没有 QA benchmark |
-| `diversity` / `response_quality` | ⏳ 未实现 | 属生成质量类，feat-025 范围外 |
+| `diversity` / `response_quality` | ✅ `quality` | **同名同口径**（feat-026 补齐，见 §13）：共享一份实现 + 交叉验证 |
 | — | ➕ `moe` | **Qwen3 独有**：专家负载分布 + aux_loss |
 
 完整映射表在 [`qwen3-pytorch/README.md`](qwen3-pytorch/README.md)。
@@ -1000,3 +1002,204 @@ python ablations/compare_with_gpt2.py
 融合 `c_attn` 与三个独立 Linear 在这个尺寸下结果逐位相同，
 LayerNorm / softmax / GELU 都是确定性算子 ⇒ 差异不是「小于浮点噪声」，
 而是**真的一个 bit 都不差**。
+
+---
+
+## 13. 生成质量评估：把「两条线能并排」变成一条断言（feat-026）
+
+对应 feat-026。源码：[qwen3-pytorch/quality.py](qwen3-pytorch/quality.py)、
+[qwen3-pytorch/data/quality_prompts.py](qwen3-pytorch/data/quality_prompts.py)、
+[qwen3-pytorch/ablations/compare_quality.py](qwen3-pytorch/ablations/compare_quality.py)，
+测试：[qwen3-pytorch/tests/test_quality.py](qwen3-pytorch/tests/test_quality.py)。
+
+### 13.1 缺口从哪来
+
+§11.4 那张表里有一行刺眼：`diversity` / `response_quality` 在 feat-025 收班时还是
+「⏳ 未实现」。当时的理由是「feat-025 的范围是精简评估」——
+但那留下了一个**很不对称**的局面：
+
+- GPT-2 线有 `diversity`（4 个生成质量指标）和 `response_quality`；
+- Qwen3 线没有。
+
+⇒ 两条线**别的段都不逐项对标**，唯独「模型说出来的话好不好」这件事，
+一条线能测、另一条线不能测 ⇒ **没法并排**。
+
+feat-026 就是补这半块拼图。但补的时候有个陷阱：
+**「把 GPT-2 的 4 个函数抄一遍」不叫做补上了** ——
+抄出来的两份代码迟早会分叉，而数字看起来一样却量着不同的事（§11.3 那个 loss 口径的坑）。
+
+### 13.2 4 个指标的定义
+
+| 指标 | 定义 | 越大越好？ |
+|---|---|---|
+| `distinct_1` / `distinct_2` | 字符级 n-gram 多样性 = 不同 n-gram 数 / n-gram 总数 | 越大越多样 |
+| `self_bleu` | 批内每条回答对其它 N-1 条的 BLEU 平均（nltk + smoothing method1） | 越小越多样 |
+| `token_entropy` | 生成每步 next-token 分布熵的均值（自然对数，单位 nat） | — |
+| `response_quality` | 4 条规则各 0.25：长度 10~50 字符 / 含动物名 / 含常见动词 / 以 `.!?` 结尾 | 越大越好 |
+
+两个容易写错的细节（GPT-2 线是这么写的，本线必须**一模一样**）：
+
+1. **熵要「先样本内平均，再样本间平均」**。
+   把所有样本的所有步摊平一起平均，结果在**样本长度不一致**时会不一样
+   （提前 EOS 的短样本权重会变）。本线的 `token_entropy_from_logits` 按样本分组，
+   `tests/test_quality.py` 第 3b 组用一个手算例子钉死了这一点
+   （分组平均 2.7726 vs 摊平平均 2.3105）。
+2. **响应质量的长度规则按**字符**算，不是按 token 算** —— 这条是后面 §13.5 的坑。
+
+### 13.3 ★ 实现放在 `quality.py`：两条线共用同一份代码
+
+`quality.py` 里只有 4 个**纯函数**（吃「一批回答」或「一批 logits」），
+顶层只 import `torch` / `nltk` / 标准库 ——
+Qwen3 特有的 import 全部**惰性**（函数体内才 import）。
+
+这样 GPT-2 线的进程就能**按文件路径**加载它来算同一批指标
+（`ablations/_gpt2_quality_runner.py` 里的 `_load_shared_quality()`），
+而不必把 Qwen3 的项目根塞进 `PYTHONPATH` ——
+两个线都有 `data` 包、都有 `model` 包，塞进去就抢包名了。
+
+> **同包名的坑在本仓库出现过两次**：
+> ① `data` / `model` 同名 ⇒ 跨线复用只能按**绝对路径**加载，或开**子进程**并把
+> `PYTHONPATH` 指向要用的那一条线；
+> ② GPT-2 线的 `evaluate.py` 在**模块层**就 `argparse.parse_args()` 并按 `args.stage` 分派
+> ⇒ 直接 `import evaluate` 会顺手把某一整个 stage 跑一遍。
+> runner 里用 `argparse.ArgumentParser.parse_args` 打补丁的办法把它变成「只定义函数、不执行」。
+
+### 13.4 ★「同名同口径」不是承诺，是一条**断言**
+
+`ablations/compare_quality.py` 的做法：
+
+1. 两边喂**同一批 prompt**（Qwen3 线的 `data/quality_prompts.py` 生成的动物探针）；
+2. 两边的指标**都走** `quality.py`（不是各写一份）；
+3. 把 GPT-2 侧生成的回答**固定住**，再喂给 **GPT-2 线自己的 `evaluate.py`**
+   的 `eval_distinct_n` / `eval_self_bleu` / `eval_response_quality` / `eval_token_entropy`；
+4. 两边的值必须**完全相等**，不相等 ⇒ **报错退出**（退出码 1），报告里的并排数字一律不算数。
+
+实测（两对模型各跑一次）：
+
+```
+表 2  口径交叉验证（GPT-2 自己的 evaluate.py  vs  共享实现 quality.py）
+指标                GPT-2 自己算  共享实现算   差值
+distinct_1        0.0187     0.0187  0.000e+00
+distinct_2        0.1745     0.1745  0.000e+00
+self_bleu         0.6959     0.6959  0.000e+00
+response_quality  0.2750     0.2750  0.000e+00
+token_entropy     2.7251     2.7251  0.000e+00
+  ✅ 5 个指标全部逐值相等（容差 1e-09）⇒ 两条线量的是同一件事。
+```
+
+两处为了让这个断言成立而做的技术处理，值得单独记一笔：
+
+- **熵要能逐值相等 ⇒ 路径必须确定**。GPT-2 的 `eval_token_entropy` 是**采样**的
+  （`torch.multinomial`），两次跑路径不同 ⇒ 熵不同。
+  runner 把 `torch.multinomial` 临时换成 `argmax`（= 贪心），
+  再用**同一段贪心路径**的 logits 喂给共享实现 ⇒ 两边才可能算出同一个数。
+- **样本集必须一样**。GPT-2 的 `eval_token_entropy(n_samples=20)` 取的是**前 20 条** prompt，
+  所以 runner 里把 `get_ppo_prompts` 改成「前 n 条」的切片 ——
+  不截断的话它会遍历全部 30 条，两边样本集不同 ⇒ 熵差了 2.8%（0.0000129698 vs 0.0000133310）。
+
+### 13.5 ★ 三条不可比性：数字可信，但结论要打折
+
+并排数字本身已被 §13.4 证明「量的是同一件事」。但**它们回答不了**
+「哪个模型更好」，原因有三个，都必须写在报告里：
+
+| 不可比性 | 具体表现 | 后果 | 对策 |
+|---|---|---|---|
+| **探针的域内外** | 动物探针对 GPT-2 是**域内**（它的预训练语料就是动物童话），对 Qwen3 是**域外**（Qwen3 训在 transformer 主题语料上） | 表 1 的高低**不能**读成「架构谁更好」 | 另跑一组「Qwen3 自己的语料」（域内）做对照（表 3） |
+| **tokenizer 粒度** | `response_quality` 的长度规则是 10~50 **字符**（按字符级 tokenizer 标定），Qwen3 用 BPE ⇒ 回答普遍更长 | 这一条规则对 Qwen3 **系统性不利** | 额外报 `response_quality_ex_length`（扣掉长度规则）+ 每条规则的命中率 |
+| **词表大小** | 熵的绝对值依赖 V（均匀分布时 H = log V）；GPT-2 ~64 字符 vs Qwen3 778 子词 | `token_entropy` 的绝对值跨线**不可比** | 跨线只看 `token_entropy_normalized` = H / log(V) |
+
+### 13.6 ★ 实测数字（seed 1234，两次跑逐字相同）
+
+脚本会比**两对**模型：微调对（`sft.pt` vs `lora.pt`）与底模对（`pretrain.pt` vs `pretrain_dense.pt`）。
+加底模对是因为下一节那个发现。
+
+**微调对**（`python evaluate.py --stage quality` 的 Qwen3 侧数字与下表一致）：
+
+| 指标 | GPT-2 (`sft.pt`) | Qwen3 (`lora.pt`) |
+|---|---|---|
+| `distinct_1` | 0.0076 | 0.0258 |
+| `distinct_2` | 0.0092 | 0.1277 |
+| `self_bleu` | 1.0000 | 0.7907 |
+| `token_entropy` | 0.0000 | 5.7975 |
+| `token_entropy_normalized` | 0.0000 | 0.8709 |
+| `response_quality` | 0.2500 | 0.0833 |
+| `response_quality_ex_length` | 0.0000 | 0.1111 |
+| `mean_response_chars` | 48.0 | 139.6 |
+
+规则命中率：GPT-2 侧 `length=1.00 / entity=0 / verb=0 / ending=0`，
+Qwen3 侧 `length=0 / entity=0.13 / verb=0 / ending=0.20`。
+**GPT-2 那 0.25 的总分全部来自「长度规则」** —— 它的回答恒为 48 字符。
+
+**底模对**：
+
+| 指标 | GPT-2 (`pretrain.pt`) | Qwen3 (`pretrain_dense.pt`) |
+|---|---|---|
+| `distinct_1` | 0.0187 | 0.0099 |
+| `distinct_2` | 0.1745 | 0.0296 |
+| `self_bleu` | 0.6959 | 0.9825 |
+| `token_entropy_normalized` | 0.7159 | 0.1954 |
+| `response_quality` | 0.2750 | 0.0750 |
+| `response_quality_ex_length` | 0.0333 | 0.1000 |
+
+读法：**底模对里 GPT-2 全面更高**（探针对它是域内，而且它的模型没塌）；
+**微调对里 Qwen3 全面更高**（因为 GPT-2 那一侧塌了，见下节）。
+两个数字放在一起才说得清 —— 只报其中一个都会误导。
+
+### 13.7 ★ 顺手挖出来的一个 P1 线问题：SFT / PPO checkpoint 退化成常量输出
+
+测「退化」这件事本身需要判据。一开始用「不同回答的数量」，
+**被骗了**：GPT-2 的 `sft.pt` 会把 prompt 的最后一个字符（`?` / `.`）一起吐出来，
+于是 30 条不同问题得到 30 条**看起来不同**的回答。
+
+改用**公共后缀长度**（一批回答的最长公共后缀）就露馅了：
+
+```
+· GPT-2 这一侧：退化成常量输出（公共后缀 47 字符 / 平均 48.0 字符 = 98%）
+· Qwen3 这一侧：正常（公共后缀 0 字符 / 平均 139.6 字符 = 0%）
+```
+
+GPT-2 的 `sft.pt` 与 `ppo.pt` 对**任何** prompt 都输出同一串常量
+（`'? <unk>sep<unk>'` + 一堆空格，48 字符），而 `pretrain.pt` 的输出是**有变化的**。
+⇒ **P1 线的 SFT 之后模型塌成了常量输出**。
+
+这与 handoff 里早就记着的「PPO 相对 SFT 无提升、`rm_score = 0.0696`」是**同一个现象**：
+模型只能吐一个常量 ⇒ 奖励模型只能给一个常量分 ⇒ PPO 没有可优化的方向。
+
+> **本 feature 不修它**（修它要改 P1 线的训练代码并跑 L3 全量，
+> 那是另一条 feature 的事）。这里只负责**如实报告**，
+> 并把它写进 `session-handoff.md` 的「Broken Or Unverified」。
+
+### 13.8 ★ 域内 vs 域外：结论必须由数据算出
+
+第三张表拿 Qwen3 自己的语料当探针（域内）跟动物探针（域外）对比。
+**踩过的坑**：脚本第一版把结论**写死**成「域内探针上多样性明显更高」，
+而实测数字恰好相反：
+
+```
+distinct_1  域外 0.0258 > 域内 0.0232      self_bleu 域外 0.7907 < 域内 0.8241
+```
+
+⇒ 结论改成**由数据算出**（脚本里比大小再打印），
+底模对那一组域内域外几乎持平（0.0099 vs 0.0099）。
+**教训**：对照实验的结论文字也属于「实验输出」，必须由数据生成，
+否则「脚本跑出来的结论」和「脚本跑出来的数字」会互相打脸。
+
+### 13.9 自测题（本节）
+
+1. 「两条线各写一份指标实现、长得一样」为什么不算「同名同口径」？
+2. 交叉验证里为什么必须把 `torch.multinomial` 换成 `argmax`？
+3. 为什么熵的绝对值跨线不可比，归一化之后就可比了？
+4. `response_quality` 的长度规则为什么对 Qwen3 系统性不利？
+5. 为什么「域内探针上多样性更高」这种结论不能写死在脚本里？
+
+**答案：**
+① 两份实现迟早分叉；**口径一致要靠「同一份实现」**，
+且必须有一条**机器证明**（本节 §13.4 的交叉验证断言）；
+② 采样路径不确定 ⇒ 两次跑的熵不同 ⇒ 两边永远对不上；
+③ 均匀分布时 H = log V，V 不同 ⇒ 绝对值不可比；除掉 log V 之后
+剩下的就是「分布有多尖」这个与词表大小无关的量；
+④ 规则是 10~50 **字符**，按字符级 tokenizer 标定；Qwen3 用 BPE，
+同样的信息量要更多字符 ⇒ 回答普遍超长 ⇒ 这条规则专挑 Qwen3 不利；
+⑤ 写死的结论一旦与实测数字矛盾，整份报告就不可信了
+（本节 §13.8 就是这个坑的真实例子）——
+**结论必须由数据生成**。

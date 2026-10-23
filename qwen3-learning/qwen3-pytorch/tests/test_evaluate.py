@@ -1,7 +1,7 @@
 """
 评估脚本 smoke：结构、GPT-2 同名列、跳过路径、门槛真的会触发、真实 checkpoint 的数值。
 
-对应 feat-025（开发计划 Task 16）。
+对应 feat-025（开发计划 Task 16）+ feat-026（新增第 6 段「生成质量」）。
 
 运行：python tests/test_evaluate.py
 """
@@ -26,9 +26,10 @@ tk = BPETokenizer("data/vocab.json", "data/merges.txt")
 device = torch.device("cpu")
 
 # =====================================================================
-# 1) STAGES 结构：5 段齐全（pretrain / moe / lora / dpo / speedup）
+# 1) STAGES 结构：6 段齐全（pretrain / moe / lora / dpo / speedup / quality）
 # =====================================================================
-assert set(evaluate.STAGES.keys()) == {"pretrain", "moe", "lora", "dpo", "speedup"}, \
+assert set(evaluate.STAGES.keys()) == {
+    "pretrain", "moe", "lora", "dpo", "speedup", "quality"}, \
     f"stage 集合不对：{sorted(evaluate.STAGES.keys())}"
 for name, fn in evaluate.STAGES.items():
     assert callable(fn), f"{name} 对应的评估函数不可调用"
@@ -145,7 +146,7 @@ evaluate.check_directional("pretrain", {"skipped": True, "reason": "x"})
 print("[eval] 方向性门槛实测：胜率/margin/speedup 不达标 ⇒ 报错退出")
 
 # =====================================================================
-# 6) 有真实 checkpoint 时，跑全部 5 段并核对
+# 6) 有真实 checkpoint 时，跑全部 6 段并核对
 #    （没有 checkpoint 的环境只跑前 5 组 —— 那是「还没跑到那一步」，不是失败）
 # =====================================================================
 need = [evaluate.PRETRAIN_DENSE, evaluate.PRETRAIN_MOE,
@@ -220,6 +221,26 @@ else:
     print(f"[eval] speedup={r['speedup']:.3f}x naive={r['naive_avg_ms']:.2f}ms "
           f"kv={r['kv_avg_ms']:.2f}ms consistent={r['consistent']}")
 
-    print("[eval] 5 段全部跑通")
+    # --- 6.6 生成质量（feat-026）---
+    r = evaluate.eval_quality(tk, device)
+    evaluate.check_directional("quality", r)
+    assert r["stage"] == "quality" and r["metric"] == "response_quality"
+    assert r["n_samples"] > 0, "探针数量为 0"
+    assert r["n_samples"] == DENSE_CONFIG.quality_n_samples
+    for k in ("distinct_1", "distinct_2", "self_bleu",
+              "response_quality", "response_quality_ex_length"):
+        assert 0.0 <= r[k] <= 1.0, f"{k} 越界（应在 [0,1]）：{r[k]}"
+    assert math.isfinite(r["token_entropy"]) and r["token_entropy"] > 0.0
+    assert 0.0 < r["token_entropy_normalized"] <= 1.0 + 1e-9
+    assert set(r["response_quality_by_rule"].keys()) == {"length", "entity",
+                                                        "verb", "ending"}
+    assert len(r["responses"]) == 3, "样例回答应给 3 条"
+    print(f"[eval] quality distinct_1={r['distinct_1']:.4f} "
+          f"self_bleu={r['self_bleu']:.4f} "
+          f"token_entropy={r['token_entropy']:.4f}"
+          f"（归一 {r['token_entropy_normalized']:.4f}） "
+          f"response_quality={r['response_quality']:.4f}")
 
-print("test_evaluate OK  5 段结构 + GPT-2 同名列 + 跳过路径 + 一致性门槛")
+    print("[eval] 6 段全部跑通")
+
+print("test_evaluate OK  6 段结构 + GPT-2 同名列 + 跳过路径 + 一致性门槛")

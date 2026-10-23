@@ -82,9 +82,10 @@ qwen3-learning/qwen3-pytorch/
 ├── data/              # byte-level BPE tokenizer + 语料 + 预训练/偏好数据
 ├── train/             # train_pretrain.py → train_lora.py → train_dpo.py
 ├── inference.py       # KV Cache prefill/decode + temperature/top-k/top-p 采样
-├── evaluate.py        # 精简 5 段评估（pretrain / moe / lora / dpo / speedup）
-├── ablations/         # 与 GPT-2 的退化对照（feat-017，唯一跨目录引用 GPT-2 线的地方）
-└── tests/             # 16 个 test_*.py + run_all.py 汇总
+├── evaluate.py        # 精简 6 段评估（pretrain / moe / lora / dpo / speedup / quality）
+├── quality.py         # 生成质量指标（两条线共用同一份实现，feat-026）
+├── ablations/         # 与 GPT-2 的退化对照（feat-017）+ 生成质量并排对照（feat-026，唯一跨目录引用 GPT-2 线的地方）
+└── tests/             # 18 个 test_*.py + run_all.py 汇总
 ```
 
 **核心思路**：不靠"读懂论文"，而是**把 Qwen3 的每个组件做成一个可关掉的开关**（`use_gqa` / `use_rope` / `use_qk_norm` / `mlp_type` / `norm_type`），
@@ -129,7 +130,7 @@ qwen3-learning/qwen3-pytorch/
 | [Qwen3 GQA 与 KV Cache](qwen3-learning/Qwen3_GQA与KV_Cache_完整学习笔记.md) | 对比主线笔记 3、12 的 MHA + KV Cache | [`model/common/attention.py`](qwen3-learning/qwen3-pytorch/model/common/attention.py)、[`model/common/kv_cache.py`](qwen3-learning/qwen3-pytorch/model/common/kv_cache.py) |
 | [Qwen3 BPE Tokenizer](qwen3-learning/Qwen3_BPE_学习笔记.md) | 对比主线字符级 `CharTokenizer`（主线**没有** BPE 代码） | [`data/bpe.py`](qwen3-learning/qwen3-pytorch/data/bpe.py)、[`data/tokenizer.py`](qwen3-learning/qwen3-pytorch/data/tokenizer.py) |
 | [Qwen3 LoRA 与 DPO](qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md) | 对比主线全参 SFT + RM + PPO（主线**没有** LoRA/DPO） | [`model/common/lora.py`](qwen3-learning/qwen3-pytorch/model/common/lora.py)、[`train/train_lora.py`](qwen3-learning/qwen3-pytorch/train/train_lora.py)、[`train/train_dpo.py`](qwen3-learning/qwen3-pytorch/train/train_dpo.py) |
-| [Qwen3 训练推理完整学习笔记](qwen3-learning/Qwen3_训练推理完整学习笔记.md) | 端到端训练与推理流程 | [`train/train_pretrain.py`](qwen3-learning/qwen3-pytorch/train/train_pretrain.py)、[`inference.py`](qwen3-learning/qwen3-pytorch/inference.py)、[`evaluate.py`](qwen3-learning/qwen3-pytorch/evaluate.py) |
+| [Qwen3 训练推理完整学习笔记](qwen3-learning/Qwen3_训练推理完整学习笔记.md) | 端到端训练与推理流程（§10 推理 / §11 评估 / §12 退化对照 / §13 生成质量） | [`train/train_pretrain.py`](qwen3-learning/qwen3-pytorch/train/train_pretrain.py)、[`inference.py`](qwen3-learning/qwen3-pytorch/inference.py)、[`evaluate.py`](qwen3-learning/qwen3-pytorch/evaluate.py)、[`quality.py`](qwen3-learning/qwen3-pytorch/quality.py) |
 
 > **每篇笔记开头都有「对应 GPT-2 实现位置 / 对应 Qwen3 源码位置 / 对应可跑测试」三行**，
 > 点开就能跳到具体文件；这些链接由 `qwen3-learning/qwen3-pytorch/tests/test_note_refs.py` **自动校验**
@@ -201,9 +202,10 @@ python train/train_pretrain.py --model moe     # ①' 预训练（MoE 变体）
 python train/train_lora.py               # ② LoRA 微调（r=4，注入 q_proj / v_proj）
 python train/train_dpo.py                # ③ DPO（π_ref = LoRA 后的 SFT 模型）
 
-python evaluate.py --stage all            # 精简 5 段评估
+python evaluate.py --stage all            # 精简 6 段评估
 python ablations/compare_with_gpt2.py    # 与 GPT-2 的退化对照（6 行消融表）
-python tests/run_all.py                  # 17 个 smoke 汇总
+python ablations/compare_quality.py      # 与 GPT-2 的生成质量并排 + 口径交叉验证
+python tests/run_all.py                  # 18 个 smoke 汇总
 ```
 
 单项说明见 [`qwen3-pytorch/README.md`](qwen3-learning/qwen3-pytorch/README.md)。

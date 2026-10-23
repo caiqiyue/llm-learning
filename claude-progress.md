@@ -11,13 +11,14 @@
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（WIP=0；**25 个 feature 全部 passing**，feat-009 是最后一个，已于 Session 012 完成）
-- 当前最高优先级未完成 feature：**无** → 下一步是收班（Task 21）
+- 当前活跃 feature：**无**（WIP=0；**26 个 feature 全部 passing**，feat-026 是最后一个，已于 Session 013 完成）
+- 当前最高优先级未完成 feature：**无** → 下一步是收班
 - ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
 - 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-22 在修复后的环境里重跑产出**，指标可信（见 `feature_list.json` feat-002~007 的 evidence）
 - 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` **9 篇**（BPE 笔记已补齐，feat-008；**每篇开头都有「对应 GPT-2 / 对应 Qwen3 源码 / 对应可跑测试」三行**，由 `tests/test_note_refs.py` 自动校验）
 - **笔记 ↔ config.py 的自动守卫**（feat-009）：`tests/test_config_sync.py` 把 27 篇笔记里的 `` `超参名 = 值` `` 跟各自 `config.py` 逐条对齐（实测 88 处断言 / 25 条例外登记）；**改 `config.py` 忘了改笔记 ⇒ 测试直接红**。已知盲点：`开发计划.md` 跨线比较，不适用自动守卫，改为人工核对
-- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 训练三段 + 评估侧 + 退化对照全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 预训练 / LoRA / DPO / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py`），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke + LoRA smoke + DPO smoke + 推理 smoke + 评估 smoke + **退化对照 smoke**」八条
+- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 训练三段 + 评估侧 + 退化对照全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 预训练 / LoRA / DPO / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py`），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke + LoRA smoke + DPO smoke + 推理 smoke + 评估 smoke + **生成质量 smoke** + **退化对照 smoke**」九条
+- **两条线现在有第三个「数字可并排」的地方**（feat-026）：`quality.py` 是**两条线共用的一份指标实现**，`ablations/compare_quality.py` 用 GPT-2 线**自己的** `evaluate.py` 在同一批回答上重算并断言**逐值相等**（实测差 0.000e+00）⇒「同名同口径」是机器证明，不是承诺。⚠️ 并排数字带着三条不可比性（探针域内外 / tokenizer 粒度 / 词表大小），详见 `Qwen3_训练推理完整学习笔记.md` §13.5
 
 ---
 
@@ -1252,3 +1253,110 @@ PASS=28  SKIP=0  FAIL=0
 `qwen3-learning/Qwen3_训练推理完整学习笔记.md`（§10.6 加免责说明）、
 `gpt-learning/0.GPT全流程详解.md`（§2 超参 + `get_lr` 源码）、
 仓库根 `README.md`、`feature_list.json`
+
+---
+
+### Session 013 — Qwen3 生成质量评估 + 与 GPT-2 线并排对照（feat-026）
+
+对应 feat-026。立项动机：feat-025 收班时，README 差异清单里
+`diversity` / `response_quality` 还是「⏳ 未实现」——
+那是两条线**唯一**还缺的一块拼图（别的段本来就不逐项对标，
+唯独「模型说出来的话好不好」这条线能测、那条线不能测 ⇒ 没法并排）。
+
+#### 做了什么
+
+| 文件 | 性质 | 内容 |
+|---|---|---|
+| `qwen3-pytorch/quality.py` | **新建** | 4 个指标的**纯函数**实现（distinct-n / self-BLEU / token 熵 / response quality）。顶层只 import `torch`/`nltk`/标准库，Qwen3 特有 import 全部惰性 ⇒ GPT-2 线的进程能按**文件路径**加载它 |
+| `qwen3-pytorch/data/quality_prompts.py` | **新建** | 共享探针集：动物类问题（GPT-2 的 `ENTITIES` 逐字复制 + 与 GPT-2 线同样的 10 个 SFT 模板）+ Qwen3 域内探针（自己的语料） |
+| `qwen3-pytorch/ablations/_gpt2_quality_runner.py` | **新建** | GPT-2 侧的跑分**子进程**（`PYTHONPATH` 指向 GPT-2 线，避开 `data`/`model` 同名包）；生成 + 共享指标 + **用 GPT-2 自己的 `evaluate.py` 重算做交叉验证** |
+| `qwen3-pytorch/ablations/compare_quality.py` | **新建** | 父脚本：并排两对模型 + 打印口径交叉验证表（不相等 ⇒ 退出码 1）+ 域内/域外对照 + 退化检测 |
+| `qwen3-pytorch/evaluate.py` | 改 | 新增第 6 段 `quality`（`eval_quality`）+ 门槛 + 打印分支 |
+| `qwen3-pytorch/config.py` | 改 | 新增 `quality_n_samples = 30` / `quality_max_new_tokens = 32`（**只加新参数，既有超参一个没动**） |
+| `qwen3-pytorch/tests/test_quality.py` | **新建** | 8 组断言：4 个指标手算一致 + 探针可复现 + 实体表一致 + 口径交叉验证 |
+| `qwen3-pytorch/tests/test_evaluate.py` | 改 | 5 段 → 6 段；新增 quality 段的真实数值核对 |
+| `init.sh` | 改 | L4 评估 smoke 改 6 段；**新增「Qwen3 生成质量 smoke」**（4 指标 + 探针 + 口径交叉验证） |
+| `qwen3-learning/Qwen3_训练推理完整学习笔记.md` | 改 | **新增 §13**（9 小节）+ §11.1/§11.4 更新 + 开头交叉引用行补两个文件 |
+| `qwen3-pytorch/README.md` | 改 | 差异清单 `diversity`/`response_quality` ⏳ → ✅ + **新增「三条不可比性」一节** |
+
+#### 验证命令与实测输出
+
+```
+python tests/test_quality.py
+  [quality] distinct_n 手算一致
+  [quality] self_bleu：全同=1.0000 全异=0.0000
+  [quality] 熵：均匀=2.079441（= log 8 = 2.079442） 确定性=-0.00e+00
+  [quality] token entropy 按样本分组平均：2.7726（摊平平均会是 2.3105）
+  [quality] response_quality 规则命中：{'length': 0.5, 'entity': 0.5, 'verb': 0.75, 'ending': 0.25} 总分=0.5000
+  [quality] 探针集可复现：n=10 seed=1234 例：'How does a dog run?'
+  [quality] 探针实体表与 GPT-2 线 ENTITIES 一致
+  [quality] 口径交叉验证：5 个指标与 GPT-2 线逐值相等
+
+python evaluate.py --stage quality
+  stage=quality response_quality=0.0833 distinct_1=0.0258 distinct_2=0.1277 self_bleu=0.7907
+    token_entropy=5.7975（归一化 0.8709，词表 778）  n=30  probe=animal
+    规则命中率：length=0.00  entity=0.13  verb=0.00  ending=0.20
+    扣掉长度规则后 = 0.1111（平均回答长度 139.6 字符）
+
+python evaluate.py --stage all   →  6/6 段：['pretrain','moe','lora','dpo','speedup','quality']
+
+python ablations/compare_quality.py
+  表 2 口径交叉验证（两对模型各 5 个指标）→ 差值全部 0.000e+00
+  表 1 微调对（sft.pt vs lora.pt）：distinct_1 0.0076/0.0258  self_bleu 1.0000/0.7907
+  表 1 底模对（pretrain.pt vs pretrain_dense.pt）：distinct_1 0.0187/0.0099  self_bleu 0.6959/0.9825
+  ★ GPT-2 这一侧：退化成常量输出（公共后缀 47 字符 / 平均 48.0 字符 = 98%）
+
+python tests/run_all.py  →  PASS=18  FAIL=0  TOTAL=18
+bash init.sh              →  PASS=29  SKIP=0  FAIL=0
+  [PASS] Qwen3 生成质量 smoke（4 指标 + 探针 + 口径）
+```
+
+#### 踩过的四个坑（都写进了脚本的 docstring）
+
+1. **熵要逐值相等 ⇒ 路径必须确定**。GPT-2 的 `eval_token_entropy` 是**采样**的
+   （`torch.multinomial`），两次跑路径不同 ⇒ 熵不同。
+   runner 把 `torch.multinomial` 临时换成 `argmax`（贪心），两边走同一段路径。
+2. **样本集必须一样**。GPT-2 的 `eval_token_entropy(n_samples=20)` 取**前 20 条** prompt；
+   runner 里把 `get_ppo_prompts` 改成切片 —— 不截断的话两边样本集不同，
+   熵差 2.8%（0.0000129698 vs 0.0000133310）。
+3. **「同名」不够，「同口径」才够**。抄两份实现迟早分叉 ⇒ 必须是**同一份实现**
+   （`quality.py`）+ 一条**机器证明**（交叉验证断言，不相等直接退出码 1）。
+4. **生成是采样 ⇒ 不固定种子数字每次都在动**。`eval_quality` 与 `compare_quality.py`
+   都固定了 `eval_seed = 1234`，两次跑输出**逐字相同**（已实测）。
+
+#### 一个方法论教训
+
+脚本第一版把结论「**域内探针上多样性明显更高**」**写死**在打印里，
+而实测数字恰好相反（域外 distinct_1 0.0258 > 域内 0.0232）。
+⇒ 结论改成**由数据算出**（脚本里比大小再打印）。
+**对照实验的结论文字也属于实验输出**，写死就会和数字互相打脸。
+
+#### 附带挖出来的一个 P1 线问题（不在本 feature 的修复范围）
+
+测「退化」需要判据。一开始用「不同回答的数量」，**被骗了** ——
+GPT-2 的 `sft.pt` 会把 prompt 的最后一个字符（`?`/`.`）一起吐出来，
+30 条不同问题得到 30 条「看起来不同」的回答。
+改用**公共后缀长度**才露馅：
+
+```
+· GPT-2 这一侧：退化成常量输出（公共后缀 47 字符 / 平均 48.0 字符 = 98%）
+· Qwen3 这一侧：正常（公共后缀 0 字符 / 平均 139.6 字符 = 0%）
+```
+
+GPT-2 的 `sft.pt` 与 `ppo.pt` 对**任何** prompt 都输出同一串常量
+（`'? <unk>sep<unk>'` + 一堆空格，48 字符），而 `pretrain.pt` 的输出是**有变化的**
+⇒ **P1 线的 SFT 之后模型塌成了常量输出**。
+这与 handoff 里早就记着的「PPO 相对 SFT 无提升、`rm_score = 0.0696`」是**同一个现象**：
+只能吐常量 ⇒ RM 只能给常量分 ⇒ PPO 没有可优化的方向。
+**本 feature 不修它**（修它要改 P1 训练代码 + 跑 L3 全量），
+已写进 `session-handoff.md` 的「Broken Or Unverified」。
+
+#### 最终状态
+
+| 项 | 值 |
+|---|---|
+| `feature_list.json` | **26 passing / 0 in_progress / 0 not_started**（priority 严格 1..26） |
+| `bash init.sh` | `PASS=29  SKIP=0  FAIL=0` |
+| `python tests/run_all.py` | `PASS=18  FAIL=0  TOTAL=18` |
+| Qwen3 `evaluate.py --stage all` | **6/6 段** |
+| 笔记守卫 | `test_note_refs.py` 81 条链接 / 115 处路径；`test_config_sync.py` 88 处断言 / 25 条例外（过时 0） |

@@ -441,7 +441,7 @@ PY
     skip "Qwen3 推理 smoke" "inference.py 尚未就绪（feat-018），或 torch 不可用"
   fi
 
-  # --- 评估 smoke（feat-025）：5 段结构 + pretrain/speedup 的「GPT-2 同名列」---
+  # --- 评估 smoke（feat-025）：6 段结构 + pretrain/speedup 的「GPT-2 同名列」---
   if [ -f "$QWEN_DIR/evaluate.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
     (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_eval.log 2>&1
 import math
@@ -455,8 +455,9 @@ from config import DENSE_CONFIG
 from data.tokenizer import BPETokenizer
 from model.qwen3_dense import Qwen3Dense
 
-# 1) 5 段齐全
-assert set(evaluate.STAGES.keys()) == {"pretrain", "moe", "lora", "dpo", "speedup"}, \
+# 1) 6 段齐全（feat-026 新增 quality 段）
+assert set(evaluate.STAGES.keys()) == {
+    "pretrain", "moe", "lora", "dpo", "speedup", "quality"}, \
     f"stage 集合不对：{sorted(evaluate.STAGES.keys())}"
 
 tk = BPETokenizer("data/vocab.json", "data/merges.txt")
@@ -485,17 +486,96 @@ try:
 finally:
     evaluate.PRETRAIN_DENSE = orig
 
-print(f"[eval] 5 段就绪；pretrain/speedup 的 GPT-2 同名列齐全；"
+print(f"[eval] 6 段就绪；pretrain/speedup 的 GPT-2 同名列齐全；"
       f"ppl={r['perplexity']:.2f} speedup={s['speedup']:.2f}x consistent={s['consistent']}")
 PY
     )
     if [ $? -eq 0 ]; then
-      ok "Qwen3 评估 smoke（5 段 + GPT-2 同名列）$(tail -1 /tmp/llm_init_l4_eval.log)"
+      ok "Qwen3 评估 smoke（6 段 + GPT-2 同名列）$(tail -1 /tmp/llm_init_l4_eval.log)"
     else
       fail "Qwen3 评估 smoke" "$(tail -3 /tmp/llm_init_l4_eval.log | tr '\n' ' ')"
     fi
   else
     skip "Qwen3 评估 smoke" "evaluate.py 尚未就绪（feat-025），或 torch 不可用"
+  fi
+
+  # --- 生成质量 smoke（feat-026）：4 个指标 + 探针可复现 + 口径与 GPT-2 线相等 ---
+  if [ -f "$QWEN_DIR/quality.py" ] && [ -f "$QWEN_DIR/data/quality_prompts.py" ] \
+     && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 GPT2_DIR="$PY_DIR" "$PY" - <<'PY' >/tmp/llm_init_l4_quality.log 2>&1
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+
+import torch
+
+import quality
+from data.quality_prompts import get_quality_prompts
+
+# 1) 4 个指标在**手算能对上**的输入上给出手算值
+assert quality.distinct_n(["abab"], 1) == 0.5
+assert abs(quality.distinct_n(["abab"], 2) - 2 / 3) < 1e-12
+assert abs(quality.self_bleu(["hello world"] * 4) - 1.0) < 1e-9
+
+probs = torch.full((1, 8), 1.0 / 8)
+assert abs(quality.entropy_from_probs(probs) - math.log(8)) < 1e-6
+
+d = quality.response_quality_detail(["q"], ["The dog runs fast."],
+                                     animals=["dog"], verbs=["runs"])
+assert abs(d["value"] - 1.0) < 1e-9, d
+assert abs(d["by_rule"]["length"] - 1.0) < 1e-9, d
+assert abs(d["by_rule"]["entity"] - 1.0) < 1e-9, d
+
+# 2) 探针集可复现（同 seed ⇒ 同结果），条数对得上
+p1 = get_quality_prompts(6, 1234)
+assert p1 == get_quality_prompts(6, 1234), "探针集不可复现"
+assert len(p1) == 6
+
+# 3) 口径交叉验证：共享实现 vs **GPT-2 线自己的** evaluate.py —— 必须逐值相等
+#    （这是「同名同口径」的机器证明；没有 GPT-2 checkpoint 时跳过这一段）
+gpt2_dir = os.environ["GPT2_DIR"]
+ckpt = os.path.join(gpt2_dir, "checkpoints", "sft.pt")
+if os.path.exists(ckpt) and os.path.exists(os.path.join(gpt2_dir, "evaluate.py")):
+    # ⚠️ runner 要用**绝对路径**：子进程的 cwd 是 GPT-2 线，相对路径会找不到
+    runner = os.path.abspath(os.path.join("ablations", "_gpt2_quality_runner.py"))
+    tmpdir = tempfile.mkdtemp(prefix="l4_quality_")
+    payload = os.path.join(tmpdir, "payload.json")
+    out = os.path.join(tmpdir, "out.json")
+    with open(payload, "w", encoding="utf-8") as f:
+        json.dump({"prompts": p1, "checkpoint": os.path.abspath(ckpt),
+                   "max_new_tokens": 4, "n_entropy_samples": 3,
+                   "temperature": 0.8, "seed": 1234}, f, ensure_ascii=False)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = gpt2_dir + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.run(
+        [sys.executable, runner, "--payload", payload, "--out", out],
+        cwd=gpt2_dir, env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace")
+    assert proc.returncode == 0, f"runner 失败：{proc.stderr[-600:]}"
+    with open(out, encoding="utf-8") as f:
+        res = json.load(f)
+    for key in ("distinct_1", "distinct_2", "self_bleu",
+                "response_quality", "token_entropy"):
+        assert abs(float(res["own"][key]) - float(res["shared"][key])) <= 1e-9, \
+            f"{key} 口径与 GPT-2 线不一致"
+    note = "5 个指标与 GPT-2 线逐值相等"
+else:
+    note = "跳过口径交叉验证（没有 GPT-2 的 sft.pt）"
+
+print(f"[quality] 4 个指标手算一致；探针可复现；{note}")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 生成质量 smoke（4 指标 + 探针 + 口径）$(tail -1 /tmp/llm_init_l4_quality.log)"
+    else
+      fail "Qwen3 生成质量 smoke" "$(tail -3 /tmp/llm_init_l4_quality.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 生成质量 smoke" "quality.py 尚未就绪（feat-026），或 torch 不可用"
   fi
 
   # --- 退化对照 smoke（feat-017）：全关时 Qwen3 必须与 GPT-2 对齐 ---

@@ -7,7 +7,8 @@ Qwen3 精简评估脚本。
     python evaluate.py --stage lora         # LoRA：偏好数据胜率
     python evaluate.py --stage dpo          # DPO：reward margin 均值/标准差 + chosen>rejected 准确率
     python evaluate.py --stage speedup      # 推理：有/无 KV Cache 的输出一致性 + 加速比
-    python evaluate.py --stage all          # 依次跑 5 段
+    python evaluate.py --stage quality      # 生成质量：distinct-n / self-BLEU / token entropy / response quality
+    python evaluate.py --stage all          # 依次跑 6 段
 
 【★ 与 GPT-2 线 9 项评估的关系 —— 不做逐项对标】
     GPT-2 线的 9 项是围绕 **Reward Model + PPO** 设计的：
@@ -18,15 +19,21 @@ Qwen3 精简评估脚本。
         · pairwise accuracy（RM）→ 本线没有 RM；对应物是 **DPO 的 margin 判对率**
         · PPO reward / PPO KL    → 本线没有 PPO；对应物是 **DPO 的隐式奖励 margin**
         · SFT-vs-PPO 对比        → 本线没有 PPO；对应物是 **LoRA 前后胜率对比**
-    剩下 5 项（distinct-n / self-BLEU / token entropy / response quality / benchmark）
-    属于「生成质量」类，本线**尚未实现**（feat-025 的范围是「精简评估」，
-    不是复制 GPT-2 的整套生成质量指标）。
+        · benchmark              → 本线语料是合成语料，没有 QA benchmark 可做
+    剩下 4 项（distinct-n / self-BLEU / token entropy / response quality）
+    属于「生成质量」类 —— **feat-026 起本线已实现**，
+    指标名与定义与 GPT-2 线**逐字同名**（实现见 `quality.py`）。
     ⇒ **差异清单写在 `qwen3-learning/qwen3-pytorch/README.md`**。
 
-    但 **pretrain 与 speedup 两项保留与 GPT-2 线逐字同名的列**，便于横向对比：
+    **pretrain / speedup / quality 三段保留与 GPT-2 线逐字同名的列**，便于横向对比：
         pretrain: stage / metric / value / loss / perplexity / n_tokens / checkpoint
         speedup:  stage / metric / value / naive_avg_ms / kv_avg_ms / speedup /
                   naive_tokens / kv_tokens / n_runs / max_new_tokens
+        quality:  distinct_1 / distinct_2 / self_bleu / token_entropy / response_quality
+
+    ⚠️ quality 段的**可比性有限**：探针是动物类问题，对 GPT-2 是**域内**、
+    对 Qwen3 是**域外**；且 token entropy 的绝对值依赖词表大小。
+    详见 `data/quality_prompts.py` 与 `ablations/compare_quality.py`。
 
 【★ 「同名」也包括「同口径」】
     GPT-2 线的 perplexity = `exp(整个 val set 的 token 加权平均 cross_entropy)`，
@@ -43,6 +50,8 @@ Qwen3 精简评估脚本。
         · dpo：checkpoint 里的 LoRA 分支必须**非零**（B 全零 ⇒ DPO 压根没训过）
         · dpo：margin 标准差 >= 0、准确率 ∈ [0, 1]
         · speedup：**有/无 KV Cache 的 greedy 输出必须逐位相同**，不一致直接报错退出
+        · quality：4 个指标都必须落在合法区间（多样性/质量分 ∈ [0,1]、
+          熵是有限正数），且至少命中一条评分规则
     checkpoint 缺失时**跳过该 stage 并打印原因**（那是「还没跑到那一步」，
     不是「指标不合格」）。
 
@@ -77,6 +86,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DENSE_CONFIG, MOE_CONFIG
 from data.preference_data import generate_preference_dataset
 from data.pretrain_data import make_pretrain_loader
+from data.quality_prompts import get_quality_prompts
 from data.tokenizer import BPETokenizer
 from model.common.lora import inject_lora, set_lora_enabled
 from model.qwen3_dense import Qwen3Dense
@@ -90,6 +100,10 @@ PRETRAIN_DENSE = os.path.join(CKPT_DIR, "pretrain_dense.pt")
 PRETRAIN_MOE = os.path.join(CKPT_DIR, "pretrain_moe.pt")
 LORA_CKPT = os.path.join(CKPT_DIR, "lora.pt")
 DPO_CKPT = os.path.join(CKPT_DIR, "dpo.pt")
+# 生成质量段用的 checkpoint：**LoRA 微调之后**的模型，
+# 与 GPT-2 线的 `checkpoints/sft.pt`（SFT 之后）对位 ——
+# 两条线都是「拿指令微调过的模型去生成」，那才是可比的两种模型。
+QUALITY_CKPT = LORA_CKPT
 
 # 预训练验证集 loader 的缓存（构造它要重新合成语料 + 编码，比较慢）
 _LOADER_CACHE: Dict[tuple, object] = {}
@@ -105,6 +119,10 @@ THRESH_DPO_ACC = 0.5
 THRESH_MARGIN = 0.0
 # KV Cache 必须真的更快（否则「用 KV Cache」这件事没有意义）
 THRESH_SPEEDUP = 1.0
+# 生成质量：模型至少要偶尔命中一条评分规则（纯随机文本的 response_quality ≈ 0）
+THRESH_RESPONSE_QUALITY = 0.0
+# 生成质量：多样性必须非 0（回答不能全是空的）
+THRESH_DISTINCT = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -523,12 +541,105 @@ def eval_speedup(tk: "BPETokenizer", device: "torch.device") -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 6) 生成质量（distinct-n / self-BLEU / token entropy / response quality）
+# ---------------------------------------------------------------------------
+def eval_quality(tk: "BPETokenizer", device: "torch.device") -> dict:
+    """
+    生成质量评估：4 个指标**与 GPT-2 线同名同定义**。
+
+    **指标与 GPT-2 线的对应关系**
+        distinct_1 / distinct_2   字符级 n-gram 多样性
+        self_bleu                 批内互相重复程度（越低越多样）
+        token_entropy             生成每步 next-token 分布熵的均值
+        response_quality          rule-based 质量分（4 条规则，每条 0.25）
+
+    **「同名同口径」不是承诺，是断言**
+        实现放在 `quality.py`（两条线共用同一份代码）；
+        `ablations/compare_quality.py` 会把**同一批固定回答**分别喂给
+        「GPT-2 线自己的 evaluate.py」和「quality.py」，
+        两边算出来的值必须**完全相等**，否则直接报错退出。
+
+    **⚠️ 跨线可比性（必读）**
+        探针是**动物类问题**（见 `data/quality_prompts.py`）：
+          · 对 GPT-2 线是**域内**（它的 SFT 数据就是这一类）
+          · 对 Qwen3 线是**域外**（它训在 transformer 主题的语料上）
+        ⇒ 两个数字**不是**「谁的架构更好」的证据，只说明「同一把尺子下的绝对水平」。
+        域内的对照见 `ablations/compare_quality.py` 的第 3 张表。
+
+    **⚠️ token_entropy 的绝对值跨线不可比**
+        熵依赖词表大小（均匀分布时 H = log V；GPT-2 线 ~64 字符 vs Qwen3 线 ~778 子词）。
+        所以额外给 `token_entropy_normalized` = H / log(V)，那个才是可比的量。
+
+    参数：
+        tk:     tokenizer
+        device: 设备
+    返回：
+        指标字典
+    """
+    import quality
+
+    if not os.path.exists(QUALITY_CKPT):
+        return _skip("quality",
+                     f"{QUALITY_CKPT} 不存在（先跑 python train/train_lora.py）")
+
+    cfg = DENSE_CONFIG
+    # ★ 固定随机种子：生成是**采样**（temperature 0.8），不固定种子的话
+    #   每次跑出来的数字都在动 ⇒ 笔记里记的数字明天就复现不出来。
+    torch.manual_seed(cfg.eval_seed)
+    model = _load_dense(QUALITY_CKPT, tk, device, with_lora=True)
+
+    prompts = get_quality_prompts(cfg.quality_n_samples, cfg.eval_seed)
+    responses, logits_list = quality.generate_responses_with_logits(
+        model, tk, prompts,
+        max_new_tokens=cfg.quality_max_new_tokens,
+        temperature=cfg.temperature, top_k=cfg.top_k, top_p=cfg.top_p,
+    )
+
+    d1 = quality.distinct_n(responses, 1)
+    d2 = quality.distinct_n(responses, 2)
+    sb = quality.self_bleu(responses)
+    ent = quality.token_entropy_from_logits(logits_list, temperature=cfg.temperature)
+    rq = quality.response_quality_detail(prompts, responses)
+
+    # --- 自洽性门槛（跟模型好坏无关 ⇒ 随机模型也该过）---
+    assert len(responses) == len(prompts) > 0, "探针或回答数量为 0"
+    for name, v in (("distinct_1", d1), ("distinct_2", d2),
+                    ("self_bleu", sb), ("response_quality", rq["value"])):
+        assert 0.0 <= v <= 1.0, f"{name} 越界（应在 [0,1]）：{v}"
+    assert math.isfinite(ent) and ent > 0.0, f"token_entropy 不是有限正数：{ent}"
+
+    return {
+        "stage": "quality",
+        "metric": "response_quality",
+        "value": rq["value"],
+        "distinct_1": d1,
+        "distinct_2": d2,
+        "self_bleu": sb,
+        "token_entropy": ent,
+        # 跨线可比的熵（除掉 log 词表大小）
+        "token_entropy_normalized": ent / math.log(tk.vocab_size),
+        "response_quality": rq["value"],
+        "response_quality_ex_length": rq["value_ex_length"],
+        "response_quality_by_rule": rq["by_rule"],
+        "mean_response_chars": rq["mean_chars"],
+        "vocab_size": tk.vocab_size,
+        "n_samples": len(responses),
+        "max_new_tokens": cfg.quality_max_new_tokens,
+        "temperature": cfg.temperature,
+        "probe": "animal（与 GPT-2 线共用；GPT-2 域内 / Qwen3 域外）",
+        "responses": responses[:3],
+        "checkpoint": QUALITY_CKPT,
+    }
+
+
 STAGES = {
     "pretrain": eval_pretrain,
     "moe": eval_moe,
     "lora": eval_lora,
     "dpo": eval_dpo,
     "speedup": eval_speedup,
+    "quality": eval_quality,
 }
 
 
@@ -569,6 +680,16 @@ def check_directional(stage: str, r: dict) -> None:
     elif stage == "speedup":
         assert r["speedup"] > THRESH_SPEEDUP, \
             f"KV Cache 加速比 {r['speedup']:.3f}x 不大于 {THRESH_SPEEDUP} ⇒ 用 cache 反而更慢"
+    elif stage == "quality":
+        # 生成质量的方向性门槛刻意设得很低：
+        # 这段的绝对值**依赖训练分布**，两条线没有可比的基线
+        # （动物探针对 GPT-2 是域内、对 Qwen3 是域外），
+        # 所以只要求「不是全零的垃圾输出」。
+        assert r["response_quality"] > THRESH_RESPONSE_QUALITY, \
+            f"response_quality={r['response_quality']:.4f} 不大于 {THRESH_RESPONSE_QUALITY} " \
+            "⇒ 模型一次都没命中任何评分规则"
+        assert r["distinct_1"] > THRESH_DISTINCT, \
+            f"distinct_1={r['distinct_1']:.4f} 不大于 {THRESH_DISTINCT} ⇒ 生成结果全为空"
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +743,18 @@ def print_stage(name: str, r: dict) -> None:
               f"prompt 长度 {r['prompt_len']}")
         print(f"[eval]   KV Cache 占用 GQA={r['kv_cache_gqa_bytes']:,}B  "
               f"MHA={r['kv_cache_mha_bytes']:,}B  比值={r['kv_cache_ratio']:.3f}")
+    elif name == "quality":
+        print(f"[eval] stage=quality  response_quality={r['response_quality']:.4f}  "
+              f"distinct_1={r['distinct_1']:.4f}  distinct_2={r['distinct_2']:.4f}  "
+              f"self_bleu={r['self_bleu']:.4f}")
+        print(f"[eval]   token_entropy={r['token_entropy']:.4f}（归一化 "
+              f"{r['token_entropy_normalized']:.4f}，词表 {r['vocab_size']}）  "
+              f"n={r['n_samples']}  probe={r['probe']}")
+        print(f"[eval]   规则命中率：" +
+              "  ".join(f"{k}={v:.2f}" for k, v in r["response_quality_by_rule"].items()))
+        print(f"[eval]   扣掉长度规则后 = {r['response_quality_ex_length']:.4f}"
+              f"（长度规则按字符级 tokenizer 标定，对 BPE 线系统性不利；"
+              f"平均回答长度 {r['mean_response_chars']:.1f} 字符）")
 
 
 def main() -> None:
