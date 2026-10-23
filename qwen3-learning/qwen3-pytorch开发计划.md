@@ -10325,3 +10325,97 @@ test_derived_sync OK
    「目标词表 1000」一起放过。**只涂掉那个数字**，其余照常核对。
 
 ---
+
+### Task 23: feat-029 笔记「手抄代码」守卫（不要求逐字一致，要求**行为一致**）
+
+#### 立项：把被否决的「逐字一致」换一个问法
+
+feat-028 已实测判定：全仓 **164/164** 个笔记代码块都是**故意简化**的摘录
+（教学笔记本来就该简化），没有一个与源文件逐字相同 ⇒ 「逐字一致」守卫
+要么得先改 164 处笔记（改内容，不是加守卫），要么上线当天就是 164 条红灯。
+
+⇒ **换问法**：不要求「长得一样」，要求「**行为一样**」。
+
+| 问法 | 实测 | 结论 |
+|---|---|---|
+| 逐字一致 | 164/164 块都是简化摘录 | ❌ 不可行 |
+| **行为一致** | 笔记版 `get_lr`（改写成局部变量 + 多一行 clamp）输出**逐个相同** | ✅ **做这个** |
+
+#### 做法
+
+```
+笔记里那段代码  ──exec──▶  同样输入  ──▶  输出 A ┐
+                                              ├─ compare(A, B)
+源码里那个函数  ──exec──▶  同样输入  ──▶  输出 B ┘
+```
+
+★ **源码函数用 `ast.get_source_segment` 摘出来再 `exec`，绝不 import** ——
+`train_pretrain.py` 是**顶层线性脚本**（没有 `__main__` 保护），
+import 它会**把整个预训练重跑一遍**（打印 150 轮迭代）并**覆盖 `checkpoints/pretrain.pt`**（实测踩过）。
+
+★ **有状态的对象：输入要一样、对象要各造一份** ——
+`KVCache.append` 会写 cache、`set_lora_enabled` 会改 scaling。
+第一版两边**各自 random 出 K/V** ⇒ 比的是两份随机数（假红 `max|diff| = 2.502e+00`）。
+修法：随机数在工厂**外面**生成一次、两边共用；只有状态对象各造各的。
+
+★ **阈值用「绝对 + 相对」双阈值**（`atol=1e-9, rtol=1e-6`）——
+学习率量级只有 `1e-4`，纯绝对阈值会让「少一次 +1」这种真错误只剩 `6.000e-06` 的差。
+
+#### 配对表（8 条 / 4 篇笔记）
+
+| 配对 | 笔记 | 源码 | 比什么 |
+|---|---|---|---|
+| `get_lr` | `0.GPT全流程详解.md`、`GPT2训练数学公式与超参详解.md` | `train_pretrain.py` | 数值（11 个 iter） |
+| `_build_sinusoidal_pos_emb` | 3 篇笔记 | `model/gpt2.py` | 张量（3 组尺寸） |
+| `KVCache.append` | `0.GPT全流程详解.md` | `inference.py` | 调用后的 cache 状态（`_seq_lens` + K/V 张量） |
+| `mark_only_lora_trainable` | `Qwen3_LoRA与DPO_学习笔记.md` | `model/common/lora.py` | 可训练参数个数 + 每个参数的 `requires_grad` 分布 |
+| `set_lora_enabled` | `Qwen3_LoRA与DPO_学习笔记.md` | `model/common/lora.py` | LoRA 分支的 `scaling` 值 |
+
+#### 产物
+
+- `qwen3-learning/qwen3-pytorch/tests/test_note_code_sync.py` —— 自动守卫
+  （`tests/run_all.py` **自动发现** ⇒ `init.sh` L4 天然覆盖，**不用改 init.sh**）
+- 4 篇笔记各加一处「本段代码由机器守卫核对」的醒目标记
+
+#### 实测结果
+
+```
+$ python tests/test_note_code_sync.py
+  [PASS] gpt2/get_lr（全流程详解）  —— 行为一致
+  [PASS] gpt2/get_lr（数学公式详解）  —— 行为一致
+  [PASS] gpt2/_build_sinusoidal_pos_emb（全流程详解）  —— 行为一致
+  [PASS] gpt2/_build_sinusoidal_pos_emb（位置编码）  —— 行为一致
+  [PASS] gpt2/_build_sinusoidal_pos_emb（数学公式详解）  —— 行为一致
+  [PASS] gpt2/KVCache.append（KV Cache 写入流程）  —— 行为一致
+  [PASS] qwen3/mark_only_lora_trainable  —— 行为一致
+  [PASS] qwen3/set_lora_enabled  —— 行为一致
+[note-code] 核对 8 条「笔记手抄代码 ↔ 源码」配对，全部行为一致（笔记 4 篇）
+test_note_code_sync OK
+```
+
+**反证 3 连**（改完全部复原）：① `get_lr` 的 `(it + 1)` 抄成 `it` → **红**（`|diff| = 6.000e-06`，
+正是本仓**历史上真实发生过**的错）；② `mark_only_lora_trainable` 的
+`id(p) in lora_ids` 抄成 `True` → **红**（`可训练参数个数不同：62 vs 16`）；
+③ `math.log(10000.0)` 抄成 `math.log(100000.0)` → **红**（`max|diff| = 1.999e+00`）。
+三次都**只红被扰动的那一条**。
+
+#### 四个教训
+
+1. **别拿「逐字一致」当目标** —— 教学笔记**必须**简化；真正的目标是**行为一致**。
+   问法一换，164 处阻塞直接消失。
+2. **绝不 import 被测的源码模块** —— 顶层线性脚本 import 就有副作用；
+   `ast` 摘函数再 `exec` 才是零副作用的做法。
+3. **有状态的东西：输入要一样、对象要各一份** —— 只做一半会假红。
+4. **阈值要跟着量级走** —— 量级 `1e-4` 的量不能用纯绝对阈值。
+
+#### 顺手挖出来的下一个真问题（→ feat-030）
+
+全仓 `#L` 行号锚点普查（**16** 个）：**4 个失效**，全在
+`gpt-learning/GPT2训练数学公式与超参详解.md`，都指向 `train_ppo.py` ——
+而那个文件现在只有 **14 行**（thin wrapper，真实实现在 `train_ppo_standard_adapted.py`，1337 行）。
+更严重：被引用的那几段代码（`compute_kl`、reward shaping、reward normalization）
+在**重构后已经不存在**了 ⇒ **整段 PPO 章节在描述一个已经不存在的实现**。
+现有 `tests/test_note_refs.py` 只校验「链接目标文件存在」，不校验 `#L` 行号范围 ⇒ 一直没被抓住。
+⇒ 已立 **feat-030**（not_started）。
+
+---

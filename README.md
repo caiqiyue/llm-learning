@@ -85,7 +85,7 @@ qwen3-learning/qwen3-pytorch/
 ├── evaluate.py        # 精简 6 段评估（pretrain / moe / lora / dpo / speedup / quality）
 ├── quality.py         # 生成质量指标（两条线共用同一份实现，feat-026）
 ├── ablations/         # 与 GPT-2 的退化对照（feat-017）+ 生成质量并排对照（feat-026，唯一跨目录引用 GPT-2 线的地方）
-└── tests/             # 19 个 test_*.py + run_all.py 汇总
+└── tests/             # 20 个 test_*.py + run_all.py 汇总
 ```
 
 **核心思路**：不靠"读懂论文"，而是**把 Qwen3 的每个组件做成一个可关掉的开关**（`use_gqa` / `use_rope` / `use_qk_norm` / `mlp_type` / `norm_type`），
@@ -150,6 +150,13 @@ qwen3-learning/qwen3-pytorch/
 > 改一个 `n_embd` / `n_layer`，几十个参数量数字会**同时**变红。
 > 表格里那种「`| 总可训练参数 | … | **794,496** |`」的写法也跑不掉（行级规则）。
 
+> **笔记里手抄的代码 ↔ 源码行为也自动校验**（feat-029）：
+> `qwen3-learning/qwen3-pytorch/tests/test_note_code_sync.py` 管的是**代码** ——
+> 笔记会手抄 `get_lr` / `_build_sinusoidal_pos_emb` / `mark_only_lora_trainable` …，
+> 手抄会抄错（本仓真的发生过少写一次 `+1` 的 `get_lr`）。
+> 守卫**不要求逐字一致**（笔记本来就是简化版），而是**把两边都跑起来比输出**：
+> 行为一致 ⇒ 放行；抄错 ⇒ 红灯并指出差在哪。
+
 ---
 
 ## 五、快速开始
@@ -213,7 +220,7 @@ python train/train_dpo.py                # ③ DPO（π_ref = LoRA 后的 SFT �
 python evaluate.py --stage all            # 精简 6 段评估
 python ablations/compare_with_gpt2.py    # 与 GPT-2 的退化对照（6 行消融表）
 python ablations/compare_quality.py      # 与 GPT-2 的生成质量并排 + 口径交叉验证
-python tests/run_all.py                  # 19 个 smoke 汇总
+python tests/run_all.py                  # 20 个 smoke 汇总
 ```
 
 单项说明见 [`qwen3-pytorch/README.md`](qwen3-learning/qwen3-pytorch/README.md)。

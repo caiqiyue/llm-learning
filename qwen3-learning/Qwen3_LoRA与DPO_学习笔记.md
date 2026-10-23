@@ -136,6 +136,11 @@ trainable = [p for p in model.parameters() if p.requires_grad]
 
 **修法**：
 
+> ⚠️ **本篇的 `mark_only_lora_trainable` / `set_lora_enabled` 由机器守卫核对**：
+> `qwen3-learning/qwen3-pytorch/tests/test_note_code_sync.py` 会把**这段笔记里的代码**和
+> **仓库里的源码**放在一起跑，在同样输入上比输出 —— 教学上可以简化，但**行为必须一样**。
+> 改了笔记没改源码（或反之），测试立刻红。
+
 ```python
 def mark_only_lora_trainable(model):
     lora_ids = {id(p) for p in lora_parameters(model)}

@@ -21,8 +21,11 @@ Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO + KV Cache 推理�
 **P1 线的 SFT 塌陷也修好了**（feat-027：三个互相咬合的缺陷 —— 训练目标与推理目标不一致 /
 特殊 token 不可达 / 评估切片错位；修完 PPO 第一次真的在优化奖励），
 **笔记里的「派生量」也纳入机器守卫了**（feat-028：参数量 / 词表大小 / 算式 / 比值 ↔ **代码实测**，
-期望值不手写而是**现场把模型搭出来数参数**）。
-**28 个 feature 全部 passing**，只剩收班。
+期望值不手写而是**现场把模型搭出来数参数**），
+**笔记里手抄的代码也纳入机器守卫了**（feat-029：把笔记里那段代码**真的跑起来**，
+和源码里那段**比输出** —— 不要求逐字一致，只要求**行为一致**）。
+**29 个 feature 全部 passing**（另有 **feat-030 已立项未开始**：笔记里的 `#L` 源码锚点机器校验
++ 修 P1 线 PPO 章节与重构后代码的脱节）。
 
 ---
 
@@ -59,7 +62,7 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 ## Verified Now（哪些是已验证的）
 
 - `bash init.sh` → **PASS=30 SKIP=0 FAIL=0**（2026-10-23，L4 已有九条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke** / **评估 smoke** / **生成质量 smoke** / **退化对照 smoke**；L1 另加「**P1 训练口径守卫（feat-027）**」、L2 另加「模型 loss 确实错位」断言）
-- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=19 FAIL=0 TOTAL=19**（feat-028 新增第 19 个：`test_derived_sync.py`）
+- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=20 FAIL=0 TOTAL=20**（feat-028 新增第 19 个 `test_derived_sync.py`；feat-029 新增第 20 个 `test_note_code_sync.py`）
 - Qwen3 前向 smoke 已用**真实 BPE 词表**（vocab 778）跑通：`logits (2, 8, 778) loss 6.6897 params 985,856`
 - Qwen3 训练步 smoke：`[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05`
 - **预训练真跑通**（CPU，脚本在 `train/train_pretrain.py`，超参全从 `config.py` 读）：
@@ -280,6 +283,45 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 - **已知边界**：`qwen3-pytorch开发计划.md` 不进自动守卫（**人工核对**）·
   测量值类数字（耗时 / loss / 采样类）不在范围内 · 不带参数上下文的分数不进守卫。
 
+### feat-029 — 笔记里「手抄的代码」也纳入机器守卫（Session 016）
+
+- **由来**：feat-028 收班时把交接文档「Next Best Step ③（逐字一致守卫）」判为**不可行**。
+  feat-029 **不去硬做 ③**，而是**换一个可落地的问法**。
+- **★ 换问法：不要求「长得一样」，要求「行为一样」** ——
+  教学笔记**必须**简化（少 docstring、改写变量名、只留主干），
+  所以「逐字一致」从设计上就不该是目标；真正的目标是**行为一致**
+  （学习者照着笔记敲出来的代码，必须和仓库里跑的是同一件事）。
+  实测：笔记版 `get_lr` 把 `config.xxx` 改写成局部变量、还多了一行 clamp ⇒ 输出**逐个相同** ⇒ 放行。
+- **新守卫**：`qwen3-learning/qwen3-pytorch/tests/test_note_code_sync.py`
+  （`tests/run_all.py` **自动发现** ⇒ `init.sh` L4 一起覆盖，**不用改 init.sh**）。
+  **配对 8 条 / 覆盖 4 篇笔记**：
+  `get_lr`（2 篇 × 11 个 iter）· `_build_sinusoidal_pos_emb`（3 篇 × 3 组尺寸）·
+  `KVCache.append`（比**调用后**的 cache 状态）· `mark_only_lora_trainable`
+  （比**可训练参数个数 + 每个参数的 requires_grad 分布**）· `set_lora_enabled`（比 **scaling 值**）。
+- **★ 绝不 import 被测的源码模块** —— 源码函数用 `ast.get_source_segment` **摘出来**再 `exec`。
+  原因**实测踩过**：`train_pretrain.py` 是**顶层线性脚本**（没有 `__main__` 保护），
+  import 它会**把整个预训练重跑一遍**（打印 150 轮迭代）并**覆盖 `checkpoints/pretrain.pt`**。
+- **★ 有状态的对象：输入要一样、对象要各造一份** —— `append` 会写 cache、`set_lora_enabled` 会改 scaling。
+  第一版只做了一半（两边各造 cache，但**各自 random 出 K/V**）⇒ 比的是两份随机数，
+  测出 `max|diff| = 2.502e+00` 的假红。修法：随机数在工厂**外面**生成一次、两边共用。
+- **★ 阈值用「绝对 + 相对」双阈值**（`atol=1e-9, rtol=1e-6`）——
+  学习率量级只有 `1e-4`，纯绝对阈值 `1e-6` 会让「少一次 +1」这种真错误只剩 `6.000e-06` 的差，卡在阈值边上很脆。
+- **★ 反证 3 连（改完全部复原）**：
+  ① `get_lr` 的 `(it + 1)` 抄成 `it` → **红**（`|diff| = 6.000e-06`）——
+  这正是本仓**历史上真实发生过**的错；
+  ② `mark_only_lora_trainable` 的 `id(p) in lora_ids` 抄成 `True` → **红**（`62 vs 16` 个可训练参数）；
+  ③ `math.log(10000.0)` 抄成 `math.log(100000.0)` → **红**（`max|diff| = 1.999e+00`）。
+  三次都**只红被扰动的那一条** ⇒ 定位精确，没有误伤。
+- **跑通**：`bash init.sh` → **PASS=30 SKIP=0 FAIL=0**；
+  `tests/run_all.py` → **PASS=20 FAIL=0 TOTAL=20**；
+  单独跑 → `核对 8 条「笔记手抄代码 ↔ 源码」配对，全部行为一致（笔记 4 篇）`。
+- **顺手给 4 篇笔记加了「本段代码由机器守卫核对」的醒目标记** ——
+  `0.GPT全流程详解.md` / `GPT2训练数学公式与超参详解.md` / `2.位置编码.md` / `Qwen3_LoRA与DPO_学习笔记.md`。
+- **已知边界**：① 只覆盖**函数级**配对，且是**手工登记**的 8 条
+  （不是「自动发现所有能跑的笔记代码块」—— 大部分笔记代码块是片段，缺上下文跑不起来）；
+  ② 配对表里的输入点写死，覆盖的是**该函数的行为契约**，不是全输入空间；
+  ③ 本 feature 只加守卫、**没动任何训练/评估代码** ⇒ 不需要跑 L3 全量训练。
+
 ## Broken Or Unverified（坏的 / 没验证的）
 
 - ~~**★ P1 线：SFT / PPO checkpoint 退化成常量输出**~~ **✅ 已修（feat-027，Session 014）**
@@ -311,6 +353,16 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 - **交叉引用只到「文件 + 类/函数」级，不到行号级** —— 行号会随代码改动漂移，写进笔记反而变成错误信息。
   另外**裸写的不带目录的文件名**（`config.py` / `evaluate.py`）**不在自动校验范围内**
   （机器判不准它指主线还是本线），这部分靠人工
+- **★ P1 线 PPO 章节与重构后的代码脱节**（feat-030 已立项，**未做**）——
+  `gpt-learning/GPT2训练数学公式与超参详解.md` 的 4 个 `#L` 锚点
+  （`train_ppo.py#L262-L268` / `#L271-L303` / `#L392-L393` / `#L397-L399`）指向
+  `gpt-learning-pytorch/train_ppo.py` —— 而那个文件现在只有 **14 行**（thin wrapper，
+  真实实现在 `train_ppo_standard_adapted.py`，1337 行）⇒ **4 个锚点全部越界**。
+  更严重：那几段被引用的代码（`compute_kl`、reward shaping、reward normalization）
+  在**重构后已经不存在**了 —— 现在对应的是 `score_reward_model` / `whiten_masked` / `compute_gae`
+  （`compute_gae` 现在在第 676 行）⇒ **整段 PPO 章节在描述一个已经不存在的实现**。
+  现有 `tests/test_note_refs.py` **只校验「链接目标文件存在」**，不校验 `#L` 行号范围 ⇒ 一直没被抓住。
+  全仓 `#L` 锚点共 **16** 个，坏 **4** 个（全部在这一处）。
 - **feat-017 的结论只在 fp32 / 小尺寸下成立**（vocab=293、n_layer=4、n_embd=128、seq_len=16）：
   「全关逐位相同」**不能外推**到别的 dtype / 别的形状。
   且单开组件时新引入的参数（SwiGLU 的 gate）是**随机初值** ⇒ 那几行的 diff 适合比**量级**，
@@ -329,10 +381,11 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 | 顺序 | feature | 做什么 | 为什么是它 |
 |------|---------|--------|--------|
-| — | **无** | — | **28 个 feature 全部 passing**，P2 阶段（Qwen3 从零实现）已收班 |
+| 1 | **feat-030** | 给笔记里的 `#L<行号>` 源码锚点加机器校验（`tests/test_note_refs.py`），并**重写** `GPT2训练数学公式与超参详解.md` 的 PPO 章节 | 唯一还没做的 feature（not_started）。它能**自动抓出**已知的 4 个失效锚点，而那 4 个锚点背后是**整段 PPO 章节在描述一个已经不存在的实现**（`compute_kl` 等已被重构掉）|
 
-**下一个 session 建议做的第一件事**（不在 `feature_list.json` 里，因为还没立项）：
-读本卡的「Broken Or Unverified」段落，挑一条已知缺口**立项**成新的 feature。
+**下一个 session 建议做的第一件事**：
+先做上表的 **feat-030**（它是 `feature_list.json` 里 priority 最小的非 passing 项）。
+再往后可以从本卡的「Broken Or Unverified」段落挑一条已知缺口**立项**成新的 feature。
 目前最值得做的三条：
 ① ~~**修 P1 线的 SFT 塌陷**~~ **✅ 已做（feat-027，Session 014）** ——
    `sft.pt` / `ppo.pt` 不再吐常量（公共后缀 0%），`ppo_rm_score` 0.0696 → +0.9188，
@@ -341,14 +394,15 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
    散文数字的字面读法**实测不可行**（「层」语义冲突 18 处、「维」多为教学/官方值）；
    改成守卫**能算出真值的派生量**（参数量 / 词表 / 算式 / 比值），
    期望值**现场把模型搭出来数**（`tests/test_derived_sync.py`，41 处主张）；
-③ ~~**把 GPT-2 线的 `get_lr` 等实现细节也做成「笔记抄源码必须逐字一致」的守卫**~~
+③ ~~**把 GPT-2 线的 `get_lr` 等实现细节也做成「笔记抄源码必须逐字一致」的守卫」**~~
    **❌ 已实测不可行（feat-028，Session 015）** ——
    **164/164** 个笔记代码块都是**故意简化**的摘录，没有一个与源文件逐字相同；
    要做这个守卫得先改 164 处笔记（那是改内容，不是加守卫），上线当天就是 164 条红灯。
-   ⇒ **换一条路**：与其追求「逐字一致」，不如对**能算真值的片段**做**语义核对**
-   （如 `get_lr` 的公式在 `config.py` 里**跑一遍**比对手算），或用**代码块自检**：
-   让笔记里的代码块**可执行**，用 `exec` 跑一遍看结果对不对。
-   （这是下一步**唯一值得试**的方向，尚未立项。）
+   ⇒ **换一条路：改成「行为一致」守卫** ——
+   **✅ 已做（feat-029，Session 016）**：把笔记里那段代码和源码里那段**都跑起来**，
+   在同样输入上**比输出**（`tests/test_note_code_sync.py`，8 条配对 / 4 篇笔记）。
+   ★ 关键：源码函数用 `ast` **摘出来**再 `exec`，**绝不 import**
+   （`train_pretrain.py` 是顶层线性脚本，import 会重跑预训练并覆盖 checkpoint）。
 
 **这一步不许动的**：不在 `qwen3-learning/qwen3-pytorch/` 之外 import；不削弱 `evaluate.py` 的任何指标与阈值；
 GPT-2 线的训练代码只允许在**已立项且已确认**的 feature 里改（feat-027 已改完，
@@ -385,6 +439,10 @@ GPT-2 线的训练代码只允许在**已立项且已确认**的 feature 里改�
 | **「关键词紧邻」的正则抓不到表格里的数字** | `\| 总可训练参数 \| 见 §1.9 \| **794,496** \|` 里关键词和数字被 `\|` 隔开 ⇒ 紧邻式正则**一条都抓不到**（feat-028 实测：补「行级」规则后覆盖 21 → 41 处，新增的 20 处里有 6 处是**从没被核对过**的参数量） |
 | **守卫要能自己作废** | 例外登记簿里「已不再命中」的条目要**自动报出来要求删除**，否则例外越积越多，最后变成「什么都豁免」 |
 | **别用行级跳过** | 遇「785065 字节」就跳过**整行** ⇒ 连带把同一行真正该核对的「目标词表 1000」一起放过。**只涂掉那个数字**，其余照常核对 |
+| **「逐字一致」不是好目标，换成「行为一致」** | 教学笔记**必须**简化（少 docstring、改写变量名、只留主干）⇒ 逐字守卫上线当天就是 164 条红灯（feat-028 实测 164/164 块都是简化摘录）。**把两边都跑起来比输出**才是可落地的判据：简化过的 `get_lr` 输出**逐个相同** ⇒ 放行；抄错 ⇒ 红灯 |
+| **绝不 import 被测的源码模块** | 本仓的脚本大多是**顶层线性脚本**（没有 `__main__` 保护）⇒ import 就有副作用：`train_pretrain.py` import 一次会把**整个预训练重跑一遍**并**覆盖 `checkpoints/pretrain.pt`**（实测踩过）。正确做法：`ast.get_source_segment` **摘函数**再 `exec` ⇒ 零副作用 |
+| **有状态的东西：输入要一样、对象要各造一份** | `KVCache.append` 会写 cache、`set_lora_enabled` 会改 scaling。**对象共用** ⇒ 第二次调用接着第一次写（假红）；**对象各造但输入各随机** ⇒ 比的是两份随机数（实测 `max|diff| = 2.502e+00` 假红）。正确做法：随机数在工厂**外面**生成一次、两边共用；只有状态对象各造各的 |
+| **阈值要跟着量级走** | 学习率量级只有 `1e-4` ⇒ 纯绝对阈值 `1e-6` 会让「少一次 +1」这种真错误只剩 `6.000e-06` 的差，**刚好卡在阈值边上**。用**绝对 + 相对双阈值**（`atol=1e-9, rtol=1e-6`） |
 | **`strict=False` 会让你「评估了一个随机模型」而不报错** | `lora.pt` / `dpo.pt` 的 state_dict 是**注入 LoRA 之后**的键名（`q_proj.base.weight` / `.lora_A` / `.lora_B`），与未注入的模型对不上。`load_state_dict(strict=False)` **只警告不抛异常** ⇒ 权重全部没加载。正确做法：**先 `inject_lora` 再 `load_state_dict(strict=True)`**，键名对不上就当场红 |
 | **「同名」不等于「同口径」** | 同一个叫 `perplexity` 的字段，GPT-2 线是 **token 加权**、本线训练日志是 **batch 均值**（1.3485 vs 1.3510）。直接并排比就是在比两件不同的事。**两个口径都打印**才能既横向比又纵向对 |
 | **LoRA ≠ 弱化版全参** | 低秩约束 + 注入点决定「能学到什么」：内容型任务上全参 loss ~1.06 vs r=4 LoRA ~5.7。**LoRA 是风格/格式型任务的主场** |
@@ -470,6 +528,7 @@ git log --oneline -5
 | Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（**9 篇**，BPE 已补齐；每篇开头有 GPT-2 / Qwen3 源码交叉引用；训练推理篇含 §10 推理 + §11 评估 + **§12 退化对照** + **§13 生成质量**） |
 | 笔记数字一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_config_sync.py`（feat-009；27 篇笔记 / 88 处断言 / 25 条例外登记；改 `config.py` 忘了改笔记 ⇒ 红灯） |
 | 笔记**派生量**一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_derived_sync.py`（feat-028；27 篇笔记 / **41 处**主张 / 8 条例外登记；参数量 / 词表 / 算式 / 比值 ↔ **代码实测**；期望值现场数参数，不手写） |
+| 笔记**手抄代码**一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_note_code_sync.py`（feat-029；**8 条配对 / 4 篇笔记**；不要求逐字一致，只要求**行为一致** —— 两边都跑起来比输出；源码用 `ast` 摘出来 `exec`，**绝不 import**） |
 | GPT-2 对照实现 | `gpt-learning/gpt-learning-pytorch/model/gpt2.py`（**只能按文件路径 import**，见陷阱表） |
 | 对照实验脚本 | `qwen3-learning/qwen3-pytorch/ablations/compare_with_gpt2.py`（本仓唯一跨目录引用 GPT-2 线的地方，单向） |
 | 生成质量（两条线共用） | `qwen3-learning/qwen3-pytorch/quality.py`（**唯一一份指标实现**，两条线共用）+ `data/quality_prompts.py`（共享探针）+ `ablations/compare_quality.py` + `ablations/_gpt2_quality_runner.py`（GPT-2 侧子进程） |

@@ -96,6 +96,49 @@ GPT-2 按 `config.py` 造模型数 `parameters()`；Qwen3 造 dense / MoE / 注�
 
 实测：`核对笔记 27 篇 / 派生量主张 41 处 / 例外登记 8 条（全部命中，过时 0）`。
 
+### 笔记里**手抄的代码** ↔ 源码：行为守卫（feat-029）
+
+```bash
+python tests/test_note_code_sync.py
+```
+
+前两个守卫守的是**文字**（超参数字、派生量数字）。但笔记里还有第三类东西：**手抄的代码** ——
+`get_lr`、`_build_sinusoidal_pos_emb`、`mark_only_lora_trainable`、`set_lora_enabled` …
+本仓**真的发生过**手抄抄错（`get_lr` 少写一次 `+1`），而且是**靠人眼**发现的。
+
+★ **为什么不做「笔记代码块 ↔ 源码逐字一致」**
+量过了，不可行：**164/164** 个笔记代码块都是**故意简化**的摘录（教学笔记本来就该简化），
+没有一个与源文件逐字相同 ⇒ 逐字守卫上线当天就是 164 条红灯。
+
+★ **换一个问法：不要求「长得一样」，要求「行为一样」**
+守卫把**笔记里那段代码真的跑起来**，和**源码里那段真的跑起来**，在**同样输入**上比输出：
+
+| 情况 | 结果 |
+|---|---|
+| 笔记少了 docstring / 少了几行注释 | 放行（`max|diff| = 0.000e+00`） |
+| 笔记把 `config.xxx` 改写成局部变量、多加一行 clamp | 放行（输出逐个相同） |
+| 笔记抄错了（少一次 `+1`、把 `sin` 写成 `cos`……） | **红灯**，并指出差在哪 |
+
+| 配对 | 笔记 | 源码 | 比什么 |
+|---|---|---|---|
+| `get_lr` | `0.GPT全流程详解.md` / `GPT2训练数学公式与超参详解.md` | `train_pretrain.py` | 数值（11 个 iter） |
+| `_build_sinusoidal_pos_emb` | 3 篇笔记 | `model/gpt2.py` | 张量（3 组尺寸） |
+| `KVCache.append` | `0.GPT全流程详解.md` | `inference.py` | **调用后的 cache 状态**（seq_len + K/V 张量） |
+| `mark_only_lora_trainable` | `Qwen3_LoRA与DPO_学习笔记.md` | `model/common/lora.py` | **可训练参数个数 + requires_grad 分布** |
+| `set_lora_enabled` | `Qwen3_LoRA与DPO_学习笔记.md` | `model/common/lora.py` | **LoRA 分支 scaling 值** |
+
+★ **两条实现上的关键决定**
+① **绝不 import 源码模块** —— 源码函数用 `ast` 从文件里**摘出来**再 `exec`。
+   原因：`train_pretrain.py` 是**顶层线性脚本**（没有 `__main__` 保护），
+   import 它会**把整个预训练重跑一遍**并覆盖 `checkpoints/pretrain.pt`（实测踩过）。
+   `ast` 摘取只取那一个函数，**零副作用**。
+② **两边用同一套 globals、两个独立 namespace** —— 否则笔记的 `get_lr` 会被源码的 `get_lr` 覆盖，
+   等于自己跟自己比。
+③ **有状态的函数必须给两边各造一个独立对象**（`append` 会写 cache、`set_lora_enabled` 会改 scaling），
+   但**喂进去的输入必须完全相同**（随机数也要共用同一份，否则比的是两份随机数）。
+
+实测：`核对 8 条「笔记手抄代码 ↔ 源码」配对，全部行为一致（笔记 4 篇）`。
+
 ## 与 GPT-2 线的对照
 
 **主线代码（`model/` 与 `train/`）不 import GPT-2 线的任何代码** ——

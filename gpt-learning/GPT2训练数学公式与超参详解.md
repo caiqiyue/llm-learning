@@ -171,6 +171,11 @@ $$\text{lr}(t) = \begin{cases}
 
 **代码实现**：
 
+> ⚠️ **本篇的 `get_lr` / `_build_sinusoidal_pos_emb` 由机器守卫核对**：
+> `qwen3-learning/qwen3-pytorch/tests/test_note_code_sync.py` 会把**这段笔记里的代码**和
+> **仓库里的源码**放在一起跑，在同样输入上比输出 —— 教学上可以简化（改写成局部变量、多加一行 clamp），
+> 但**行为必须一样**。改了笔记没改源码（或反之），测试立刻红。
+
 ```python
 def get_lr(it: int) -> float:
     base_lr = config.learning_rate
