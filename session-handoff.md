@@ -25,8 +25,11 @@ Qwen3 线的**组件层 + 数据层 + 预训练 + LoRA + DPO + KV Cache 推理�
 **笔记里手抄的代码也纳入机器守卫了**（feat-029：把笔记里那段代码**真的跑起来**，
 和源码里那段**比输出** —— 不要求逐字一致，只要求**行为一致**），
 **笔记里的 `#L` 行号锚点也纳入机器守卫了**（feat-030：行号**越界**要红、
-单行锚点**指错行**也要红 —— 「链接点得开」≠「链接指得准」）。
-**30 个 feature 全部 passing**（本卡「Next Best Step」给出下一批候选）。
+单行锚点**指错行**也要红 —— 「链接点得开」≠「链接指得准」），
+**MoE 的 LoRA 微调也跑通了**（feat-031：`train/train_lora.py --model moe`，
+还能把 LoRA **注进每个专家的 FFN**；真跑才看得见的问题：**路由器是冻结的 ⇒
+没被路由到的专家，它的 LoRA 参数梯度是 `None`（根本没进计算图）⇒ 有一部分参数是白注入的**）。
+**31 个 feature 全部 passing**（本卡「Next Best Step」给出下一批候选）。
 
 ---
 
@@ -62,8 +65,8 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 ## Verified Now（哪些是已验证的）
 
-- `bash init.sh` → **PASS=30 SKIP=0 FAIL=0**（2026-10-23，L4 已有九条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **DPO smoke** / **推理 smoke** / **评估 smoke** / **生成质量 smoke** / **退化对照 smoke**；L1 另加「**P1 训练口径守卫（feat-027）**」、L2 另加「模型 loss 确实错位」断言）
-- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=20 FAIL=0 TOTAL=20**（feat-028 新增第 19 个 `test_derived_sync.py`；feat-029 新增第 20 个 `test_note_code_sync.py`；feat-030 **没有新增文件**——是给 `test_note_refs.py` 加了第 6 节锚点校验）
+- `bash init.sh` → **PASS=31 SKIP=0 FAIL=0**（2026-10-23，L4 已有十条：组件 smoke / 前向 smoke / **训练步 smoke** / **LoRA smoke** / **MoE LoRA smoke（feat-031）** / **DPO smoke** / **推理 smoke** / **评估 smoke** / **生成质量 smoke** / **退化对照 smoke**；L1 另加「**P1 训练口径守卫（feat-027）**」、L2 另加「模型 loss 确实错位」断言）
+- `cd qwen3-learning/qwen3-pytorch && python tests/run_all.py` → **PASS=21 FAIL=0 TOTAL=21**（feat-028 新增第 19 个 `test_derived_sync.py`；feat-029 新增第 20 个 `test_note_code_sync.py`；feat-030 **没有新增文件**——是给 `test_note_refs.py` 加了第 6 节锚点校验；feat-031 新增第 21 个 `test_lora_moe.py`）
 - Qwen3 前向 smoke 已用**真实 BPE 词表**（vocab 778）跑通：`logits (2, 8, 778) loss 6.6897 params 985,856`
 - Qwen3 训练步 smoke：`[train-step] loss 5.4788 grads 46 个 lr0 6.00e-06 lr_end 3.00e-05`
 - **预训练真跑通**（CPU，脚本在 `train/train_pretrain.py`，超参全从 `config.py` 读）：
@@ -378,6 +381,74 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
   ③ `0.GPT全流程详解.md` 的**多行锚点**（`inference.py#L280-L287` 等）目前只保证「范围对」，
   区间**并没有逐字包含**笔记引用的那几行（**故意不查**，见上面的 R3 实测）。
 
+### feat-031 — MoE 的 LoRA 微调：把 LoRA 注进每个专家的 FFN（Session 018）
+
+- **由来**：MoE 之前**只验证到预训练**（`train/train_pretrain.py --model moe`），
+  **微调链路一次没跑过** ⇒ P3 的第一件事就是补上它。
+- **★ 立项时的一个问题修正**：原 Next Best Step 里 feat-031 的占位是
+  「多行锚点的标识符级校验」。落地时 P3 的最高优先级是**补齐 MoE 的微调链路**，
+  于是 **feat-031 改挂到「MoE 的 LoRA」**，原占位**顺延为 feat-032**。
+  （**编号一旦贴上就不要复用** —— `feature_list.json` 的 priority 必须严格 1..N。）
+- **★ 真跑才看得见的问题**：**路由器是冻结的**（它决定哪个专家被用上，自己不被训练）
+  ⇒ **这一步没被路由到的专家，它的 LoRA 参数梯度是 `None`** ——
+  不是「很小」，是**根本没进计算图** ⇒ 往**全部**专家注入 LoRA 时，
+  有一部分参数是**白注入**的（占着显存与参数量，却拿不到任何学习信号）。
+- **★ 三个实现要点（都是「不写就不知道」的坑）**：
+  ① `inject_lora` 按**子模块名**匹配（`if child_name not in target_modules`），
+     **不是全模块名** ⇒ 传 `("q_proj","v_proj","gate_proj","up_proj","down_proj")`
+     就**同时命中 attention 与每一个专家的 FFN**（专家就是 `SwiGLUMLP`，
+     正好有 gate/up/down 三个投影）⇒ **LoRA 实现一行都不用改**；
+  ② MoE 的 `forward` 返回的 `loss` 是**纯 `cross_entropy`**，
+     `aux_loss` 单独放在 `extras["aux_loss"]` 里，**没混进 loss**
+     ⇒ LoRA 训练脚本可以原样复用，不会把辅助损失混进微调目标；
+  ③ MoE 的 `forward` 仍是**恒定 4 元组** ⇒ 解包代码不用改。
+- **★ 核心发现：专家的 LoRA 参数有*三种*梯度状态**（必须分开计数）：
+  | 状态 | 触发条件 | 后果 |
+  |---|---|---|
+  | ① `grad is None` | 这一步**专家根本没参与前向** | **AdamW 整个跳过** ⇒ 参数**一动不动**（连 weight decay 都没有） |
+  | ② `grad == 0.0` | 参与了前向，但它处理的 token **不影响 loss**（如序列**最后一个位置**，target 被 -100 忽略） | **没有学习信号**，只有 weight decay |
+  | ③ `grad > 0` | 真学到了 | 正常更新 |
+
+  ① 和 ② 都是「白注入」但**成因完全不同**。实测「完全不动」的比例 **0% ~ 12.5%** 浮动。
+  > **一个假象要排除**：第 0 步所有专家的 **A 梯度恒为 0**（`∂L/∂A ∝ B`，而 **B 零初始化**）
+  > ⇒ **不是**白注入。分不清 A/B 时本仓一度把白注入率误报成 **56.2%**（实际 12.5%）。
+- **★ 实测对照**（r=4 / alpha=8 / lr=1e-3 / 1500 步 / 2000 对偏好 / 200 对评估）：
+  | 配方 | 注入模块数 | 可训练参数 | BEFORE 胜率 | AFTER 胜率 | 长度归一 |
+  |---|---|---|---|---|---|
+  | dense + 只注 attention | 8 | 8,704 / 994,560 (0.88%) | 0.515 | 0.605 | 0.400 → 0.745 |
+  | MoE + 只注 attention | 8 | 8,704 / 1,193,216 (0.73%) | 0.450 | 0.600 | 0.250 → 0.745 |
+  | **MoE + attention + 专家 FFN** | 56 | 57,856 / 1,242,368 (4.66%) | 0.450 | **0.630** | 0.250 → **0.780** |
+
+  ⇒ **注进专家 FFN 确实更有效**（胜率 +0.03，长度归一 +0.035），代价是可训练参数 0.73% → 4.66%；
+  但 **MoE 的基线比 dense 差**（BEFORE 0.450 vs 0.515）⇒ **「MoE 更好」不能只看微调后的绝对值**。
+- **★ 两个把结论带偏的坑**：
+  ① **`extras["expert_load"]` 是归一化负载（`slot_counts / K`）⇒ 可能是小数**
+  （只拿到 1 个 slot、K=2 ⇒ **0.5**）⇒ **不能**用 `int(load) == 0` 判断「没被路由到」
+  （本仓真踩过：把 3 个「拿到 0.5 个 slot」的专家**谎报**成未路由）
+  ⇒ **精确判据是 `p.grad is None`**；
+  ② **`set_seed` 必须设在建模型之前**（建模型与 LoRA 的 `kaiming_uniform_` 都消耗全局 RNG）
+  ⇒ 重构时把 `set_seed` 挪到建模型之后，**dense 的胜率从 0.605 掉到 0.600**
+  ⇒ **重构训练脚本后必须拿旧版本跑一遍同样的配置对数字**。
+- **守卫**：① **新文件** `qwen3-learning/qwen3-pytorch/tests/test_lora_moe.py`（**7 组断言**）：
+  注入无损 / 专家 FFN 全部注入（点数 = `n_layer × n_experts × 3`）/ 只有 A/B 可训 /
+  **未路由专家 `grad is None`** / **`grad is None` 的参数 `AdamW.step()` 后一动不动、
+  `grad == 0` 的参数只被 weight decay 动** / **MoE loss 是纯 CE** / 对照 dense 的 `extras` 为空。
+  > ★ 第 4 条有个**必须踩过才知道的细节**：要**用只有 1 个 token 的输入**才有「没被选中的专家」——
+  > 16 个 token 时 4 个专家全都会被选上，这条断言会**空转**。
+  ② `init.sh` L4 新增第 **10** 条 smoke。
+  ③ **`test_derived_sync.py` 同步扩展**：原来它只认 dense 的 LoRA 参数量
+  ⇒ **MoE 两种配方的「总参数 / 可训练参数 / 专家侧参数」根本不在实测集合里**
+  ⇒ 笔记里那张对照表的核心数字（57,856 / 1,242,368）**没人核对**。
+  现在 `_ground_truth()` 多造两种 MoE + LoRA 模型、现场数参数
+  （另有一条例外登记：诊断里的「这一步 `grad is None` 的参数个数 6,144」是**随路由浮动**的运行时计数）。
+- **★ 反证 2 连（改完全部复原）**：
+  ① 把 `SparseMoeBlock._forward_ffn` 改成「没被路由的专家也参与前向」（dense-MoE 风格）
+  ⇒ `test_lora_moe.py` **红**（`blocks.0.moe.experts.1 一步都没被路由到，它的 lora_B.grad 应当是 None（不是 0.0）`）
+  ⇒ 复原后 PASS；② 把笔记里的 57,856 改成 57,999 ⇒ `test_derived_sync.py` **红**
+  （`分子 57,999 / 分母 1,242,368 不是代码实测出来的参数量`）⇒ 复原后 PASS。
+- **范围边界**：设计文档 §2「不做」把「MoE 的 LoRA / DPO」列为范围外，P3 才放开。
+  本 feature **只做 LoRA**；**DPO-on-MoE** 留给下一个 feature（暂编号 **feat-035**）。
+
 ## Broken Or Unverified（坏的 / 没验证的）
 
 - ~~**★ P1 线：SFT / PPO checkpoint 退化成常量输出**~~ **✅ 已修（feat-027，Session 014）**
@@ -438,18 +509,24 @@ norm_type    = "layernorm" → 退化为 nn.LayerNorm（两边必须同步切，
 
 ## Next Best Step（按顺序，不要跳）
 
-> **`feature_list.json` 的 30 条 feature 全部 passing** ⇒ 下面三条是**建议新立项**的候选，
-> 都需要**先写进 `feature_list.json`（priority 31/32/33）再动手**（AGENTS.md 的 WIP=1 规矩）。
+> **`feature_list.json` 的 31 条 feature 全部 passing** ⇒ 下面四条是**建议新立项**的候选，
+> 都需要**先写进 `feature_list.json`（priority 32/33/34/35）再动手**（AGENTS.md 的 WIP=1 规矩）。
+>
+> ★ **编号说明**：原表里的 **feat-031**（多行锚点标识符级校验）已**顺延为 feat-032** ——
+> 那个编号被 feat-031「MoE 的 LoRA 微调」占用（Session 018）。
+> **编号一旦贴上就不要再复用** —— priority 必须严格 1..N。
 
 | 顺序 | 建议 feature | 做什么 | 为什么是它 |
 |------|---------|--------|--------|
-| 1 | **feat-031** | 给**多行锚点**加**标识符级**校验（feat-030 的 R3 软化版）：不比逐字，只比「笔记代码块里出现的每个 `标识符(` 调用 / 赋值目标，是否在锚点区间内出现过」 | **feat-030 留下的唯一已知盲区**：R3 实测 18 个配对里 8 个对不上，但**全是风格差异** ⇒ 逐字不行；但「标识符在不在区间里」既不误报又能抓真错 —— 实测 `0.GPT全流程详解.md` 的 `inference.py#L280-L287` 区间里**根本没有**笔记引用的 `position_ids = ...` 那一行 |
-| 2 | **feat-032** | 让 **MoE 在本仓语料上体现出容量优势**（换/扩合成语料 + 加训练步数 + 固定 seed 重测） | 现在 MoE val_loss 1.3607 反而**略差**于 dense 1.3510 ⇒ 结论只能是「本仓语料太简单 + 专家更窄（参数量只多 1.21×）+ 只训 300 步」。**「MoE 一定更好」现在是常识不是实验** —— 把它变成实验是 P3 的核心内容 |
-| 3 | **feat-033** | 给笔记里**裸写的文件名**（`config.py` / `evaluate.py`）定一个**消歧约定**并纳入自动校验 | feat-009 守卫的已知盲区 ②：**机器判不准它指主线还是本线**。约定比猜测便宜（例如笔记里一律写成 `qwen3-config.py` / `gpt2-config.py`） |
+| 1 | **feat-032** | 给**多行锚点**加**标识符级**校验（feat-030 的 R3 软化版）：不比逐字，只比「笔记代码块里出现的每个 `标识符(` 调用 / 赋值目标，是否在锚点区间内出现过」 | **feat-030 留下的唯一已知盲区**：R3 实测 18 个配对里 8 个对不上，但**全是风格差异** ⇒ 逐字不行；但「标识符在不在区间里」既不误报又能抓真错 —— 实测 `0.GPT全流程详解.md` 的 `inference.py#L280-L287` 区间里**根本没有**笔记引用的 `position_ids = ...` 那一行 |
+| 2 | **feat-033** | 让 **MoE 在本仓语料上体现出容量优势**（换/扩合成语料 + 加训练步数 + 固定 seed 重测） | 现在 MoE val_loss 1.3607 反而**略差**于 dense 1.3510，**LoRA 的 BEFORE 胜率 0.450 也低于 dense 的 0.515** ⇒ 结论只能是「本仓语料太简单 + 专家更窄（参数量只多 1.21×）+ 只训 300 步」。**「MoE 一定更好」现在是常识不是实验** —— 把它变成实验是 P3 的核心内容 |
+| 3 | **feat-034** | 给笔记里**裸写的文件名**（`config.py` / `evaluate.py`）定一个**消歧约定**并纳入自动校验 | feat-009 守卫的已知盲区 ②：**机器判不准它指主线还是本线**。约定比猜测便宜（例如笔记里一律写成 `qwen3-config.py` / `gpt2-config.py`） |
+| 4 | **feat-035** | **DPO-on-MoE**（MoE 的 LoRA 已就位，DPO 侧还没跑过 MoE） | 设计文档 §2「不做」把「MoE 的 LoRA / DPO」一起列为范围外，feat-031 只放开了 **LoRA**。**DPO 侧还没在 MoE 上跑过** —— 而 DPO 的 `π_ref`（merge → strip → 重新 inject）这条链在 MoE 上会额外踩「专家侧 LoRA 怎么 merge」的坑，值得单独做 |
 
 **下一个 session 建议做的第一件事**：
-把上表的 **feat-031 立项**（写进 `feature_list.json`，priority 31，status `not_started`），
+把上表的 **feat-032 立项**（写进 `feature_list.json`，priority 32，status `not_started`），
 再动手实现 —— 它承接刚做完的 feat-030，是同一条「笔记 ↔ 源码锚点」链上的最后一个已知缺口。
+（若更想先把 MoE 的故事讲完整，就先做 **feat-033**。）
 
 **已完成的这条链（留个记录，别重复劳动）**：
 ① ~~**修 P1 线的 SFT 塌陷**~~ **✅ 已做（feat-027，Session 014）** ——
@@ -535,6 +612,9 @@ GPT-2 线的训练代码只允许在**已立项且已确认**的 feature 里改�
 | **行号锚点会静默腐烂** | 「链接点得开」≠「链接指得准」。行号会随代码改动漂移，**没人点就没人发现**。本仓真实踩过：4 个锚点指向一个**只剩 14 行**的 wrapper（行号 262/271/303/392/397 **全部越界**），而它们引用的代码**在重构后已经不存在** ⇒ 整段 PPO 章节在描述一个**不存在的实现**。**行号锚点必须机器守** |
 | **「在范围内」≠「指对了行」** | 范围校验（R1）只能保证行号不越界；本仓还有 **3 处**在范围内却**指着旁边代码**的锚点（`gpt2.py#L222` 实际是 dropout、`#L262` 实际是 `super().__init__()`、`train_reward.py#L203` 实际是**注释行**）⇒ 单行锚点还得再判「那一行**就是**笔记引用的那句」 |
 | **别用「逐字比对」守多行锚点** | 实测 18 个「锚点 + 代码块」配对里 **8 个对不上**，逐条看全是**风格差异**（笔记省 docstring、拆开签名、去 type hint）⇒ 做成守卫就是一台误报机器。**教学笔记必须简化，守卫只能判「真错」**（与 feat-029 的「逐字一致不可行」同源） |
+| **`grad is None` ≠ `grad == 0.0`（在优化器里后果完全不同）** | `None` = **AdamW 整个跳过**（参数一动不动，连 weight decay 都没有）⇒ 是「**没参与前向**」；`0.0` = **只做 weight decay** ⇒ 是「参与了但不影响 loss」。本仓真实场景：MoE 里**没被路由到的专家**是 `None`，而**序列最后一个位置**（target 被 -100 忽略）让已路由专家的梯度**恰好为 0**。混为一谈会把白注入率算错一个量级（一度误报 56.2%，实际 12.5%） |
+| **归一化指标不能当计数用** | `extras["expert_load"] = slot_counts / K` 是**归一化负载** ⇒ **可能是小数**（只拿到 1 个 slot、K=2 ⇒ **0.5**）⇒ `int(load) == 0` 会把 0.5 误判成 0，报告里**谎报**「这个专家没被路由到」。**判「有没有参与前向」要问梯度是不是 `None`**，别去猜计数 |
+| **重构训练脚本 = 改实验** | 建模型与 LoRA 的 `A` 矩阵（`kaiming_uniform_`）都消耗**全局 RNG** ⇒ `set_seed` 的**位置**会改变 `A` 的初值 ⇒ 训练轨迹改变（实测 dense 胜率 0.605 → 0.600）。**重构后必须拿旧版本跑一遍同样的配置对数字**，否则会悄悄改掉笔记里已经记下的数 |
 | **静默默认值陷阱：`config.py` 里没这个键** | `cfg("ppo_reward_whiten", False)` —— `config.py` 里**根本没有** `ppo_reward_whiten` 这个键 ⇒ 静默走代码里的 fallback，**不报错**。若按「config 里有 ⇒ 生效」去想，就会把**默认关闭**的东西写成默认开启（feat-030 实测就错在这：reward whitening 默认关闭，而 **advantage whitening 反而始终开启**） |
 
 ---
@@ -566,12 +646,15 @@ python evaluate.py --stage all
 # Qwen3 线（组件 + 数据 + 预训练已就位）
 cd qwen3-learning/qwen3-pytorch
 python data/build_vocab.py       # 重建 BPE 词表（vocab.json / merges.txt）
-python tests/run_all.py          # 20 个 smoke 汇总
+python tests/run_all.py          # 21 个 smoke 汇总
 python tests/test_pretrain.py    # 单个 smoke
 python tests/test_lora.py        # LoRA 的 9 组断言
 python train/train_pretrain.py --model dense   # 预训练（dense，~47s CPU）
 python train/train_pretrain.py --model moe     # 预训练（MoE，~59s CPU）
 python train/train_lora.py       # LoRA 微调（r=4 q/v, lr=1e-3, 1500 步）
+python train/train_lora.py --model moe            # MoE 的 LoRA（attention + 专家 FFN，feat-031）
+python train/train_lora.py --model moe --lora-targets attn   # 对照：只注 attention
+python tests/test_lora_moe.py     # MoE 的 LoRA 的 7 组断言（feat-031）
 python train/train_dpo.py        # DPO（π_ref = SFT 模型，merge → strip → 重新 inject）
 python tests/test_dpo.py         # DPO 的 9 组断言
 python tests/test_inference.py   # KV Cache 推理与采样（12 组断言）
@@ -599,7 +682,8 @@ git log --oneline -5
 | Qwen3 设计 / 实施计划 | `qwen3-learning/qwen3-pytorch设计.md`、`qwen3-learning/qwen3-pytorch开发计划.md`（Task 7–20 已就地纠错，含「实测修正记录」与「9 个真 bug」清单；Task 20 = feat-009 数字核对，含例外分类表与 4 条经验） |
 | Qwen3 笔记原文 | `qwen3-learning/Qwen3_*.md`（**9 篇**，BPE 已补齐；每篇开头有 GPT-2 / Qwen3 源码交叉引用；训练推理篇含 §10 推理 + §11 评估 + **§12 退化对照** + **§13 生成质量**） |
 | 笔记数字一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_config_sync.py`（feat-009；27 篇笔记 / 88 处断言 / 25 条例外登记；改 `config.py` 忘了改笔记 ⇒ 红灯） |
-| 笔记**派生量**一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_derived_sync.py`（feat-028；27 篇笔记 / **41 处**主张 / 8 条例外登记；参数量 / 词表 / 算式 / 比值 ↔ **代码实测**；期望值现场数参数，不手写） |
+| 笔记**派生量**一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_derived_sync.py`（feat-028，feat-031 扩展；27 篇笔记 / **62 处**主张 / 9 条例外登记；参数量 / 词表 / 算式 / 比值 ↔ **代码实测**；期望值现场数参数，不手写 —— dense 与 **MoE 两种 LoRA 配方**都在集合里） |
+| **MoE 的 LoRA** | `qwen3-learning/qwen3-pytorch/train/train_lora.py`（`--model moe` / `--lora-targets attn+expert`）+ `tests/test_lora_moe.py`（feat-031，7 组断言）；笔记见 `Qwen3_LoRA与DPO_学习笔记.md` §10 与 `Qwen3_MoE_学习笔记.md` §28 |
 | 笔记**手抄代码**一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_note_code_sync.py`（feat-029；**8 条配对 / 4 篇笔记**；不要求逐字一致，只要求**行为一致** —— 两边都跑起来比输出；源码用 `ast` 摘出来 `exec`，**绝不 import**） |
 | 笔记**行号锚点**一致性守卫 | `qwen3-learning/qwen3-pytorch/tests/test_note_refs.py` **第 6 节**（feat-030；全仓 **22 处** `#L` 锚点；**R1** 范围 + **R2** 单行锚点必须精确；多行锚点只做 R1 —— 逐字比对实测会误报） |
 | GPT-2 对照实现 | `gpt-learning/gpt-learning-pytorch/model/gpt2.py`（**只能按文件路径 import**，见陷阱表） |

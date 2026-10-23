@@ -2,7 +2,7 @@
 
 > **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/model/gpt2.py`](../gpt-learning/gpt-learning-pytorch/model/gpt2.py) → `MLP`（**GPT-2 线没有 MoE**，只有稠密 FFN）
 > **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/qwen3_moe.py`](qwen3-pytorch/model/qwen3_moe.py) → `load_balancing_aux_loss` / `SparseMoeBlock` / `MoEBlock` / `Qwen3MoE`
-> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_moe.py`](qwen3-pytorch/tests/test_moe.py)
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_moe.py`](qwen3-pytorch/tests/test_moe.py)、[`qwen3-learning/qwen3-pytorch/tests/test_lora_moe.py`](qwen3-pytorch/tests/test_lora_moe.py)（MoE 的 LoRA 微调，见 §28）
 
 ## 1. MoE 是什么
 
@@ -861,3 +861,72 @@ Expert 权重搬运
 8. **\(f_i\) 表示实际 Expert 流量，\(p_i\) 表示 Router 平均偏好。**
 9. **MoE 和 KV Cache 是两件不同的事情。**
 10. **MoE 对权重内存和内存带宽非常敏感，因此很适合结合低精度量化。**
+
+
+---
+
+## 28. MoE 的 LoRA 微调（feat-031）
+
+MoE 之前只验证到**预训练**。这一节补上**微调**链路，并回答一个
+「只有真跑才能看见」的问题：**给每个专家都注入 LoRA，值不值？**
+
+完整实现与数据见
+[`Qwen3_LoRA与DPO_学习笔记.md`](Qwen3_LoRA与DPO_学习笔记.md) §10，
+可跑测试是
+[`qwen3-learning/qwen3-pytorch/tests/test_lora_moe.py`](qwen3-pytorch/tests/test_lora_moe.py)。
+
+### 28.1 注入点：为什么不用改 LoRA 实现
+
+`inject_lora` 比的是**子模块名**（`child_name`），不是全名：
+
+```python
+if child_name not in target_modules:
+    continue
+```
+
+专家就是 `SwiGLUMLP`，正好有 `gate_proj` / `up_proj` / `down_proj` 三个投影，
+所以传 `("q_proj", "v_proj", "gate_proj", "up_proj", "down_proj")`
+就会**同时命中 attention 与每一个专家**。LoRA 实现一行都不用改。
+
+### 28.2 ★ 专家的 LoRA 参数有三种梯度状态
+
+| 状态 | 触发条件 | 后果 |
+|---|---|---|
+| ① `grad is None` | 这一步**专家根本没参与前向**（没被路由到） | AdamW **整个跳过** ⇒ 参数**一动不动**（连 weight decay 都没有） |
+| ② `grad == 0.0` | 参与了前向，但它处理的 token **不影响 loss** | **没有学习信号**，只有 weight decay |
+| ③ `grad > 0` | 真的学到了东西 | 正常更新 |
+
+① 和 ② 都是「**白注入**」：占着参数量与显存，却拿不到任何学习信号。
+
+**为什么会有 ①？** 路由器是**冻结**的，它决定哪个专家被用上。
+没被选中的专家这一轮**根本不进计算图** ⇒ `p.grad is None`
+（不是 `0.0` —— 这两件事在 AdamW 里后果完全不同：
+`None` 是**跳过**，`0.0` 是**只做 weight decay**）。
+
+本仓 MoE（4 专家 / top-2）单步实测：「完全不动」的比例在 **0% ~ 12.5%** 之间浮动。
+
+### 28.3 实测对照（r=4 / alpha=8 / lr=1e-3 / 1500 步）
+
+| 配方 | 注入模块数 | 可训练参数 | BEFORE 胜率 | AFTER 胜率 | 长度归一胜率 |
+|---|---|---|---|---|---|
+| dense + 只注 attention | 8 | 可训练 8,704 / 994,560 (0.88%) | 0.515 | 0.605 | 0.400 → 0.745 |
+| MoE + 只注 attention | 8 | 可训练 8,704 / 1,193,216 (0.73%) | 0.450 | 0.600 | 0.250 → 0.745 |
+| **MoE + attention + 专家 FFN** | 56 | 可训练 57,856 / 1,242,368 (4.66%) | 0.450 | **0.630** | 0.250 → **0.780** |
+
+**注进专家 FFN 确实更有效**（胜率 +0.03，长度归一 +0.035），
+代价是可训练参数从 0.73% 涨到 4.66%。
+而 **MoE 的基线比 dense 差**（BEFORE 0.450 vs 0.515），
+所以「MoE 更好」不能只看微调后的绝对值。
+
+### 28.4 MoE 的 loss 是**纯 cross_entropy**
+
+负载均衡辅助损失只放在 `extras["aux_loss"]` 里，**没有混进 `loss`**。
+所以 LoRA 微调直接复用同一个 `loss` 口径，不会把辅助损失混进微调目标。
+（`tests/test_lora_moe.py` 第 6 条：手算 CE 与 `loss` 逐值相等。）
+
+### 28.5 一条容易踩的坑
+
+`extras["expert_load"]` 是**归一化负载**（`slot_counts / K`），**可能是小数**
+（某个专家只拿到 1 个 slot、而 K=2 ⇒ load = 0.5）。
+**不能**用 `int(load) == 0` 判断「没被路由到」——
+**精确判据是 LoRA 参数的 `grad is None`**。

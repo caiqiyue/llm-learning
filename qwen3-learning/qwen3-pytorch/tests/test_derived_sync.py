@@ -18,6 +18,10 @@ config 守卫**看不见它们**（它们没有 `键 = 值` 的写法），
     用来核对笔记 §1.9、§5 那种**逐项拆解**的写法；
   · Qwen3：按 `DENSE_CONFIG` / `MOE_CONFIG` 造 dense / MoE 模型，数参数；
     再注入 LoRA，数「可训练参数 / 总参数」；
+    ★ feat-031 追加：**MoE 的两种 LoRA 配方**（只注 attention /
+    attention + 每个专家的 FFN）各自的「总参数 / 可训练参数」——
+    否则笔记里那张三配方对照表的核心数字（57,856 / 1,242,368）
+    就是**没人核对**的。
   · 词表大小：直接走 GPT-2 线自己的 `CharTokenizer` 读 `vocab.txt`、
     读 Qwen3 线的 `vocab.json` —— **不数行**（词表里有「空格」这种行，
     `strip()` 会把它数掉，本仓实测就是数成 44 而不是 45）。
@@ -184,9 +188,29 @@ def _ground_truth() -> dict:
     def _moe(v: int) -> int:
         return _num(Qwen3MoE(vocab_size=v, cfg=MOE_CONFIG, dropout=0.0).parameters())
 
+    def _moe_lora(v: int, targets: tuple):
+        """MoE 注入 LoRA 后的 (总参数, 可训练参数, 专家侧可训练参数)。
+
+        ★ feat-031 补的：**MoE 的两种 LoRA 配方**（只注 attention /
+          attention + 每个专家的 FFN）也必须被守卫覆盖 ——
+          否则笔记里那张三配方对照表里的「57,856 / 1,242,368」
+          就是**没人核对**的数字。
+        ★ 专家侧那一份（49,152）单独拿出来：它是「没被路由到的专家拿不到梯度」
+          那个结论的**分母**，也得是实测值。
+        """
+        m = Qwen3MoE(vocab_size=v, cfg=MOE_CONFIG, dropout=0.0)
+        inject_lora(m, targets, r=MOE_CONFIG.lora_r, alpha=MOE_CONFIG.lora_alpha)
+        tr = mark_only_lora_trainable(m)
+        exp_tr = _num(p for n, p in m.named_parameters()
+                      if ".moe.experts." in n and p.requires_grad)
+        return _num(m.parameters()), _num(tr), exp_tr
+
     d778, d778_l, lora_tr = _dense(778)
     d512, d512_l, _ = _dense(512)
     d256, d256_l, _ = _dense(256)
+    moe_attn_total, moe_attn_tr, _ = _moe_lora(778, MOE_CONFIG.lora_target_modules)
+    moe_exp_total, moe_exp_tr, moe_exp_side = _moe_lora(
+        778, MOE_CONFIG.lora_target_modules_expert)
     swiglu_ffn = 3 * DENSE_CONFIG.n_embd * DENSE_CONFIG.intermediate_size
     gelu_ffn = 2 * g_cfg.n_embd * g_cfg.n_inner          # GPT-2 的两矩阵 FFN
     qwen3_vals = {
@@ -195,6 +219,9 @@ def _ground_truth() -> dict:
         lora_tr,                                           # LoRA 可训练参数
         swiglu_ffn,                                        # SwiGLU 单层 FFN
         _moe(778), _moe(512),                              # MoE 总参数
+        moe_attn_total, moe_attn_tr,                       # MoE + 只注 attention
+        moe_exp_total, moe_exp_tr,                         # MoE + attention + 专家 FFN
+        moe_exp_side,                                      # 专家侧 LoRA 参数总数
     }
 
     # ---- 词表大小（读文件，不数行）----
@@ -392,6 +419,11 @@ EXCEPTIONS = {
         "SMOKE: `tests/test_moe.py` 的小词表模型（vocab=512）",
     ("qwen3-learning/Qwen3_训练推理完整学习笔记.md", 293):
         "SMOKE: feat-017 对照实验用的小词表（vocab=293）",
+    ("qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md", 6144):
+        "RUNTIME: feat-031 的逐专家诊断里「这一步 `grad is None` 的 LoRA 参数个数」—— "
+        "它**随这一步的路由结果浮动**（路由器冻结 ⇒ 哪些专家被选中会变），"
+        "不是由 config 决定的静态参数量 ⇒ 不进实测集合。"
+        "同段落的分母 49,152（专家侧 LoRA 参数总数）是静态的，已由代码实测覆盖。",
 }
 
 

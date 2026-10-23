@@ -7,21 +7,22 @@
 
 ## Current Verified State
 
-- **当前阶段**：**P2 — Qwen3 从零实现**（阶段标记见 `feature_list.json` 的 `phase` 字段）
+- **当前阶段**：**P3 — Qwen3 训练与评估深化、MoE 扩展**（阶段标记见 `feature_list.json` 的 `phase` 字段）
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（WIP=0；**30 个 feature 全部 passing**，feat-030 是最后一个，已于 Session 017 完成）
-- 当前最高优先级未完成 feature：**无** —— 下一批候选见 `session-handoff.md` 的「Next Best Step」（建议 feat-031 多行锚点的标识符级校验 / feat-032 让 MoE 体现容量优势 / feat-033 裸文件名消歧；**都要先立项再动手**）
+- 当前活跃 feature：**无**（WIP=0；**31 个 feature 全部 passing**，feat-031 是最后一个，已于 Session 018 完成）
+- 当前最高优先级未完成 feature：**无** —— 下一批候选见 `session-handoff.md` 的「Next Best Step」（建议 feat-032 多行锚点的标识符级校验 / feat-033 让 MoE 体现容量优势 / feat-034 裸文件名消歧 / feat-035 DPO-on-MoE；**都要先立项再动手**）
 - ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
 - 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-23 在修复后的环境里、按 feat-027 定下的口径重跑产出**，指标可信（见 `feature_list.json` feat-002~007、feat-027 的 evidence）
 - **P1 线的 SFT 塌陷已修**（feat-027）：三个互相咬合的缺陷 —— ① SFT 的 labels 同下标 + 模型 loss 不左移 ⇒ 学成「复制当前 token」；② `encode` 逐字符查表 ⇒ `BOS/EOS/SEP` 永远不可达 ⇒ 学不会自己停；③ 评估按字符串长度切回答 ⇒ 每条带 `"? <unk>sep<unk> "` 前缀。修完：公共后缀 0%（原 98%）、`ppo_rm_score` +0.9188（原 0.0696）、`improvement` +3.6509（原 0.0000）。**口径写进了 `init.sh` 的 L1/L2 守卫**
 - 笔记规模：`gpt-learning/` 17 篇 + `qwen3-learning/` **9 篇**（BPE 笔记已补齐，feat-008；**每篇开头都有「对应 GPT-2 / 对应 Qwen3 源码 / 对应可跑测试」三行**，由 `tests/test_note_refs.py` 自动校验）
 - **笔记 ↔ config.py 的自动守卫**（feat-009）：`tests/test_config_sync.py` 把 27 篇笔记里的 `` `超参名 = 值` `` 跟各自 `config.py` 逐条对齐（实测 88 处断言 / 25 条例外登记）；**改 `config.py` 忘了改笔记 ⇒ 测试直接红**。已知盲点：`开发计划.md` 跨线比较，不适用自动守卫，改为人工核对
-- **笔记 ↔ 代码实测的「派生量」自动守卫**（feat-028）：`tests/test_derived_sync.py` 核对**算出来的**数字 —— 参数量（794,496 / 985,856 / 8,704 / 1,184,512）、词表大小（45 / 778）、算式、比值（实测 **41 处**主张 / 8 条例外登记）。**期望值不手写，而是现场把模型搭出来数参数** ⇒ 改一个 `n_embd` / `n_layer`，几十个参数量数字会**同时**变红。**表格里的数字也跑不掉**（行级规则）
+- **笔记 ↔ 代码实测的「派生量」自动守卫**（feat-028）：`tests/test_derived_sync.py` 核对**算出来的**数字 —— 参数量（794,496 / 985,856 / 8,704 / 1,184,512）、词表大小（45 / 778）、算式、比值（实测 **62 处**主张 / 9 条例外登记）。**期望值不手写，而是现场把模型搭出来数参数** ⇒ 改一个 `n_embd` / `n_layer`，几十个参数量数字会**同时**变红。**表格里的数字也跑不掉**（行级规则）
 - **笔记里「手抄的代码」↔ 源码的自动守卫**（feat-029）：`tests/test_note_code_sync.py` 把手抄进笔记的函数（`get_lr` / `_build_sinusoidal_pos_emb` / `KVCache.append` / `mark_only_lora_trainable` / `set_lora_enabled`）**真的跑起来**，和源码里那份在同样输入上**比输出**（实测 **8 条配对 / 4 篇笔记**）。**不要求逐字一致**（164/164 个笔记代码块都是故意简化的摘录）⇒ 只要求**行为一致**。★ 源码函数用 `ast` **摘出来**再 `exec`，**绝不 import** —— `train_pretrain.py` 是顶层线性脚本，import 会重跑预训练并覆盖 `checkpoints/pretrain.pt`
 - **笔记里 `#L` 行号锚点的自动守卫**（feat-030）：`tests/test_note_refs.py` **第 6 节**扫全仓 markdown 的 **22 处** `#L` 锚点，两条规则 —— **R1** 范围（目标存在 + `1 <= start <= end <= 行数`）、**R2** 单行锚点**必须精确**（锚点后第一个 ```python 块的第一条语句 == 源码那一行，去注释去空白后逐字相等）。**多行锚点只做 R1** —— 逐字比对实测 18 个配对里 8 个对不上，**全是风格差异**（与 feat-029「逐字一致不可行」同源）⇒ 守卫只判「真错」
-- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 训练三段 + 评估侧 + 退化对照全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 预训练 / LoRA / DPO / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py`），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke + LoRA smoke + DPO smoke + 推理 smoke + 评估 smoke + **生成质量 smoke** + **退化对照 smoke**」九条
+- **MoE 的 LoRA 微调已跑通**（feat-031）：`train/train_lora.py --model moe` 能在 **MoE 预训练权重**上做 LoRA；`--lora-targets attn+expert` 会把 LoRA **注进每个专家的 FFN**（`inject_lora` 按**子模块名**匹配 ⇒ **LoRA 实现一行没改**）。★ 真跑才看得见的问题：**路由器是冻结的 ⇒ 这一步没被路由到的专家，它的 LoRA 参数梯度是 `None`（根本没进计算图 ⇒ AdamW 整个跳过 ⇒ 参数一动不动）** ⇒ 往全部专家注入 LoRA 有一部分参数是**白注入**的（实测「完全不动」的比例 **0% ~ 12.5%**）。守卫：`tests/test_lora_moe.py`（7 组断言）+ `init.sh` L4 第 10 条 smoke + `test_derived_sync.py` 扩展（MoE 两种配方的参数量纳入实测）
+- 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 训练三段 + 评估侧 + 退化对照全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 预训练 / LoRA / DPO / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py`），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke + LoRA smoke + **MoE LoRA smoke** + DPO smoke + 推理 smoke + 评估 smoke + **生成质量 smoke** + **退化对照 smoke**」十条
 - **两条线现在有第三个「数字可并排」的地方**（feat-026）：`quality.py` 是**两条线共用的一份指标实现**，`ablations/compare_quality.py` 用 GPT-2 线**自己的** `evaluate.py` 在同一批回答上重算并断言**逐值相等**（实测差 0.000e+00）⇒「同名同口径」是机器证明，不是承诺。⚠️ 并排数字带着三条不可比性（探针域内外 / tokenizer 粒度 / 词表大小），详见 `Qwen3_训练推理完整学习笔记.md` §13.5
 
 ---
@@ -1906,3 +1907,189 @@ $ python tests/test_note_refs.py
 | `qwen3-pytorch` `python tests/run_all.py` | `PASS=20  FAIL=0  TOTAL=20` |
 | `python tests/test_note_refs.py` | 笔记 9 篇 / 链接 82 条 / 路径 121 处 / **锚点 22 处** |
 | 下一批候选 | 见 `session-handoff.md`「Next Best Step」（建议 feat-031 / 032 / 033，**都要先立项再动手**） |
+
+
+### Session 018 — MoE 的 LoRA 微调：把 LoRA 注进每个专家的 FFN（feat-031）
+
+**目标**：补上 MoE 线**唯一没跑过的**环节 —— 微调（此前 MoE 只验证到预训练），
+并把「给每个专家都注入 LoRA 值不值」变成一次**可跑实验**。
+**状态**：✅ 完成 —— **31 个 feature 全部 passing**。
+
+#### 立项：为什么这件事只能靠跑出来
+
+MoE + LoRA 有一个**只有真跑才能看见**的问题：
+
+**路由器是冻结的。** 它决定哪个专家被用上，而它自己不被训练。
+于是**这一步没被路由到的专家，它的 LoRA 参数梯度是 `None`** ——
+不是「很小」，是**根本没进计算图**。
+⇒ 往**全部**专家注入 LoRA 时，有一部分参数是**白注入**的
+（占着显存与参数量，却拿不到任何学习信号）。
+
+这正是本仓「把架构决策变成可跑实验」的方法论：
+**「给每个专家都注入 LoRA，值不值？」** 只能靠跑出来回答。
+
+#### 三个实现要点（都是「不写就不知道」的坑）
+
+**① `inject_lora` 按*子模块名*匹配，不是全名。**
+
+```python
+if child_name not in target_modules:      # ← 比的是 child_name
+    continue
+```
+
+专家就是 `SwiGLUMLP`，正好有 `gate_proj` / `up_proj` / `down_proj` 三个投影
+⇒ 传 `("q_proj", "v_proj", "gate_proj", "up_proj", "down_proj")`
+就**同时命中 attention 与每一个专家** ⇒ **LoRA 实现一行都不用改**。
+
+**② MoE 的 `forward` 返回的 `loss` 是*纯 `cross_entropy``。**
+`aux_loss` 单独放在 `extras["aux_loss"]` 里，**没混进 loss**
+⇒ LoRA 训练脚本可以原样复用，不会把辅助损失混进微调目标。
+
+**③ MoE 的 `forward` 仍是*恒定 4 元组*** ⇒ 解包代码不用改。
+
+改动的三个位置：
+`config.py`（新增 `lora_target_modules_expert`）、
+`train/train_lora.py`（新增 `--model {dense,moe}` 与 `--lora-targets {attn,attn+expert}` + 逐专家诊断）、
+`model/qwen3_moe.py`（`stats` 补 `topk_weights` / `topk_indices`）。
+
+#### ★ 本 feature 的核心发现：专家的 LoRA 参数有**三种**梯度状态
+
+| 状态 | 触发条件 | 后果 |
+|---|---|---|
+| ① `grad is None` | 这一步**专家根本没参与前向**（没被路由到） | AdamW **整个跳过** ⇒ 参数**一动不动**（连 weight decay 都没有） |
+| ② `grad == 0.0` | 参与了前向，但它处理的 token **不影响 loss**（如序列**最后一个位置**，target 被 -100 忽略） | 梯度张量存在但**恰好是 0** ⇒ **没有学习信号**，只有 weight decay |
+| ③ `grad > 0` | 真的学到了东西 | 正常更新 |
+
+① 和 ② 都是「**白注入**」但**成因完全不同**，必须分开计数。
+本仓 MoE（4 专家 / top-2）单步实测：「完全不动」的比例在 **0% ~ 12.5%** 之间浮动。
+
+> ★ **一个假象要排除**：第 0 步所有专家的 **A 梯度恒为 0** ——
+> `∂L/∂A = (α/r)·(∂L/∂out)ᵀ·B·x` 而 **B 零初始化** ⇒ 恰好为 0。
+> 这是 B 零初始化的直接后果，**不是 bug**（第 0 步一更新就有真梯度）
+> ⇒ 统计白注入时**不能**把它算进去。
+> 本仓真踩过：不区分 A/B 时一度把白注入率误报成 **56.2%**，实际是 **12.5%**。
+
+#### 实测对照（r=4 / alpha=8 / lr=1e-3 / 1500 步 / 2000 对偏好 / 200 对评估，CPU）
+
+| 配方 | 注入模块数 | 可训练参数 | BEFORE 胜率 | AFTER 胜率 | 长度归一胜率 |
+|---|---|---|---|---|---|
+| dense + 只注 attention | 8 | 可训练 8,704 / 994,560 (0.88%) | 0.515 | 0.605 | 0.400 → 0.745 |
+| MoE + 只注 attention | 8 | 可训练 8,704 / 1,193,216 (0.73%) | 0.450 | 0.600 | 0.250 → 0.745 |
+| **MoE + attention + 专家 FFN** | 56 | 可训练 57,856 / 1,242,368 (4.66%) | 0.450 | **0.630** | 0.250 → **0.780** |
+
+两条结论：
+
+1. **把 LoRA 注进专家 FFN 确实更有效**（胜率 +0.03，长度归一 +0.035），
+   代价是可训练参数从 0.73% 涨到 4.66%。
+2. **MoE 的基线比 dense 差**（BEFORE 0.450 vs 0.515）
+   ⇒ **「MoE 更好」不能只看微调后的绝对值**（预训练的差距得先补上）。
+
+#### ★ 两个把结论带偏的坑（本 feature 踩过）
+
+**坑 1：`expert_load` 是*归一化负载*（`slot_counts / K`），*可能是小数*。**
+
+某个专家只拿到 1 个 slot、而 K=2 ⇒ load = **0.5**
+⇒ **不能**用 `int(load) == 0` 判断「没被路由到」——
+那会把 0.5 误判成 0，报告里**谎报**「这个专家没被路由到」。
+**精确判据是 LoRA 参数的 `grad is None`。**
+
+**坑 2：`set_seed` 必须设在*建模型之前*。**
+
+建模型与 LoRA 的 `A` 矩阵（`kaiming_uniform_`）都会消耗全局 RNG
+⇒ 把 `set_seed` 挪到建模型之后 ⇒ `A` 的初值变了 ⇒ 训练轨迹变了：
+**dense 的胜率从 0.605 掉到 0.600**。
+一个纯重构的改动，悄悄改掉了笔记里已经记下的数字
+⇒ **重构训练脚本后，必须拿旧版本跑一遍同样的配置对数字。**
+
+#### 守卫
+
+- **新文件** `qwen3-learning/qwen3-pytorch/tests/test_lora_moe.py`（**7 组断言**）：
+  ① 注入 LoRA 到专家 FFN **无损**（logits 逐元素相等）；
+  ② 专家的 gate/up/down 都被注到（点数 = `n_layer × n_experts × 3`）；
+  ③ 冻结基座后**只有 A/B 可训**；
+  ④ ★ **未路由专家 `grad is None`**、已路由专家不是 None；
+  ⑤ ★ `grad is None` 的参数在 `AdamW.step()` 后**一动不动**，
+     `grad == 0` 的参数**只被 weight decay** 动（`p ← p·(1-lr·wd)`）；
+  ⑥ ★ MoE 的 `loss` 是**纯 `cross_entropy`**（aux_loss 没混进去）；
+  ⑦ 对照：dense 的 `extras` 是空的。
+  > ★ 第 ④ 条有个**必须踩过才知道的细节**：要**用只有 1 个 token 的输入**才有「没被选中的专家」——
+  > 16 个 token 时 4 个专家全都会被选上，这条断言会**空转**（本仓真踩过：断言恒真）。
+- `init.sh` L4 新增第 **10** 条 smoke「Qwen3 MoE LoRA smoke（feat-031）」。
+- ★ **`tests/test_derived_sync.py` 同步扩展**（feat-028 的守卫）：
+  原来它只认 dense 的 LoRA 参数量
+  ⇒ **MoE 两种配方的「总参数 / 可训练参数 / 专家侧参数」全都不在实测集合里**
+  ⇒ 笔记里那张对照表的核心数字（57,856 / 1,242,368）**根本没人核对**。
+  现在 `_ground_truth()` 多造两种 MoE + LoRA 模型、现场数参数。
+  （另有一条例外登记：诊断输出里的「这一步 `grad is None` 的参数个数 6,144」
+  是**随路由浮动**的运行时计数，不是静态参数量 ⇒ 不进实测集合。）
+
+#### 证据
+
+```
+# ① 轻量验证
+$ bash init.sh
+  ...
+  PASS=31  SKIP=0  FAIL=0
+
+# ② 全部 smoke
+$ cd qwen3-learning/qwen3-pytorch && python tests/run_all.py
+  [run_all] PASS=21  FAIL=0  TOTAL=21
+
+# ③ 新守卫单独跑
+$ python tests/test_lora_moe.py
+  test_lora_moe OK  注入无损 / 专家 FFN 全部注入 / 只有 A/B 可训 / 未路由专家 grad=None / AdamW 不动它 / MoE loss 是纯 CE
+
+$ python tests/test_derived_sync.py
+  [derived] 核对笔记 27 篇；派生量主张 62 处；例外登记 9 条（命中 9，过时 0）
+  test_derived_sync OK
+
+# ④ 三种配方真跑（各 1500 步）
+$ python train/train_lora.py --model dense
+  [lora] AFTER   win_rate=0.605  win_rate_per_token=0.745  mean_logp(chosen)=-385.99
+  [lora] 胜率 0.515 -> 0.605 (随机基线 0.5)，长度归一口径 0.400 -> 0.745
+  [lora] saved -> checkpoints\lora.pt
+
+$ python train/train_lora.py --model moe --lora-targets attn
+  [lora] 胜率 0.450 -> 0.600 (随机基线 0.5)，长度归一口径 0.250 -> 0.745
+  [lora] saved -> checkpoints\lora_moe.pt
+
+$ python train/train_lora.py --model moe
+  [lora] 胜率 0.450 -> 0.630 (随机基线 0.5)，长度归一口径 0.250 -> 0.780
+  [lora] saved -> checkpoints\lora_moe.pt
+```
+
+#### ★ 反证 2 连（改完全部复原）
+
+| # | 改了什么 | 守卫的反应 | 复原 |
+|---|---|---|---|
+| ① | 把 `SparseMoeBlock._forward_ffn` 改成「没被路由的专家也参与前向」（dense-MoE 风格） | **红**（`blocks.0.moe.experts.1 一步都没被路由到，它的 lora_B.grad 应当是 None（不是 0.0）`） | ✅ `git checkout` |
+| ② | 把笔记对照表里的 57,856 改成 57,999 | **红**（`分子 57,999 / 分母 1,242,368 不是代码实测出来的参数量`） | ✅ 复原 |
+
+⇒ 两次都**只红被扰动的那一条** ⇒ 守卫定位精确，没有误伤。
+
+#### 四个方法论教训
+
+1. **「梯度是 0」和「梯度是 `None`」在优化器里后果完全不同** ——
+   `None` = **AdamW 整个跳过**（参数一动不动，连 weight decay 都没有）；
+   `0.0` = **只做 weight decay**。前者是「没参与前向」，后者是「参与了但不影响 loss」。
+   **混为一谈就会把白注入率算错一个量级**（本仓一度误报 56.2% vs 实际 12.5%）。
+2. **「归一化指标」不能当计数用** —— `expert_load = slot_counts / K` 是**小数**，
+   用 `int(load) == 0` 判「没被路由到」会**谎报**。计数要回到**原始量**，
+   「有没有参与前向」要问**梯度是不是 `None`**。
+3. **重构训练脚本 = 改实验** —— `set_seed` 的位置改变 RNG 消耗顺序 ⇒ 训练轨迹改变
+   ⇒ **纯重构的改动悄悄改掉了已经记进笔记的数字**。
+   ⇒ 重构后必须**拿旧版本跑一遍同样的配置对数字**。
+4. **守卫的实测集合要跟着代码能力扩** —— 派生量守卫只认 dense 的 LoRA 参数量时，
+   MoE 两种配方的数字**根本没人核对**（不是「核对过且通过」，是「压根没进核对范围」）。
+   ⇒ 每加一种新配方，就要把它**现场造出来数一遍**。
+
+#### 最终状态
+
+| 项 | 值 |
+|---|---|
+| `feature_list.json` | **31 passing / 0 in_progress / 0 not_started**（priority 严格 1..31） |
+| `bash init.sh` | `PASS=31  SKIP=0  FAIL=0` |
+| `qwen3-pytorch` `python tests/run_all.py` | `PASS=21  FAIL=0  TOTAL=21`（新增第 21 个 `test_lora_moe.py`） |
+| `python tests/test_lora_moe.py` | 7 组断言全绿 |
+| `python tests/test_derived_sync.py` | 派生量主张 62 处 / 例外 9 条全部命中 |
+| 下一批候选 | 见 `session-handoff.md`「Next Best Step」（建议 feat-032 / 033 / 034 / 035，**都要先立项再动手**） |

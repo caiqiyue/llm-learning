@@ -2,7 +2,7 @@
 
 > **对应 GPT-2 实现位置**：[`gpt-learning/gpt-learning-pytorch/train_sft.py`](../gpt-learning/gpt-learning-pytorch/train_sft.py)（**全参 SFT**）/ [`gpt-learning/gpt-learning-pytorch/train_ppo.py`](../gpt-learning/gpt-learning-pytorch/train_ppo.py)（**RLHF 三件套**）—— **GPT-2 线没有 LoRA / DPO**（原理另见 [`gpt-learning/9.强化学习.md`](../gpt-learning/9.强化学习.md)）
 > **对应 Qwen3 源码位置**：[`qwen3-learning/qwen3-pytorch/model/common/lora.py`](qwen3-pytorch/model/common/lora.py) → `LoRALinear` / `inject_lora` / `merge_lora` / `strip_lora`；[`qwen3-learning/qwen3-pytorch/train/train_lora.py`](qwen3-pytorch/train/train_lora.py)；[`qwen3-learning/qwen3-pytorch/train/train_dpo.py`](qwen3-pytorch/train/train_dpo.py) → `dpo_loss`
-> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_lora.py`](qwen3-pytorch/tests/test_lora.py)、[`qwen3-learning/qwen3-pytorch/tests/test_dpo.py`](qwen3-pytorch/tests/test_dpo.py)
+> **对应可跑测试**：[`qwen3-learning/qwen3-pytorch/tests/test_lora.py`](qwen3-pytorch/tests/test_lora.py)、[`qwen3-learning/qwen3-pytorch/tests/test_dpo.py`](qwen3-pytorch/tests/test_dpo.py)、[`qwen3-learning/qwen3-pytorch/tests/test_lora_moe.py`](qwen3-pytorch/tests/test_lora_moe.py)（MoE 的 LoRA，见 §10）
 
 > 代码位置：`qwen3-learning/qwen3-pytorch/model/common/lora.py`、
 > `qwen3-learning/qwen3-pytorch/train/train_lora.py`、
@@ -860,3 +860,154 @@ DPO 省掉的不是一点算力，是**一整条流水线**（采样 + RM 训练
 7. **★ 同一个 bug 会伪装成别的问题**。§6.4 那个 dropout bug，
    一开始表现为「DPO 消融两次结果对不上」—— 看起来像 DPO 本身有随机性。
    **当实验「不可复现」时，先怀疑配置与随机性来源，再怀疑算法。**
+
+
+---
+
+## 10. MoE 的 LoRA 微调（feat-031）
+
+> 本节所有数字都来自**本仓库代码实跑输出**（CPU，2026-10-23）。
+> 复现命令见 §10.5。
+
+### 10.1 为什么要单独做这一节
+
+MoE 之前**只验证到预训练** —— 微调链路一次没跑过。
+而且 MoE + LoRA 有一个**只有真跑才能看见**的问题：
+
+**路由器是冻结的。** 它决定哪个专家被用上，而它自己不被训练。
+于是**这一步没被路由到的专家，它的 LoRA 参数梯度是 `None`** ——
+不是「很小」，是**根本没进计算图**。
+⇒ 往**全部**专家注入 LoRA 时，有一部分参数是**白注入**的
+（占着显存与参数量，却拿不到任何学习信号）。
+
+### 10.2 三个实现要点（都是「不写就不知道」的坑）
+
+**① `inject_lora` 按**子模块名**匹配，不是全名。**
+
+```python
+# model/common/lora.py::inject_lora
+for name, module in list(model.named_modules()):
+    for child_name, child in list(module.named_children()):
+        if not isinstance(child, nn.Linear):
+            continue
+        if child_name not in target_modules:      # ← 比的是 child_name
+            continue
+```
+
+所以传 `("q_proj", "v_proj", "gate_proj", "up_proj", "down_proj")`
+就会**同时命中 attention 与每一个专家的 FFN**
+（专家就是 `SwiGLUMLP`，正好有 gate/up/down 三个投影）——
+**LoRA 实现一行都不用改**。
+
+**② MoE 的 `forward` 返回的 `loss` 是**纯 `cross_entropy``。**
+
+负载均衡辅助损失单独放在 `extras["aux_loss"]` 里，**没有混进 loss**。
+所以 LoRA 训练脚本可以原样复用，不会把辅助损失混进微调目标。
+（`tests/test_lora_moe.py` 第 6 条把这条钉死：手算 CE 与 `loss` 逐值相等。）
+
+**③ MoE 的 `forward` 仍是**恒定 4 元组**。**
+只是 `extras` 里多了 `aux_loss` / `expert_load` / `expert_load_last`
+⇒ `_, loss, _, _ = model(...)` 的解包代码不用改。
+
+### 10.3 ★ 专家的 LoRA 参数其实有**三种**状态
+
+这是本节最值得记住的一条。跑 `--model moe` 时脚本会逐专家打印：
+
+```
+[lora-moe] 逐专家诊断（step 0，最后一层）
+  专家       路由token      路由权重max      grad(A)      grad(B)         B范数     无梯度(None)     零梯度(A)     零梯度(B)
+  0           86.0    4.619e-01     0.000000     0.831471    0.000000             0          3          0
+  1            2.0    5.500e-01     0.000000     0.238120    0.000000             0          3          0
+  2            0.0    0.000e+00     0.000000     0.000000    0.000000             6          0          0
+  3           84.0    7.945e-01     0.000000     0.921636    0.000000             0          3          0
+  ⚠️ **没参与前向**的专家：[2] ⇒ 它们的 LoRA 参数 `grad is None`（**连 weight decay 都不会有**，参数一动不动）
+  ⇒ 专家侧的 LoRA 参数共 49,152 个：6,144 个这一步 `grad is None` …  ⇒ 合计 12.5% 是**白注入**的
+```
+
+| 状态 | 触发条件 | 后果 |
+|---|---|---|
+| ① `grad is None` | 这一步**专家根本没参与前向**（没被路由到） | AdamW **整个跳过** ⇒ 参数**一动不动**（连 weight decay 都没有） |
+| ② `grad == 0.0` | 参与了前向，但它处理的 token **不影响 loss**（如序列**最后一个位置**，target 被 -100 忽略） | 梯度张量存在但**恰好是 0** ⇒ **没有学习信号**，只有 weight decay |
+| ③ `grad > 0` | 真的学到了东西 | 正常更新 |
+
+> **①和②都是「白注入」**，但成因完全不同，必须分开计数。
+> 本仓 MoE（4 专家 / top-2）单步实测：「完全不动」的比例在 **0% ~ 12.5%** 之间浮动
+> （取决于这一步各专家分到多少 token）。
+
+**为什么第 0 步 A 的梯度恒为 0？**
+LoRA 分支输出是 `(α/r)·x·Aᵀ·Bᵀ`：
+
+- `∂L/∂B = (α/r)·(∂L/∂out)ᵀ·(x·Aᵀ)` —— **B=0 时非零**
+- `∂L/∂A = (α/r)·(∂L/∂out)ᵀ·B·x` —— **B=0 时恰好是 0**
+
+所以**第 0 步所有专家的 A 梯度都是 0**，这是 B 零初始化的直接后果，
+**不是 bug**，而且**第 0 步一更新、B≠0 之后 A 就有真梯度了**
+⇒ 统计「白注入」时**不能**把第 0 步的 A 零梯度算进去。
+
+### 10.4 三种配方的实测对照
+
+**同一份偏好数据（2000 对）、同一份评估集（200 对）、r=4 / alpha=8 / lr=1e-3 / 1500 步。**
+
+| 配方 | 注入模块数 | 可训练参数 | BEFORE 胜率 | AFTER 胜率 | 长度归一胜率 |
+|---|---|---|---|---|---|
+| dense + 只注 attention | 8 | 可训练 8,704 / 994,560 (0.88%) | 0.515 | 0.605 | 0.400 → 0.745 |
+| MoE + 只注 attention | 8 | 可训练 8,704 / 1,193,216 (0.73%) | 0.450 | 0.600 | 0.250 → 0.745 |
+| **MoE + attention + 专家 FFN** | 56 | 可训练 57,856 / 1,242,368 (4.66%) | 0.450 | **0.630** | 0.250 → **0.780** |
+
+两条结论：
+
+1. **把 LoRA 注进专家 FFN 确实更有效**：胜率 0.600 → 0.630，
+   长度归一口径 0.745 → 0.780。代价是可训练参数从 0.73% 涨到 4.66%。
+2. **MoE 的基线比 dense 差**（BEFORE 胜率 0.450 vs 0.515）——
+   同样的 LoRA 配方下，MoE 要先补上预训练的差距。
+   所以「MoE 更好」不能只看微调后的绝对值。
+
+**参数量的构成**（可直接手算核对）：
+
+- attention 侧：`q_proj`(128→192) + `v_proj`(128→96)，
+  每层 `(4×128 + 192×4) + (4×128 + 96×4) = 2,176`，× 4 层 = **8,704**
+- 专家侧：每个专家每层 `gate/up/down` 三个投影，
+  每个 `(4×128 + 128×4) = 1,024`，三个 = 3,072；
+  × 4 专家 × 4 层 = **49,152**
+- 合计可训练 **57,856** ✓ 与表里一致
+
+### 10.5 复现
+
+```bash
+cd qwen3-learning/qwen3-pytorch
+python train/train_lora.py --model moe                      # 默认 attention + 专家 FFN
+python train/train_lora.py --model moe --lora-targets attn  # 只注 attention（对照）
+python train/train_lora.py --model dense                    # dense 对照
+python tests/test_lora_moe.py                               # 7 组断言
+```
+
+`tests/test_lora_moe.py` 守住 7 件事：
+
+1. 注入 LoRA 到 MoE 的专家 FFN 是**无损**的（logits 逐元素相等）
+2. 每个专家的 gate/up/down 都被注到（注入点数 = `n_layer × n_experts × 3`）
+3. 冻结基座后**只有 A/B 可训**（专家的 base 权重也被冻住）
+4. ★ **没被路由到的专家 `grad is None`；被路由到的不是 None**
+   （用**只有 1 个 token** 的输入才保证会出现「没被选中」的专家 ——
+   16 个 token 时 4 个专家全都会被选上，这条断言就**空转**了）
+5. ★ `grad is None` 的参数在 `AdamW.step()` 之后**一动不动**；
+   `grad == 0` 的参数**只被 weight decay** 动（`p ← p·(1-lr·wd)`）
+6. ★ MoE 的 `loss` 是**纯 `cross_entropy`**（aux_loss 没混进去）
+7. 对照：dense 的 `extras` 是空的，loss 同样是纯 CE
+
+### 10.6 ★ 两个把结论带偏的坑（本节踩过）
+
+**坑 1：`expert_load` 是**归一化负载**（`slot_counts / K`），**可能是小数**。**
+
+e.g. 某个专家只拿到 1 个 slot、而 K=2 ⇒ 它的 load 是 **0.5**。
+所以**不能**用 `int(load) == 0` 判断「没被路由到」——
+那会把 0.5 误判成 0，报告里就会**谎报**「这个专家没被路由到」。
+**「有没有被路由到」的精确判据是 LoRA 参数的 `grad is None`。**
+（本仓真踩过：报告里一度把 3 个「拿到 0.5 个 slot」的专家标成未路由。）
+
+**坑 2：`set_seed` 必须设在**建模型之前**。**
+
+建模型与 LoRA 的 `A` 矩阵（`kaiming_uniform_`）都会消耗全局 RNG。
+把 `set_seed` 挪到建模型之后 ⇒ `A` 的初值变了 ⇒ 训练轨迹变了：
+**dense 的胜率从 0.605 掉到 0.600**。
+一个纯重构的改动，悄悄改掉了笔记里已经记下的数字。
+⇒ **重构训练脚本后，必须拿旧版本跑一遍同样的配置对数字**（本节就是这么发现坑 2 的）。

@@ -85,7 +85,7 @@ qwen3-learning/qwen3-pytorch/
 ├── evaluate.py        # 精简 6 段评估（pretrain / moe / lora / dpo / speedup / quality）
 ├── quality.py         # 生成质量指标（两条线共用同一份实现，feat-026）
 ├── ablations/         # 与 GPT-2 的退化对照（feat-017）+ 生成质量并排对照（feat-026，唯一跨目录引用 GPT-2 线的地方）
-└── tests/             # 20 个 test_*.py + run_all.py 汇总
+└── tests/             # 21 个 test_*.py + run_all.py 汇总
 ```
 
 **核心思路**：不靠"读懂论文"，而是**把 Qwen3 的每个组件做成一个可关掉的开关**（`use_gqa` / `use_rope` / `use_qk_norm` / `mlp_type` / `norm_type`），
@@ -224,15 +224,35 @@ python data/build_vocab.py               # 训练并落盘 byte-level BPE 词表
 python train/train_pretrain.py --model dense   # ① 预训练 → checkpoints/pretrain_dense.pt
 python train/train_pretrain.py --model moe     # ①' 预训练（MoE 变体）
 python train/train_lora.py               # ② LoRA 微调（r=4，注入 q_proj / v_proj）
+python train/train_lora.py --model moe     # ②' LoRA 微调（MoE 变体：attention + 专家 FFN）
 python train/train_dpo.py                # ③ DPO（π_ref = LoRA 后的 SFT 模型）
 
 python evaluate.py --stage all            # 精简 6 段评估
 python ablations/compare_with_gpt2.py    # 与 GPT-2 的退化对照（6 行消融表）
 python ablations/compare_quality.py      # 与 GPT-2 的生成质量并排 + 口径交叉验证
-python tests/run_all.py                  # 20 个 smoke 汇总
+python tests/run_all.py                  # 21 个 smoke 汇总
 ```
 
 单项说明见 [`qwen3-pytorch/README.md`](qwen3-learning/qwen3-pytorch/README.md)。
+
+### MoE 的 LoRA 微调（feat-031）
+
+`qwen3-learning/qwen3-pytorch/train/train_lora.py --model moe` 现在能在
+**MoE 预训练权重**上做 LoRA 微调（此前 MoE 只验证到预训练），
+并支持把 LoRA 注进**每个专家的 FFN**（`--lora-targets attn+expert`）。
+
+它暴露的真问题：**路由器是冻结的 ⇒ 这一步没被路由到的专家，
+它的 LoRA 参数梯度是 `None`（根本没进计算图）** ⇒
+往全部专家注入 LoRA 时有一部分参数是**白注入**的。
+
+实测（r=4 / lr=1e-3 / 1500 步）：注进专家 FFN 后胜率 0.600 → **0.630**，
+长度归一口径 0.745 → **0.780**，可训练参数 0.73% → 4.66%。
+
+守卫：[`qwen3-learning/qwen3-pytorch/tests/test_lora_moe.py`](qwen3-learning/qwen3-pytorch/tests/test_lora_moe.py)
+（7 组断言：注入无损 / 专家 FFN 全注入 / 只训 A/B / 未路由专家梯度 None /
+AdamW 不动它 / MoE loss 是纯 CE）。
+笔记：[`qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md`](qwen3-learning/Qwen3_LoRA与DPO_学习笔记.md) §10。
+
 
 ### 推荐学习顺序
 

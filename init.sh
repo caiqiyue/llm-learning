@@ -433,6 +433,71 @@ PY
     skip "Qwen3 LoRA smoke" "model/common/lora.py 尚未就绪（feat-023），或 torch 不可用"
   fi
 
+  # --- MoE LoRA smoke（feat-031）：专家 FFN 注入无损 + 未路由专家梯度是 None ---
+  if [ -f "$QWEN_DIR/train/train_lora.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
+    (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_lora_moe.log 2>&1
+import torch
+import torch.nn.functional as F
+from config import MOE_CONFIG
+from model.common.lora import LoRALinear, inject_lora, mark_only_lora_trainable
+from model.qwen3_moe import Qwen3MoE
+
+model = Qwen3MoE(vocab_size=64, cfg=MOE_CONFIG, dropout=0.0)
+model.eval()
+idx = torch.randint(0, 64, (1, 8))
+with torch.no_grad():
+    before = model(idx)[0]
+
+replaced = inject_lora(model, MOE_CONFIG.lora_target_modules_expert,
+                       r=MOE_CONFIG.lora_r, alpha=MOE_CONFIG.lora_alpha)
+with torch.no_grad():
+    after = model(idx)[0]
+# B 零初始化 ⇒ 把 LoRA 注进专家 FFN 也必须无损
+assert torch.equal(before, after), "注入 LoRA 到专家 FFN 应无损"
+
+n_expert = sum(1 for n in replaced if ".moe.experts." in n)
+expect = MOE_CONFIG.n_layer * MOE_CONFIG.n_experts * 3
+assert n_expert == expect, f"专家侧应注入 {expect} 个 LoRALinear，实得 {n_expert}"
+
+trainable = mark_only_lora_trainable(model)
+n_train = sum(p.numel() for p in trainable)
+n_all = sum(p.numel() for p in model.parameters())
+assert n_train < n_all * 0.1, f"可训练参数应远小于总参数：{n_train}/{n_all}"
+
+# ★ 单 token ⇒ 4 个专家里必然有没被路由到的 ⇒ 它的 LoRA 梯度必须是 None
+model.train()
+idx1 = torch.randint(0, 64, (1, 1))
+tg1 = torch.randint(0, 64, (1, 1))
+logits, loss, _, extras = model(idx1, targets=tg1)
+loss.backward()
+n_ck = n_none = 0
+for name, m in model.named_modules():
+    if not isinstance(m, LoRALinear) or ".moe.experts." not in name:
+        continue
+    n_ck += 1
+    if m.lora_B.grad is None:
+        n_none += 1
+assert n_ck > 0, "没找到专家侧的 LoRA"
+assert n_none > 0, f"应当有专家一步没被路由到（梯度为 None），实得 none={n_none}"
+
+# MoE 的 loss 是纯 cross_entropy（aux_loss 只在 extras 里，没混进 loss）
+manual = F.cross_entropy(logits.reshape(-1, 64), tg1.reshape(-1), ignore_index=-100)
+assert torch.allclose(loss, manual, atol=1e-6), \
+    f"MoE 的 loss 应等于纯 cross_entropy，实得 {float(loss)} vs {float(manual)}"
+print(f"[lora-moe] 专家侧注入 {n_expert} 个 LoRALinear，输出无损；"
+      f"未路由专家梯度为 None：{n_none}/{n_ck}；loss 是纯 CE；"
+      f"可训练 {n_train:,}/{n_all:,} ({n_train/n_all:.2%})")
+PY
+    )
+    if [ $? -eq 0 ]; then
+      ok "Qwen3 MoE LoRA smoke（专家 FFN 注入无损 + 未路由专家梯度 None + loss 纯 CE）$(tail -1 /tmp/llm_init_l4_lora_moe.log)"
+    else
+      fail "Qwen3 MoE LoRA smoke" "$(tail -3 /tmp/llm_init_l4_lora_moe.log | tr '\n' ' ')"
+    fi
+  else
+    skip "Qwen3 MoE LoRA smoke" "train/train_lora.py 尚未就绪（feat-031），或 torch 不可用"
+  fi
+
   # --- DPO smoke（feat-024）：初始 margin=0（π_θ == π_ref）+ loss=log2 + 只训 LoRA ---
   if [ -f "$QWEN_DIR/train/train_dpo.py" ] && [ "$HAS_TORCH" -eq 1 ]; then
     (cd "$QWEN_DIR" && PYTHONIOENCODING=utf-8 "$PY" - <<'PY' >/tmp/llm_init_l4_dpo.log 2>&1

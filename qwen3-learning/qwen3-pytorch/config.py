@@ -118,6 +118,13 @@ class Qwen3Config:
     lora_dropout: float = 0.0
     # 注入 LoRA 的模块名后缀
     lora_target_modules: tuple = ("q_proj", "v_proj")
+    # MoE 版的注入点（feat-031）：**在 attention 之外，把 LoRA 也注进每个专家的 FFN**。
+    # ★ `inject_lora` 按**子模块名**匹配 ⇒ `gate_proj`/`up_proj`/`down_proj`
+    #   会命中**每一个专家**（专家就是 SwiGLUMLP，正好有这三个投影）。
+    # ⚠️ 代价：路由器是**冻结**的 ⇒ 这一步没被路由到的专家，
+    #    它的 LoRA 参数梯度**恰好是 0**（grad is None）⇒ 有一部分参数是白注入的。
+    lora_target_modules_expert: tuple = ("q_proj", "v_proj",
+                                         "gate_proj", "up_proj", "down_proj")
     # LoRA 微调学习率
     # （实测 r=4/attn/1500 步：lr 3e-4 → loss 5.743 / 总 logprob 胜率 0.590；
     #   lr 1e-3 → loss 5.517 / 胜率 0.605。取 1e-3。

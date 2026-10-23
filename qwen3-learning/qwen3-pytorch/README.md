@@ -31,6 +31,7 @@ python ablations/compare_quality.py     # 与 GPT-2 的生成质量并排对照�
 | MoE | [MoE_学习笔记](../Qwen3_MoE_学习笔记.md) | `model/qwen3_moe.py` |
 | byte-level BPE | [BPE_学习笔记](../Qwen3_BPE_学习笔记.md) | `data/bpe.py`、`data/tokenizer.py` |
 | LoRA / DPO | [LoRA与DPO_学习笔记](../Qwen3_LoRA与DPO_学习笔记.md) | `model/common/lora.py`、`train/train_lora.py`、`train/train_dpo.py` |
+| **MoE 的 LoRA** | [LoRA与DPO_学习笔记 §10](../Qwen3_LoRA与DPO_学习笔记.md) | `train/train_lora.py`（`--model moe`）、`tests/test_lora_moe.py` |
 | 训练 → 推理 | [训练推理完整学习笔记](../Qwen3_训练推理完整学习笔记.md) | `train/`、`inference.py` |
 | 与 GPT-2 的退化对照 | [训练推理完整学习笔记 §12](../Qwen3_训练推理完整学习笔记.md) | `ablations/compare_with_gpt2.py` |
 | 生成质量评估 | [训练推理完整学习笔记 §13](../Qwen3_训练推理完整学习笔记.md) | `quality.py`、`data/quality_prompts.py`、`ablations/compare_quality.py` |
@@ -260,6 +261,37 @@ Qwen3 线的评估是「**训练质量（loss/ppl）+ 偏好对齐（margin/胜�
 | `quality` | 4 个指标全部 ∈ [0, 1]；`token_entropy` 有限且 > 0；探针数 > 0（都是**自洽性**门槛，与模型好坏无关） |
 
 checkpoint 缺失时**跳过该段并打印原因**（那是「还没跑到那一步」，不是「指标不合格」）。
+
+
+### MoE 的 LoRA 微调（feat-031）
+
+MoE 之前只验证到**预训练**。现在 `train/train_lora.py` 支持 `--model dense|moe`：
+
+```bash
+cd qwen3-learning/qwen3-pytorch
+python train/train_lora.py --model moe                      # 默认：attention + 专家 FFN
+python train/train_lora.py --model moe --lora-targets attn  # 只注 attention（对照）
+python tests/test_lora_moe.py                               # 7 组断言
+```
+
+`--lora-targets attn+expert` 会把 LoRA **注进每个专家的 FFN**
+（`gate_proj` / `up_proj` / `down_proj`）——
+`inject_lora` 是按**子模块名**匹配的，所以 **LoRA 实现一行都不用改**。
+
+训练中会打印**逐专家诊断**，直接暴露一个真问题：
+**路由器是冻结的 ⇒ 这一步没被路由到的专家，它的 LoRA 参数梯度是 `None`**
+（不是「很小」，是**根本没进计算图**）⇒ 往全部专家注入 LoRA 时
+有一部分参数是**白注入**的。实测「完全不动」的比例在 **0% ~ 12.5%** 之间浮动。
+
+三种配方的实测（r=4 / lr=1e-3 / 1500 步）：
+
+| 配方 | 注入模块 | 可训练参数 | BEFORE 胜率 | AFTER 胜率 | 长度归一 |
+|---|---|---|---|---|---|
+| dense + attention | 8 | 8,704 / 994,560 (0.88%) | 0.515 | 0.605 | 0.400 → 0.745 |
+| MoE + attention | 8 | 8,704 / 1,193,216 (0.73%) | 0.450 | 0.600 | 0.250 → 0.745 |
+| **MoE + attention + 专家 FFN** | 56 | 57,856 / 1,242,368 (4.66%) | 0.450 | **0.630** | 0.250 → **0.780** |
+
+细节见 [LoRA与DPO_学习笔记 §10](../Qwen3_LoRA与DPO_学习笔记.md)。
 
 ## 硬约束
 

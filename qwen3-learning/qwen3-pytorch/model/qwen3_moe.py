@@ -175,7 +175,7 @@ class SparseMoeBlock(nn.Module):
             x: (B, T, n_embd)
         返回：
             (out, stats)，out 为 (B, T, n_embd)；
-            stats 含 aux_loss / expert_load / topk_weights / routed_tokens /
+            stats 含 aux_loss / expert_load / topk_weights / topk_indices / routed_tokens /
             expert_token_pairs
         """
         B, T, C = x.size()
@@ -241,6 +241,10 @@ class SparseMoeBlock(nn.Module):
             "f_i": f_i.detach(),
             "p_i": p_i.detach(),
             "topk_weights": topk_weights.view(B * T, K).detach(),
+            # feat-031：把 top-k 的**专家下标**也带出来，
+            # 这样外部能算出「每个专家被选中时拿了多大的路由权重」
+            # （梯度大小 ∝ 路由权重，见 train/train_lora.py 的逐专家诊断）
+            "topk_indices": topk_indices.detach(),
             "routed_tokens": n_tokens,
             "expert_token_pairs": n_tokens * K,
         }
