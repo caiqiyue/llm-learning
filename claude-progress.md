@@ -11,8 +11,8 @@
 - 仓库根目录：`E:/ai-learning/05-llm-fundamentals/llm-learning`
 - 标准启动路径：`bash init.sh`（轻量 smoke L0–L4，< 1 分钟）
 - 标准验证路径：同上；GPT-2 全量训练与评估见 `AGENTS.md` §5 的 L3 段
-- 当前活跃 feature：**无**（WIP=0；**29 个 feature 全部 passing**，feat-029 是最后一个，已于 Session 016 完成；**feat-030 已立项未开始**）
-- 当前最高优先级未完成 feature：**feat-030**（笔记里的 `#L` 源码锚点机器校验 + 修 P1 线 PPO 章节与重构后代码的脱节）
+- 当前活跃 feature：**无**（WIP=0；**30 个 feature 全部 passing**，feat-030 是最后一个，已于 Session 017 完成）
+- 当前最高优先级未完成 feature：**无** —— 下一批候选见 `session-handoff.md` 的「Next Best Step」（建议 feat-031 多行锚点的标识符级校验 / feat-032 让 MoE 体现容量优势 / feat-033 裸文件名消歧；**都要先立项再动手**）
 - ~~已知 blocker：torch DLL 加载失败~~ → **已解除**（feat-001 根因是 PATH 上的 Python 3.11.0a2 alpha ABI，不是 torch 损坏；`init.sh` 现在自动挑能 `import torch` 的解释器，本机命中 `/d/python310/python.exe` 3.10.4 + torch 2.1.0+cpu）
 - 训练产物现状：`gpt-learning/gpt-learning-pytorch/checkpoints/` 下的 `pretrain.pt` / `sft.pt` / `reward.pt` / `ppo.pt` 均为 **2026-10-23 在修复后的环境里、按 feat-027 定下的口径重跑产出**，指标可信（见 `feature_list.json` feat-002~007、feat-027 的 evidence）
 - **P1 线的 SFT 塌陷已修**（feat-027）：三个互相咬合的缺陷 —— ① SFT 的 labels 同下标 + 模型 loss 不左移 ⇒ 学成「复制当前 token」；② `encode` 逐字符查表 ⇒ `BOS/EOS/SEP` 永远不可达 ⇒ 学不会自己停；③ 评估按字符串长度切回答 ⇒ 每条带 `"? <unk>sep<unk> "` 前缀。修完：公共后缀 0%（原 98%）、`ppo_rm_score` +0.9188（原 0.0696）、`improvement` +3.6509（原 0.0000）。**口径写进了 `init.sh` 的 L1/L2 守卫**
@@ -20,6 +20,7 @@
 - **笔记 ↔ config.py 的自动守卫**（feat-009）：`tests/test_config_sync.py` 把 27 篇笔记里的 `` `超参名 = 值` `` 跟各自 `config.py` 逐条对齐（实测 88 处断言 / 25 条例外登记）；**改 `config.py` 忘了改笔记 ⇒ 测试直接红**。已知盲点：`开发计划.md` 跨线比较，不适用自动守卫，改为人工核对
 - **笔记 ↔ 代码实测的「派生量」自动守卫**（feat-028）：`tests/test_derived_sync.py` 核对**算出来的**数字 —— 参数量（794,496 / 985,856 / 8,704 / 1,184,512）、词表大小（45 / 778）、算式、比值（实测 **41 处**主张 / 8 条例外登记）。**期望值不手写，而是现场把模型搭出来数参数** ⇒ 改一个 `n_embd` / `n_layer`，几十个参数量数字会**同时**变红。**表格里的数字也跑不掉**（行级规则）
 - **笔记里「手抄的代码」↔ 源码的自动守卫**（feat-029）：`tests/test_note_code_sync.py` 把手抄进笔记的函数（`get_lr` / `_build_sinusoidal_pos_emb` / `KVCache.append` / `mark_only_lora_trainable` / `set_lora_enabled`）**真的跑起来**，和源码里那份在同样输入上**比输出**（实测 **8 条配对 / 4 篇笔记**）。**不要求逐字一致**（164/164 个笔记代码块都是故意简化的摘录）⇒ 只要求**行为一致**。★ 源码函数用 `ast` **摘出来**再 `exec`，**绝不 import** —— `train_pretrain.py` 是顶层线性脚本，import 会重跑预训练并覆盖 `checkpoints/pretrain.pt`
+- **笔记里 `#L` 行号锚点的自动守卫**（feat-030）：`tests/test_note_refs.py` **第 6 节**扫全仓 markdown 的 **22 处** `#L` 锚点，两条规则 —— **R1** 范围（目标存在 + `1 <= start <= end <= 行数`）、**R2** 单行锚点**必须精确**（锚点后第一个 ```python 块的第一条语句 == 源码那一行，去注释去空白后逐字相等）。**多行锚点只做 R1** —— 逐字比对实测 18 个配对里 8 个对不上，**全是风格差异**（与 feat-029「逐字一致不可行」同源）⇒ 守卫只判「真错」
 - 两条线代码状态：GPT-2 线 `gpt-learning/gpt-learning-pytorch/` **全链路已复验通过**；Qwen3 线 `qwen3-learning/qwen3-pytorch/` **组件层 + 数据层 + 训练三段 + 评估侧 + 退化对照全部就位**（RMSNorm / RoPE / KVCache / QK-Norm+GQA 注意力 / SwiGLU / Qwen3Dense / Qwen3MoE / byte-level BPE / 预训练 / LoRA / DPO / `inference.py` / `evaluate.py` / `ablations/compare_with_gpt2.py`），`bash init.sh` L4 已有「组件 smoke + 前向 smoke + 训练步 smoke + LoRA smoke + DPO smoke + 推理 smoke + 评估 smoke + **生成质量 smoke** + **退化对照 smoke**」九条
 - **两条线现在有第三个「数字可并排」的地方**（feat-026）：`quality.py` 是**两条线共用的一份指标实现**，`ablations/compare_quality.py` 用 GPT-2 线**自己的** `evaluate.py` 在同一批回答上重算并断言**逐值相等**（实测差 0.000e+00）⇒「同名同口径」是机器证明，不是承诺。⚠️ 并排数字带着三条不可比性（探针域内外 / tokenizer 粒度 / 词表大小），详见 `Qwen3_训练推理完整学习笔记.md` §13.5
 
@@ -1786,3 +1787,122 @@ test_note_code_sync OK
 | `bash init.sh` | `PASS=30  SKIP=0  FAIL=0` |
 | `qwen3-pytorch` `python tests/run_all.py` | `PASS=20  FAIL=0  TOTAL=20` |
 | `python tests/test_note_code_sync.py` | **8 条**配对 / **4 篇**笔记 / 全部行为一致 |
+
+### Session 017 — 笔记里的 `#L` 行号锚点纳入机器守卫（feat-030）
+
+**目标**：把「笔记里指向源码行号的锚点」纳入机器守卫，并**修掉** P1 线 PPO 章节与重构后代码的脱节。
+**状态**：✅ 完成 —— **30 个 feature 全部 passing**。
+
+#### 立项：为什么「链接可点开」还不够
+
+feat-029 收班时做了一次**全仓 `#L` 锚点普查**：16 个锚点里 **4 个失效**，
+全在 `gpt-learning/GPT2训练数学公式与超参详解.md`，都指向 `gpt-learning-pytorch/train_ppo.py`
+—— 而那个文件现在只有 **14 行**（thin wrapper，真实实现在 `train_ppo_standard_adapted.py`，1337 行）
+⇒ 行号 262 / 271 / 303 / 392 / 397 **全部越界**。
+
+更严重的是第二层：笔记引用的那几段代码（`compute_kl`、reward shaping、reward normalization）
+**在重构后已经不存在**了 —— 现在对应的是 `score_reward_model` / `whiten_masked` / `compute_gae`
+⇒ **整段 PPO 章节在描述一个已经不存在的实现**。
+
+原来的 `tests/test_note_refs.py` **只校验「链接目标文件存在」** ⇒ 这种腐烂**安安静静躺了很久**
+（**没人点就没人发现**）。
+
+#### 守卫：两条规则（R1 + R2），以及一条**测过就否决**的规则（R3）
+
+守卫加在 `qwen3-learning/qwen3-pytorch/tests/test_note_refs.py` 的**第 6 节** `_check_anchors()`，
+扫**全仓** markdown（跳过 `.git` / `checkpoints` / `docs` / `__pycache__` / `.claude` / `.vscode`）：
+
+| 规则 | 内容 | 抓到的 |
+|---|---|---|
+| **R1（范围）** | 目标文件存在，且 `1 <= start <= end <= 文件行数` | 4 个越界锚点 |
+| **R2（单行锚点必须精确）** | `file.py#L123` 的语义是「就是这一行」⇒ 紧跟其后的 ```python 代码块**第一条语句**必须**就是**源码第 123 行（去注释、去空白后逐字相等） | **3 个「在范围内但指错行」**的锚点 |
+| ~~R3（代码块逐行落在区间内）~~ | —— | **否决**：实测 18 个「锚点 + 代码块」配对里 **8 个对不上**，逐条看全是**风格差异**（笔记省 docstring、拆开签名、去 type hint）⇒ 做成守卫就是一台误报机器。**多行锚点只做 R1** |
+
+★ R3 被否决这件事，与 feat-029 的「逐字一致不可行」**同源**：**教学笔记必须简化，守卫只能判「真错」**。
+
+#### 改的内容（不只是改行号）
+
+**重写** `gpt-learning/GPT2训练数学公式与超参详解.md` 的 PPO 章节
+（§3.4.3 / §4.1 / §4.2 / §4.3 / §4.4 / §4.5），锚点改指 `train_ppo_standard_adapted.py`：
+
+| 笔记里的内容 | 新锚点 |
+|---|---|
+| policy loss | `L1012-L1048` |
+| value loss | `L1077-L1093` |
+| token 级 KL | `L842-L847` |
+| reward shaping | `L839-L847` |
+| RM 奖励注入（**只加在最后一个 action 上**） | `L862-L867` |
+| `whiten_masked` | `L661-L673` |
+| reward whitening 开关 | `L178-L179` |
+| `compute_gae` | `L676-L728` |
+| advantage whitening | `L928-L929` |
+
+锚点总数 **16 → 22**（删 4 个坏的，加 10 个新的）。
+
+**顺带修的 3 个「在范围内但指错行」的单行锚点**：
+
+| 旧锚点 | 那一行实际是什么 | 新锚点 |
+|---|---|---|
+| `model/gpt2.py#L222` | `att = self.attn_dropout(att)`（笔记引的是 GELU） | `#L293`（`x = F.gelu(x)`） |
+| `model/gpt2.py#L262` | `super().__init__()`（笔记引的是 `self.ln_1 = nn.LayerNorm(n_embd)`） | `#L336` |
+| `train_reward.py#L203` | **一行注释**（笔记引的是 `-F.logsigmoid(r_chosen - r_rejected).mean()`） | `#L218` |
+
+**顺带修的 4 处内容**事实**错误**（正文本身也错，不只是锚点错）：
+
+1. advantage whitening 原文写「未启用」⇒ 实际**始终启用**（`L928-L929`）；
+2. reward whitening 原文当成默认开启 ⇒ 实际**默认关闭**
+   （`cfg("ppo_reward_whiten", False)`，且 `config.py` 里**根本没有这个键** ⇒ 静默走代码里的 fallback 0.05
+   —— 这是个**静默默认值陷阱**）；
+3. 原文写「代码里没有 `compute_kl()` 这个函数」⇒ 现在补上**真实的 token 级 KL**（`L842-L847`）；
+4. reward shaping / reward normalization 的公式与代码对不上 ⇒ 改成 `score_reward_model` + `whiten_masked` 的真实口径。
+
+#### 证据
+
+```
+# ① 轻量验证
+$ bash init.sh
+  ...
+  PASS=30  SKIP=0  FAIL=0
+
+# ② 全部 smoke
+$ cd qwen3-learning/qwen3-pytorch && python tests/run_all.py
+  [run_all] PASS=20  FAIL=0  TOTAL=20
+
+# ③ 守卫单独跑
+$ python tests/test_note_refs.py
+  [refs] 笔记 9 篇：Qwen3_BPE_学习笔记.md, ...（共 9 篇）
+  [refs] 交叉引用链接 82 条全部可点开；正文路径 121 处全部存在；源码行号锚点 22 处全部在范围内
+  test_note_refs OK  笔记 9 篇 / 链接 82 条 / 路径 121 处 / 锚点 22 处
+```
+
+★ 本 feature 只改**守卫与笔记**、**没动任何训练/评估代码** ⇒ 按 AGENTS.md **不需要**跑 L3 全量训练。
+
+#### ★ 反证 2 连（改完全部复原）
+
+| # | 改了什么 | 守卫的反应 | 复原 |
+|---|---|---|---|
+| ① | 把单行锚点 `#L293` 改成 `#L294` | **红**（`单行锚点指错行 → …/gpt2.py#L294` / `笔记里引用的：x = F.gelu(x)` / `源码第 294 行：（空行 / 越界）`） | ✅ `git checkout` |
+| ② | 把多行锚点的 end 改成越界值 | **红**（`锚点行号越界`） | ✅ `git checkout` |
+
+⇒ 两次都**只红被扰动的那一条** ⇒ 守卫定位精确，没有误伤。
+
+#### 四个方法论教训
+
+1. **「链接点得开」≠「链接指得准」** —— 行号锚点是一种**会随代码改动自动腐烂**的引用，
+   而腐烂**不报错**（没人点就没人发现）。⇒ 这类引用**必须机器守**，不能靠「记得更新」。
+2. **范围对了还可能指错行** —— R1 只能保证「不越界」；真正的坏锚点往往是**安安静静指着旁边的代码**
+   （本仓 3 处）。⇒ 单行锚点要再判「那一行**就是**笔记引用的那句」。
+3. **别把守卫做成误报机器** —— 「代码块逐行比对」实测 8/18 对不上，**全是风格差异** ⇒ 否决。
+   **教学笔记必须简化，守卫只能判「真错」**（与 feat-029 同源）。
+4. **写笔记时别假设「config 里有这个键」** —— `ppo_reward_whiten` **不在 `config.py` 里** ⇒ 静默走 fallback。
+   **静默默认值**是这类文档最隐蔽的错误来源。
+
+#### 最终状态
+
+| 项 | 值 |
+|---|---|
+| `feature_list.json` | **30 passing / 0 in_progress / 0 not_started**（priority 严格 1..30） |
+| `bash init.sh` | `PASS=30  SKIP=0  FAIL=0` |
+| `qwen3-pytorch` `python tests/run_all.py` | `PASS=20  FAIL=0  TOTAL=20` |
+| `python tests/test_note_refs.py` | 笔记 9 篇 / 链接 82 条 / 路径 121 处 / **锚点 22 处** |
+| 下一批候选 | 见 `session-handoff.md`「Next Best Step」（建议 feat-031 / 032 / 033，**都要先立项再动手**） |

@@ -10419,3 +10419,90 @@ test_note_code_sync OK
 ⇒ 已立 **feat-030**（not_started）。
 
 ---
+
+### Task 24: feat-030 笔记 `#L` 行号锚点守卫（范围 + 精确性）+ 重写 P1 线 PPO 章节
+
+#### 立项：「链接点得开」≠「链接指得准」
+
+Task 23 收班时的**全仓 `#L` 锚点普查**（16 个锚点）：
+
+- **4 个失效**，全在 `gpt-learning/GPT2训练数学公式与超参详解.md`，都指向 `train_ppo.py`
+  —— 而那个文件后来被改造成 **14 行的 thin wrapper**（真实实现在 `train_ppo_standard_adapted.py`，1337 行）
+  ⇒ 行号 262 / 271 / 303 / 392 / 397 **全部越界**。
+- 更严重：被引用的那几段代码（`compute_kl`、reward shaping、reward normalization）
+  在**重构后已经不存在**了 ⇒ **整段 PPO 章节在描述一个已经不存在的实现**。
+- 现有 `tests/test_note_refs.py` 只校验「链接目标文件存在」，**不校验 `#L` 行号** ⇒ 一直没被抓住。
+
+★ 这类腐烂**不报错**（**没人点就没人发现**）⇒ 行号锚点必须机器守。
+
+#### 做法：两条规则（R1 + R2），以及一条**测过就否决**的规则（R3）
+
+守卫加在 `tests/test_note_refs.py` 的**第 6 节** `_check_anchors()`，扫**全仓** markdown
+（跳过 `.git` / `checkpoints` / `docs` / `__pycache__` / `.claude` / `.vscode`）：
+
+| 规则 | 内容 | 抓到 |
+|---|---|---|
+| **R1（范围）** | 目标文件存在，且 `1 <= start <= end <= 文件行数` | 4 个越界锚点 |
+| **R2（单行锚点必须精确）** | `file.py#L123` 的语义是「就是这一行」⇒ 锚点后 ```python 块**第一条语句**必须**就是**源码第 123 行（去注释、去空白后逐字相等） | **3 个「在范围内但指错行」**的锚点 |
+| ~~R3（代码块逐行落在区间内）~~ | —— | **否决** |
+
+★ **R3 为什么被否决**：实测 18 个「锚点 + 代码块」配对里 **8 个对不上**，逐条看全是**风格差异**
+（笔记省 docstring、拆开签名、去 type hint）⇒ 做成守卫就是一台误报机器。
+**多行锚点只做 R1**。这与 Task 23 的「逐字一致不可行」**同源**：
+**教学笔记必须简化，守卫只能判「真错」**。
+
+#### 改的内容（不只改行号）
+
+**重写** `gpt-learning/GPT2训练数学公式与超参详解.md` 的 PPO 章节
+（§3.4.3 / §4.1 / §4.2 / §4.3 / §4.4 / §4.5），锚点改指 `train_ppo_standard_adapted.py`：
+policy loss `L1012-L1048`、value loss `L1077-L1093`、token 级 KL `L842-L847`、
+reward shaping `L839-L847`、RM 奖励注入 `L862-L867`、`whiten_masked` `L661-L673`、
+reward whitening 开关 `L178-L179`、`compute_gae` `L676-L728`、advantage whitening `L928-L929`。
+锚点总数 **16 → 22**（删 4 个坏的，加 10 个新的）。
+
+**顺带修的 3 个「在范围内但指错行」的单行锚点**：
+`model/gpt2.py#L222`（实际是 `att = self.attn_dropout(att)`）→ `#L293`（`x = F.gelu(x)`）；
+`model/gpt2.py#L262`（实际是 `super().__init__()`）→ `#L336`（`self.ln_1 = nn.LayerNorm(n_embd)`）；
+`train_reward.py#L203`（实际是**一行注释**）→ `#L218`（`loss = -F.logsigmoid(...).mean()`）。
+
+**顺带修的 4 处内容**事实**错误**：① advantage whitening 实际**始终启用**（不是「未启用」）；
+② reward whitening 实际**默认关闭**（`cfg("ppo_reward_whiten", False)`，且 `config.py` 里**没有这个键**
+⇒ 静默走 fallback 0.05）；③ 补上**真实的 token 级 KL**（原文写「代码里没有 `compute_kl()`」）；
+④ reward shaping / reward normalization 公式改成 `score_reward_model` + `whiten_masked` 的真实口径，
+并讲清 **RM 的奖励只加在最后一个 action 上**。
+
+#### 实测结果
+
+```
+$ bash init.sh
+  PASS=30  SKIP=0  FAIL=0
+
+$ cd qwen3-learning/qwen3-pytorch && python tests/run_all.py
+  [run_all] PASS=20  FAIL=0  TOTAL=20
+
+$ python tests/test_note_refs.py
+  [refs] 交叉引用链接 82 条全部可点开；正文路径 121 处全部存在；源码行号锚点 22 处全部在范围内
+  test_note_refs OK  笔记 9 篇 / 链接 82 条 / 路径 121 处 / 锚点 22 处
+```
+
+**反证 2 连**（改完全部复原）：① 单行锚点 `#L293` → `#L294` → **红**
+（`单行锚点指错行 → …/gpt2.py#L294` / `笔记里引用的：x = F.gelu(x)` / `源码第 294 行：（空行 / 越界）`）；
+② 多行锚点的 end 改成越界值 → **红**（`锚点行号越界`）。两次都**只红被扰动的那一条**。
+
+★ 本 feature 只改**守卫与笔记**、**没动任何训练/评估代码** ⇒ 按 AGENTS.md **不需要**跑 L3 全量训练。
+
+#### 三个教训
+
+1. **「链接点得开」≠「链接指得准」** —— 行号锚点会**静默腐烂**，这类引用必须机器守。
+2. **范围对了还可能指错行** —— 本仓 3 处锚点**在范围内**却指着旁边的代码 ⇒ 单行锚点要判「就是那一句」。
+3. **别把守卫做成误报机器** —— 逐字比对实测 8/18 对不上（全是风格差异）⇒ 否决。
+
+#### 下一批候选（都要**先立项**再动手，见 `session-handoff.md`「Next Best Step」）
+
+| 建议 feature | 做什么 |
+|---|---|
+| **feat-031** | 多行锚点的**标识符级**校验（R3 的软化版：比「标识符在不在区间里」而不是逐字） |
+| **feat-032** | 让 **MoE 在本仓语料上体现出容量优势**（扩语料 + 加步数 + 固定 seed） |
+| **feat-033** | 笔记里**裸写文件名**（`config.py` / `evaluate.py`）的消歧约定 |
+
+---

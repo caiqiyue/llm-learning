@@ -7,6 +7,8 @@
   3. 笔记正文里出现的**路径型反引号串**都能在仓库里找到对应文件
   4. 根 README 的 Qwen3 索引表覆盖了全部笔记，且每一行都带「Qwen3 源码」列
   5. 唯一缺过的那篇笔记（Qwen3_BPE_学习笔记.md）已补齐
+  6. 全仓 markdown 里的 `#L<行号>` 源码锚点：**行号在目标文件的范围内**（R1），
+     且**单行锚点必须精确指向笔记引用的那一句**（R2）（feat-030）
 
 运行：python tests/test_note_refs.py
 """
@@ -41,6 +43,12 @@ _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")
 # 交叉引用块的两行标记
 _GPT2_LINE = "> **对应 GPT-2 实现位置**"
 _QWEN3_LINE = "> **对应 Qwen3 源码位置**"
+
+# markdown 链接带行号锚点：[文字](路径#L12) 或 [文字](路径#L12-L34)
+_ANCHOR_RE = re.compile(r"\[([^\]]*)\]\(([^)\s]+)#L(\d+)(?:-L(\d+))?\)")
+
+# 扫全仓 markdown 时要跳过的目录
+_SKIP_DIRS = {".git", "checkpoints", "docs", "__pycache__", ".claude", ".vscode"}
 
 
 def _note_files() -> list:
@@ -91,6 +99,112 @@ def _is_skippable(s: str) -> bool:
     if s.startswith(("checkpoints/", "docs/")):
         return True
     return False
+
+
+def _all_markdown_files() -> list:
+    """列出全仓所有 markdown 文件（跳过产物目录 / 元数据目录）。"""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for name in filenames:
+            if name.endswith(".md"):
+                out.append(os.path.join(dirpath, name))
+    return sorted(out)
+
+
+def _strip_comment(line: str) -> str:
+    """去掉行尾注释并把内部空白压成单空格（比逐字比较稳）。"""
+    h = line.find("#")
+    body = line if h < 0 else line[:h]
+    return " ".join(body.split())
+
+
+def _first_code_line(lines: list, fence_idx: int):
+    """围栏里第一条「非空且非纯注释」的语句（归一化后），没有则返回 None。"""
+    for raw in lines[fence_idx:]:
+        if raw.strip().startswith("```"):
+            break
+        s = _strip_comment(raw)
+        if s:
+            return s
+    return None
+
+
+def _check_anchors() -> int:
+    """校验全仓 markdown 里的 `#L<行号>` 源码锚点，返回锚点总数。
+
+    ★ 为什么要有这一条（feat-030）：
+      「链接点得开」≠「链接指得准」—— `file.py#L262-L268` 里的**行号**
+      会随代码改动漂移，而**没人点就没人发现** ⇒ 静默腐烂。
+      本仓真实踩过：`GPT2训练数学公式与超参详解.md` 的 4 个锚点指向
+      `train_ppo.py`（已被改造成 **14 行**的 thin wrapper），
+      行号 262 / 271 / 303 / 392 / 397 **全部越界**；
+      更严重的是被引用的那几段代码（`compute_kl` 等）在重构后**已经不存在**。
+
+    ★ 两条规则：
+      **R1（范围）**：目标文件存在，且 `1 <= start <= end <= 文件行数`。
+      **R2（单行锚点必须精确）**：`file.py#L123` 这种**单行**锚点，
+        它的意思是「就是这一行」⇒ 紧跟其后的 python 代码块**第一条语句**
+        必须**就是**源码第 123 行（去注释、去空白后逐字相等）。
+        —— 行号在范围内也可能是**指错行**（本仓实测有 3 处）。
+      **多行锚点**（`file.py#L33-L57`）只做 R1：
+        笔记里的代码**本来就是简化版**（会省 docstring、拆开签名），
+        要求逐字落在区间内会误报（实测 10/18 对不上，全是风格差异不是错误）。
+    """
+    problems = []
+    n_anchor = 0
+    for path in _all_markdown_files():
+        rel_note = os.path.relpath(path, REPO_ROOT).replace("\\", "/")
+        text = _read(path)
+        lines = text.split("\n")
+        for m in _ANCHOR_RE.finditer(text):
+            n_anchor += 1
+            target = m.group(2)
+            a = int(m.group(3))
+            b = int(m.group(4) or m.group(3))
+            if target.startswith(("http://", "https://", "#")):
+                continue
+            resolved = os.path.normpath(os.path.join(os.path.dirname(path), target))
+            if not os.path.isfile(resolved):
+                problems.append(
+                    f"{rel_note}: 锚点目标文件不存在 → {target}#L{a}")
+                continue
+            src_lines = _read(resolved).split("\n")
+            n_lines = len(src_lines)
+            if a < 1 or b < a or b > n_lines:
+                problems.append(
+                    f"{rel_note}: 锚点行号越界 → {target}#L{a}"
+                    + (f"-L{b}" if b != a else "")
+                    + f"（目标文件只有 {n_lines} 行）")
+                continue
+            if a != b:
+                continue                      # 多行锚点只做 R1
+            # --- R2：单行锚点必须精确指向被引用的那一句 ---
+            lineno = text[:m.start()].count("\n")     # 锚点所在行（0 基）
+            fence = None
+            j, seen = lineno + 1, 0
+            while j < len(lines) and seen < 3:
+                if lines[j].strip():
+                    seen += 1
+                if lines[j].strip() == "```python":
+                    fence = j + 1
+                    break
+                j += 1
+            if fence is None:
+                continue                  # 后面没有代码块，无从比对
+            first = _first_code_line(lines, fence)
+            if first is None:
+                continue
+            src_stmt = _strip_comment(src_lines[a - 1]) if a - 1 < len(src_lines) else ""
+            if first != src_stmt:
+                problems.append(
+                    f"{rel_note}: 单行锚点指错行 → {target}#L{a}\n"
+                    f"      笔记里引用的：{first}\n"
+                    f"      源码第 {a} 行：{src_stmt or '（空行 / 越界）'}")
+    assert not problems, (
+        "笔记里的 `#L` 行号锚点失效（feat-030）：\n    "
+        + "\n    ".join(problems))
+    return n_anchor
 
 
 def main() -> int:
@@ -180,9 +294,17 @@ def main() -> int:
     for name in notes:
         assert name in q_readme, f"qwen3-pytorch/README.md 缺 {name} 的入口"
 
+    # =================================================================
+    # 6) 全仓 markdown 的 `#L<行号>` 锚点：目标存在 + 行号在范围内
+    #    （feat-030：链接「点得开」不等于「指得准」）
+    # =================================================================
+    n_anchor = _check_anchors()
+
     print(f"[refs] 交叉引用链接 {n_links} 条全部可点开；"
-          f"正文路径 {n_paths} 处全部存在")
-    print(f"test_note_refs OK  笔记 {len(notes)} 篇 / 链接 {n_links} 条 / 路径 {n_paths} 处")
+          f"正文路径 {n_paths} 处全部存在；"
+          f"源码行号锚点 {n_anchor} 处全部在范围内")
+    print(f"test_note_refs OK  笔记 {len(notes)} 篇 / 链接 {n_links} 条 / "
+          f"路径 {n_paths} 处 / 锚点 {n_anchor} 处")
     return 0
 
 

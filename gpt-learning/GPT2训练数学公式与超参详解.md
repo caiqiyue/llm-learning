@@ -298,7 +298,7 @@ $$\text{GELU}(x) \approx 0.5 x \left(1 + \tanh\left[\sqrt{\frac{2}{\pi}}\left(x 
 - 平滑梯度（在 0 附近可微）
 - 经验上 NLP 任务表现更好
 
-**对应代码**（[model/gpt2.py:222](gpt-learning-pytorch/model/gpt2.py#L222)）：
+**对应代码**（[model/gpt2.py:293](gpt-learning-pytorch/model/gpt2.py#L293)）：
 
 ```python
 # PyTorch 内置精确 GELU（基于 erf）
@@ -335,7 +335,7 @@ $$\text{LayerNorm}(x) = \gamma \cdot \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} 
 - 训练和推理行为一致
 - 对 batch size 不敏感（适合大模型）
 
-**对应代码**（[model/gpt2.py:262](gpt-learning-pytorch/model/gpt2.py#L262)）：
+**对应代码**（[model/gpt2.py:336](gpt-learning-pytorch/model/gpt2.py#L336)）：
 
 ```python
 self.ln_1 = nn.LayerNorm(n_embd)  # 128 维，γ 和 β 各 128 参数
@@ -543,7 +543,7 @@ $$\frac{\partial \mathcal{L}_{\text{BT}}}{\partial r_c} = -\sigma(r_r - r_c) = \
 - 当 $r_c > r_r$（RM 答对）：梯度小，几乎不更新
 - 当 $r_c < r_r$（RM 答错）：梯度大，强烈推动 $r_c$ 上升
 
-**代码**（[train_reward.py:203](gpt-learning-pytorch/train_reward.py#L203)）：
+**代码**（[train_reward.py:218](gpt-learning-pytorch/train_reward.py#L218)）：
 
 ```python
 loss = -F.logsigmoid(r_chosen - r_rejected).mean()
@@ -595,21 +595,49 @@ $$\mathcal{L}_{\text{value}} = \frac{1}{|R|} \sum_{t \in R} (V_\theta(s_t) - R_t
 - $V_\theta(s_t)$：value_head 在状态 $s_t$ 的估计（标量）
 - $R_t = A_t + V_t$：实际收益（GAE 返回值）
 
-#### 3.4.3 代码实现（[train_ppo.py](gpt-learning-pytorch/train_ppo.py)）
+#### 3.4.3 代码实现（[train_ppo_standard_adapted.py](gpt-learning-pytorch/train_ppo_standard_adapted.py)）
+
+> ⚠️ 入口 `train_ppo.py` 现在只是一个 **thin wrapper**（十几行，只做一次 re-export），
+> **真正的实现在 `train_ppo_standard_adapted.py` 里** —— 本节所有代码引用都指向它。
+
+**policy loss**（[L1012-L1048](gpt-learning-pytorch/train_ppo_standard_adapted.py#L1012-L1048)）：
 
 ```python
-# policy loss
-ratio = torch.exp(logp_new - old_logprobs)                    # (B, T-1)
-loss_unclipped = ratio * advantages
-loss_clipped   = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
-loss_policy    = -torch.min(loss_unclipped, loss_clipped).mean()
-
-# value loss
-loss_value = F.mse_loss(values, returns)
-
-# 总 loss
-loss = loss_policy + ppo_vf_coef * loss_value                # c1=0.5
+log_ratio = new_logp - mb_old_logp
+ratio = torch.exp(log_ratio)                        # (mB, T-1)
+surr1 = ratio * mb_adv
+surr2 = torch.clamp(
+    ratio,
+    1.0 - CLIP_RANGE, #0.2
+    1.0 + CLIP_RANGE,
+) * mb_adv
+pg_loss_per_token = -torch.minimum(surr1, surr2)
+pg_loss = (pg_loss_per_token * mb_mask).sum() / n_valid
+entropy_mean = (entropy * mb_mask).sum() / n_valid
+actor_loss = pg_loss - ENTROPY_COEF * entropy_mean
 ```
+
+**value loss**（[L1077-L1093](gpt-learning-pytorch/train_ppo_standard_adapted.py#L1077-L1093)）：
+
+```python
+value_loss_unclipped = (new_values - mb_ret) ** 2
+value_loss_clipped = (value_pred_clipped - mb_ret) ** 2
+value_loss_per_token = 0.5 * torch.maximum(
+    value_loss_unclipped,
+    value_loss_clipped,
+)
+value_loss = (value_loss_per_token * mb_mask).sum() / n_valid
+critic_loss = VALUE_LOSS_COEF * value_loss
+```
+
+> ★ **和教科书写法的三处差别**（照抄公式就以为代码长那样，会被 review 打回）：
+> ① **不是 `.mean()`，是「先乘 mask 再除以有效 token 数」** ——
+>    padding 位置不能进 loss，否则短样本会被稀释；
+> ② **value loss 是 clipped 版**（`max(unclipped, clipped)`），不是裸 MSE ——
+>    目的是限制「Value 相对旧 Value 一次跳太远」时仍能从 loss 里榨出额外改善；
+> ③ **actor 还带一项 entropy bonus**（`ENTROPY_COEF`）——
+>    本项目 `config.py` 里没有 `ppo_entropy_coef` 这一项，代码用 `0.0` 兜底 ⇒ 实际为 0，
+>    但**结构在**，改配置即可打开。
 
 **4 个超参**：
 
@@ -644,17 +672,31 @@ $$\text{KL}_{\text{seq}} = \sum_{t \in R} \text{kl}_t$$
 
 **直觉**：KL 散度 = policy 在每个 token 上的 log 概率差之和。
 
-**代码**（[train_ppo.py:262-268](gpt-learning-pytorch/train_ppo.py#L262-L268)）：
+**代码**（[train_ppo_standard_adapted.py:L842-L847](gpt-learning-pytorch/train_ppo_standard_adapted.py#L842-L847)）：
 
 ```python
-def compute_kl(policy_lp, ref_lp):
-    return (policy_lp - ref_lp).sum(dim=-1)  # (B,)
+# sampled token-level KL estimator：
+#     kl_t = log pi_old(a_t|s_t) - log pi_ref(a_t|s_t)
+kl_token = (old_logp - ref_logp) * action_mask          # (B, T-1)
+# 每一步先拿 KL shaping reward：-beta * KL_t
+rewards = -KL_COEF * kl_token                           # (B, T-1)
 ```
 
-**为什么用 k3 估计？**
-- 严格 KL 需要在 policy 分布上求期望（要采样）
-- k3 估计只用"已采样动作"的 log 概率差（一阶 Taylor）
-- 工程上便宜得多，效果接近
+> ⚠️ **代码里没有 `compute_kl()` 这个函数**（早期版本有过，重构时删掉了）。
+> 现在的形态是：**不把 KL 聚成一个标量，而是每个 token 一个数**（`kl_token`），
+> 直接进 reward shaping（见 §4.2）。
+> 估计量就是上面那个「**已采样动作**上的 log 概率差」：
+> 严格 KL 需要在 policy 分布上求期望（要采样），
+> 这个估计量只用**已经采出来的那些 token** ⇒ 工程上便宜得多，效果接近。
+
+**β 从哪来**：`KL_COEF` 读的是 `config.py` 里的 `ppo_kl_coef`（= 0.1），
+见 §4.2 的表。
+
+> ⚠️ **一个静默的坑**：PPO 脚本读配置走的是 `cfg(name, default)` = `getattr(config, name, default)`
+> —— **`config.py` 里没有这一项时，代码会静默地用兜底默认值**。
+> 本仓就有一处不一致：`ppo_kl_coef` 在 `config.py` 里是 **0.1**，
+> 而代码里的兜底默认值写的是 **0.05** ⇒ 万一哪天把 `config.py` 那一行删了，
+> β 会**悄悄变成 0.05**，而且**不报任何错**。
 
 ---
 
@@ -668,13 +710,39 @@ r_{\text{RM}} - \beta \cdot \text{kl}_T & t = T_{\text{response}} \\
 0 & t \ge T_{\text{response}} \text{（已结束）}
 \end{cases}$$
 
-**对应代码**（[train_ppo.py:392-393](gpt-learning-pytorch/train_ppo.py#L392-L393)）：
+**对应代码**（[train_ppo_standard_adapted.py:L839-L847](gpt-learning-pytorch/train_ppo_standard_adapted.py#L839-L847)）：
 
 ```python
-_, _, _, r_total = reward_model(rm_ids, targets=None)         # (B,) RM 分数
-r_total = r_total - config.ppo_kl_coef * kl_per_sample       # KL 惩罚
-# r_total 现在 = RM 分数 - β * KL
+# RM：每个完整 response 一个 sequence-level scalar。
+rm_scores = score_reward_model(full_ids, seq_lens)      # (B,)
+
+# sampled token-level KL estimator：
+#     kl_t = log pi_old(a_t|s_t) - log pi_ref(a_t|s_t)
+kl_token = (old_logp - ref_logp) * action_mask          # (B, T-1)
+
+# 每一步先拿 KL shaping reward：-beta * KL_t
+rewards = -KL_COEF * kl_token                           # (B, T-1)
 ```
+
+**RM 分数只加在 response 的最后一个 action 上**（[L862-L867](gpt-learning-pytorch/train_ppo_standard_adapted.py#L862-L867)）：
+
+```python
+valid_sequence = last_action_idx >= 0
+batch_idx = torch.arange(B, device=device)[valid_sequence]
+rewards[
+    batch_idx,
+    last_action_idx[valid_sequence],
+] += rm_scores[valid_sequence]
+```
+
+> ⚠️ **与公式的对应关系**：
+> 公式里「$r_t^{\text{shaped}} = -\beta\cdot\text{kl}_t$（$t < T_{\text{response}}$）」
+> 对应代码里的 `rewards = -KL_COEF * kl_token`；
+> 公式里「$r_{\text{RM}} - \beta\cdot\text{kl}_T$（$t = T_{\text{response}}$）」
+> 对应最后那个 `+= rm_scores[valid_sequence]` ——
+> 也就是说 **RM 分数是「加」在最后一个 action 上的**，不是「替换」；
+> 该位置的 KL 惩罚**同时**生效（`rewards` 在加 RM 之前已经是 `-β·kl` 了）。
+> 早先的写法是「整句一个 KL 标量、再减一个标量」，重构后换成了 **token 级**。
 
 **β 系数设计哲学**：
 
@@ -698,18 +766,42 @@ $$\hat{r}_b = \frac{r_b - \mu_r}{\sigma_r + \epsilon}$$
 
 其中 $\mu_r = \frac{1}{B} \sum_b r_b$，$\sigma_r = \sqrt{\frac{1}{B} \sum_b (r_b - \mu_r)^2}$。
 
-**代码**（[train_ppo.py:397-399](gpt-learning-pytorch/train_ppo.py#L397-L399)）：
+**代码**（[train_ppo_standard_adapted.py:L661-L673](gpt-learning-pytorch/train_ppo_standard_adapted.py#L661-L673)）：
 
 ```python
-r_mean = r_total.mean()
-r_std = r_total.std() + 1e-8
-r_total = (r_total - r_mean) / r_std                          # (B,) 标准化后
+def whiten_masked(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """只在 mask=1 的有效位置做 whitening，其余位置保持 0。"""
+    valid = mask.bool()
+    out = torch.zeros_like(x)
+    vals = x[valid]
+    if vals.numel() == 0:
+        return out
+
+    mean = vals.mean()
+    # unbiased=False：即使只有一个有效元素也不会产生 NaN。
+    std = vals.std(unbiased=False)
+    out[valid] = (vals - mean) / (std + 1e-8)
+    return out
 ```
+
+**★ 注意：标准化是「带 mask 的」，不是整条张量一起算** ——
+只有 `mask=1` 的有效位置参与统计（`mean` / `std` 都在有效子集上算），
+其余位置保持 0。早期写法是 `r_total.mean()` 那种**整条一起算**，
+padding 位置的 0 会把均值和方差都拉偏。
+
+**★ 本项目当前的开关状态**：
+
+| 对象 | 状态 | 依据 |
+|---|---|---|
+| **Reward whitening** | **默认关闭** | 代码读 `cfg("ppo_reward_whiten", False)`，而 `config.py` 里**没有这一项** ⇒ 用 `False` 兜底（[L178-L179](gpt-learning-pytorch/train_ppo_standard_adapted.py#L178-L179)）|
+| **Advantage whitening** | **始终开启** | GAE 之后无条件调用（[L928-L929](gpt-learning-pytorch/train_ppo_standard_adapted.py#L928-L929)），见 §4.5 |
 
 **为什么有效？**
 - 把 reward 强制拉到 ~N(0, 1)
 - 防止个别极端值主导梯度
-- 训练稳定（PT 端实测：reward 不再爆炸到 ±100+）
+- ⚠️ 但**本项目默认没开 reward whitening**（上表）——
+  理由写在代码注释里：batch 很小时把 RM 的绝对尺度完全抹掉，弊大于利。
+  真正无条件生效的是 **advantage whitening**。
 
 ---
 
@@ -743,21 +835,45 @@ $$A_t^{\text{GAE}} = \sum_{l=0}^{T-t} (\gamma \lambda)^l \delta_{t+l}$$
 
 $$R_t = A_t + V(s_t)$$
 
-**代码**（[train_ppo.py:271-303](gpt-learning-pytorch/train_ppo.py#L271-L303)）：
+**代码**（[train_ppo_standard_adapted.py:L676-L728](gpt-learning-pytorch/train_ppo_standard_adapted.py#L676-L728)）：
 
 ```python
-def compute_gae(rewards, values, mask, gamma=1.0, lam=0.95):
+def compute_gae(
+    rewards: torch.Tensor,      # (B, T-1)
+    values: torch.Tensor,       # (B, T-1)
+    mask: torch.Tensor,         # (B, T-1)
+    gamma: float,
+    lam: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T = rewards.shape
     advantages = torch.zeros_like(rewards)
-    last_gae = torch.zeros(B, device=rewards.device)
-    
-    # 反向递归
+    last_gae = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+
     for t in reversed(range(T)):
-        next_v = values[:, t+1] if t < T-1 else torch.zeros(B, device=rewards.device)
-        delta = rewards[:, t] + gamma * next_v - values[:, t]
-        last_gae = delta + gamma * lam * last_gae * mask[:, t]   # mask 修正
+        mask_t = mask[:, t]
+
+        if t < T - 1:
+            next_mask = mask[:, t + 1]
+            next_value = values[:, t + 1]
+        else:
+            next_mask = torch.zeros_like(mask_t)
+            next_value = torch.zeros_like(mask_t)
+
+        delta = (
+            rewards[:, t]
+            + gamma * next_value * next_mask
+            - values[:, t]
+        )
+
+        last_gae = (
+            delta
+            + gamma * lam * next_mask * last_gae
+        )
+
+        # prompt / padding 位置完全清零，同时切断递归传播。
+        last_gae = last_gae * mask_t
         advantages[:, t] = last_gae
-    
+
     returns = advantages + values
     return advantages, returns
 ```
@@ -767,10 +883,23 @@ def compute_gae(rewards, values, mask, gamma=1.0, lam=0.95):
 - 从 $t=T-1$ 开始往前算，保证依赖已计算
 - 边界 $A_T = 0$ 自然满足
 
-**mask[:, t] 的作用？**
-- 不同样本序列长度可能不同
-- padding 位置不应参与 GAE 累积
-- mask = 0 让 last_gae 重置，避免污染有效位置
+**★ `next_mask` 是本实现和教科书最不一样的地方**：
+教科书常写成「`t < T-1` 就用 `values[:, t+1]`」，
+而本实现乘的是 **`next_mask`**（下一个位置**还是不是 response 的 action**）：
+
+- 若下一个位置**还是 response**（`next_mask = 1`）⇒ 正常 bootstrap；
+- 若下一个位置**已经结束 / 越界**（`next_mask = 0`）⇒
+  **下一个位置的 Value 视为 0**，delta 只剩 $r_t - V_t$。
+
+⇒ **最后一个 response token 之后不会 bootstrap 到 padding 的 Value**
+（否则会把 padding 位置的 Value 当成「未来的期望收益」，直接污染 advantage）。
+
+**mask 的两个作用**
+- `next_mask`：决定**能不能向未来 bootstrap**（见上）；
+- `mask_t`（`last_gae = last_gae * mask_t`）：
+  **prompt / padding 位置完全清零，同时切断递归传播** ——
+  不同样本的 response 长度不同，padding 位置既不该有 advantage，
+  也不该把累积的 `last_gae` 传给前面的有效位置。
 
 ---
 
@@ -785,7 +914,19 @@ $$\hat{A}_t = \frac{A_t - \mu_A}{\sigma_A + \epsilon}$$
 - 让 loss 量级与 lr 解耦
 - 在大 batch PPO 中常用
 
-**本项目**：未启用（每个 rollout batch size = 8 较小，不需要）
+**★ 本项目：始终启用**（不是「可选」）——
+GAE 算完之后无条件做一次**带 mask 的** advantage whitening
+（[L928-L929](gpt-learning-pytorch/train_ppo_standard_adapted.py#L928-L929)）：
+
+```python
+# 只对有效 response action 标准化 Advantage。
+advantages = whiten_masked(advantages, action_mask)
+```
+
+⚠️ 和 §4.3 的 **reward whitening** 正好相反：
+reward whitening 由开关控制（**默认关闭**），**advantage whitening 是无条件的**。
+另外，whitening 之后原本为正的 advantage **也可能变成负数** ——
+它现在表示的是「相对于当前 batch 平均 advantage 的高低」，不再是「比 baseline 好多少」。
 
 ---
 
