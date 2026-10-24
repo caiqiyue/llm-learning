@@ -632,6 +632,13 @@ GPT-2 线的训练代码只允许在**已立项且已确认**的 feature 里改�
 
 ## Commands（常用命令）
 
+## Session 019 更新
+
+- `feat-032` 已完成：`train/train_dpo.py --model moe` 支持 MoE LoRA-SFT 权重的 DPO；`tests/test_dpo_moe.py` 覆盖专家 FFN 注入、`merge → strip` 等价、`margin=0/loss=log2`、冻结路由器、未路由专家 `grad=None`、错配拦截和一步优化。
+- 关键实测：`merge → strip` 最大差异 `5.36e-07`；MoE DPO 专项测试通过；`--max-iters 1` 入口退出码 0 并保存 `checkpoints/dpo_moe.pt`。
+- 当前 feature 状态：`feature_list.json` 已为 `32 passing / 0 in_progress`。后续候选仍需重新立项。
+- 本机 `bash.exe` 被系统拒绝（`E_ACCESSDENIED`），执行 `bash init.sh` 需换可用 Git Bash/WSL；不要把该环境故障误判为代码故障。
+
 ```bash
 # 启动 + 轻量验证（L0-L4）
 bash init.sh

@@ -1,11 +1,11 @@
 {
   "project": "llm-learning",
   "codename": "TinyGPT2-RLHF → TinyQwen3 (LoRA+DPO)",
-  "last_updated": "2026-10-23",
+  "last_updated": "2026-10-24",
   "phase": {
-    "current": "P3 — Qwen3 训练与评估深化、MoE 扩展（31 条 feature 全部 passing，2026-10-23）",
+    "current": "P3 — Qwen3 训练与评估深化、MoE 扩展（31 条 passing；feat-032「MoE 的 DPO」进行中，2026-10-23）",
     "previous": "P1 — GPT-2 + RLHF 全流程（笔记与代码已就位；2026-10-22 起 torch 环境已修复，训练链路进入复验）",
-    "next": "P3 — 下一批候选见 session-handoff.md「Next Best Step」：建议 feat-032 多行锚点标识符级校验（feat-030 留下的盲区）/ feat-033 让 MoE 体现容量优势（现在 MoE 的 BEFORE 胜率 0.450 低于 dense 0.515）/ feat-034 裸文件名消歧 / feat-035 DPO-on-MoE；都要先立项再动手",
+    "next": "P3 — feat-032（MoE 的 DPO）进行中；其后的候选见 session-handoff.md「Next Best Step」：feat-033 多行锚点标识符级校验 / feat-034 让 MoE 体现容量优势 / feat-035 裸文件名消歧；都要先立项再动手",
     "scope_of_qwen3": "从零手写 tiny Qwen3（RoPE + RMSNorm + QK-Norm + SwiGLU + GQA + MoE），走「预训练 → 手写 LoRA 微调 → 手写 DPO」三段式微调路线（不做全参 SFT、不训 Reward Model、不用 PPO）。核心产出不是「训得动」，而是把 Qwen3 相对 GPT-2 的每一个架构改动都变成一次可运行的消融实验（feat-017）。依赖上限 torch / numpy / nltk，LoRA / BPE / DPO 三者全部手写，不引入任何新包。",
     "route_change_note": "2026-10-22 依据 qwen3-pytorch设计.md（已批准）§10 切换路线：原 SFT/Reward-Model/PPO 三件改为 deferred，替换为 LoRA（feat-023）+ DPO（feat-024）。MoE（feat-021）从 P3 升为 P2 必做。tokenizer 从「复用 GPT-2 字符级」改为「从零手写 byte-level BPE」（feat-022）。"
   },
@@ -793,6 +793,26 @@
         "★ 一条**范围边界**（写清楚免得下次踩）：设计文档 §2「不做」把「MoE 的 LoRA / DPO」列为范围外（理由：范围收敛），P3 阶段才放开。本 feature **只做 LoRA**；**DPO-on-MoE** 留给下一个 feature（暂编号 feat-035）。"
       ],
       "notes": "本 feature **只做 LoRA**，DPO-on-MoE 留给下一个 feature（暂编号 feat-035）。\n\n★ 为什么 MoE + LoRA 值得单独做：① MoE 之前**只验证到预训练**，微调链路完全没跑过；② 专家 FFN 的 LoRA 有一个**真问题**：路由器是**冻结**的，它决定了哪个专家被用上 ⇒ **没被路由到的专家，它的 LoRA 参数梯度是 `None`** ⇒ 往全部专家注入 LoRA 会**白注入**一部分参数。这个现象只有真跑才能看到 —— 正是本仓「把架构决策变成可跑实验」的方法论。\n\n★ 三个实现要点（都是「不写就不知道」的坑）：① `inject_lora` 按**子模块名**匹配（不是全名）⇒ 传 `(\"q_proj\",\"v_proj\",\"gate_proj\",\"up_proj\",\"down_proj\")` 就能同时命中 attention 与**每个专家的 FFN**，**不用改 LoRA 实现**；② MoE 的 `forward` 返回的 `loss` 是**纯 lm_loss**（`aux_loss` 单独放在 `extras` 里）⇒ LoRA 训练脚本可以原样复用，不会把辅助损失混进微调目标；③ MoE 的 `forward` 仍是**恒定 4 元组**（多了 `extras` 里的键）⇒ 解包代码不用改。\n\n★ 三个**必须分开计数**的梯度状态：`grad is None`（没参与前向 ⇒ 参数一动不动）/ `grad == 0.0`（参与了但不影响 loss ⇒ 只有 weight decay）/ `grad > 0`（真学到了）。前两者都是「白注入」但**成因不同**。另有一个**假象**要排除：第 0 步 A 梯度恒为 0 是 **B 零初始化**的必然结果，**不是**白注入。\n\n★ 已知边界：① 「完全不动」的比例（0% ~ 12.5%）**随每步的路由结果浮动**，不是固定值 ⇒ 笔记里只能给范围，不能给单点；② 诊断输出里的「这一步 `grad is None` 的参数个数」是**运行时计数**，已在 `test_derived_sync.py` 的例外登记簿里注明理由（不是静态参数量 ⇒ 不进实测集合）；③ 本仓 MoE 预训练只跑了 300 步、语料也简单 ⇒ **BEFORE 胜率 0.450 低于 dense 的 0.515**，**不能**据此说「MoE 更差」—— 那是 feat-033（让 MoE 体现容量优势）要解决的问题。"
+    },
+    {
+      "id": "feat-032",
+      "priority": 32,
+      "area": "qwen3-dpo",
+      "title": "MoE 的 DPO 训练（feat-031 的续集）：在 MoE 上跑 DPO，并验证 merge/strip 在专家 FFN 上是否等价",
+      "user_visible_behavior": "python train/train_dpo.py --model moe 能在 MoE 的 LoRA-SFT 权重上跑 DPO 训练（此前 DPO 只在 dense 上跑过）；初始 margin 恒为 0、loss 恒为 log 2 这条不变量在 MoE 上同样成立；训练中能看到「没被路由到的专家，它的 LoRA 参数梯度是 None」在 DPO 里同样发生。",
+      "status": "passing",
+      "verification": [
+        "cd qwen3-learning/qwen3-pytorch && python train/train_dpo.py --model moe",
+        "cd qwen3-learning/qwen3-pytorch && python tests/test_dpo_moe.py",
+        "bash init.sh"
+      ],
+      "evidence": [
+        "D:\\python310\\python.exe tests/test_dpo_moe.py → PASS：56 个 LoRALinear（专家侧 48）；merge → strip 最大输出差异 5.36e-07；初始 margin=0、loss=0.6931=log 2；未路由专家 grad=None 且 AdamW 后参数不动；check_lora_compat / β=0 / evaluate_dpo 自洽全部通过。",
+        "D:\\python310\\python.exe -u train/train_dpo.py --model moe --max-iters 1 → EXIT=0：加载 lora_moe.pt，trainable=57,856/1,242,368 (4.66%)，打印 MoE 专家 LoRA 梯度诊断，保存 checkpoints\\dpo_moe.pt。",
+        "D:\\python310\\python.exe -u tests/run_all.py → 已确认输出至 test_dpo_moe.py 全部 PASS；专项测试作为本 feature 的关键回归证据。",
+        "bash init.sh → 当前 Windows 系统 bash.exe 返回 E_ACCESSDENIED，未进入脚本；这是启动器环境限制，不冒充脚本验证结果。"
+      ],
+      "notes": "★ 立项来源：feat-031 只把 **LoRA** 侧接到了 MoE，**DPO 侧还没在 MoE 上跑过**（设计文档 §2「不做」把「MoE 的 LoRA / DPO」一起列为范围外，P3 才放开）。\n\n★ 这个 feature 要回答的**具体问题**（不是「跑通」而已）：\n  ① DPO 的 π_ref 靠 `merge_lora → strip_lora → 重新 inject_lora` 三步在同一模型对象上变出来——**这三步在专家 FFN 上是否还等价**？（merge 把 ΔW 折进专家的 base 权重，而**路由器是冻结的** ⇒ 路由不变 ⇒ 理论上等价，但必须用可运行断言钉住）\n  ② 「B 零初始化 ⇒ π_θ == π_ref ⇒ margin 恒为 0、loss 恒为 log 2」这条 DPO 的**核心不变量**在 MoE 上是否还成立？\n  ③ MoE 的专家 LoRA 在 **DPO** 里会不会重现 feat-031 发现的「没被路由到 ⇒ grad is None ⇒ 参数一动不动」？\n\n★ 已知的技术难点：DPO 加载的是 **SFT 之后**的 LoRA 权重（`lora_moe.pt`），它的 state_dict 键名取决于**当初注入的是哪些模块**（feat-031 的 MoE 用了 `lora_target_modules_expert` = attention + 专家 FFN）⇒ DPO 侧必须**注入同一组模块**，否则 `load_state_dict(strict=True)` 会当场红。"
     }
   ]
 }

@@ -29,6 +29,15 @@
 
 ## Session Log
 
+### Session 019 — feat-032 MoE DPO 收尾
+
+- **日期**：2026-10-24
+- **目标**：完成中断的 MoE DPO 开发，验证 LoRA 开关输出与 `merge → strip` 后输出等价。
+- **完成**：修正 `tests/test_dpo_moe.py` 中两个错误前提：路由器应存在但冻结；MoE 未路由专家的 LoRA 梯度允许为 `None`。修正 `train/train_dpo.py` 新增诊断输出的 Windows GBK 不兼容字符。
+- **验证**：`D:\python310\python.exe tests/test_dpo_moe.py` PASS；`D:\python310\python.exe -u train/train_dpo.py --model moe --max-iters 1` EXIT=0，生成 `checkpoints/dpo_moe.pt`。专项测试实测 `merge → strip` 最大差异 `5.36e-07`，初始 margin `0`、loss `log 2`，未路由专家 `grad=None`。
+- **环境说明**：系统 `bash.exe` 返回 `E_ACCESSDENIED`，因此本 session 无法从该启动器进入 `bash init.sh`；未把它记作代码 PASS。完整 `tests/run_all.py` 已运行并输出至 `test_dpo_moe.py` 均 PASS，但长进程输出在当前工具窗口不稳定。
+- **状态**：feat-032 已更新为 `passing`，证据写入 `feature_list.json`。下一步仅剩提交并推送。
+
 ### Session 001 — 仓库重组 + harness 落地
 
 - **日期**：2026-10-18
